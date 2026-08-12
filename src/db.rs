@@ -1,0 +1,486 @@
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, Result};
+use rusqlite::{Connection, params};
+
+use crate::drivers::Usage;
+use crate::registry::AgentDef;
+
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS agents (
+    kind TEXT PRIMARY KEY,
+    system_prompt TEXT NOT NULL,
+    model TEXT NOT NULL,
+    instances INTEGER NOT NULL DEFAULT 1,
+    max_history INTEGER NOT NULL DEFAULT 40,
+    context_window INTEGER NOT NULL DEFAULT 128000,
+    compaction_ratio REAL NOT NULL DEFAULT 0.8,
+    auto_compact INTEGER NOT NULL DEFAULT 1,
+    capabilities_json TEXT NOT NULL DEFAULT '[]',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,
+    summary TEXT,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS messages (
+    session_id INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT,
+    tool_calls_json TEXT,
+    tool_call_id TEXT,
+    PRIMARY KEY (session_id, seq)
+);
+"#;
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// A serializable conversation message (mirrors the WIT `message` record).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredMessage {
+    pub role: String,
+    pub content: Option<String>,
+    pub tool_calls: Option<Vec<StoredToolCall>>,
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+impl From<&crate::bindings::carson::agent::llm::Message> for StoredMessage {
+    fn from(m: &crate::bindings::carson::agent::llm::Message) -> Self {
+        Self {
+            role: m.role.clone(),
+            content: m.content.clone(),
+            tool_calls: m.tool_calls.as_ref().map(|calls| {
+                calls
+                    .iter()
+                    .map(|tc| StoredToolCall {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        arguments: tc.arguments_json.clone(),
+                    })
+                    .collect()
+            }),
+            tool_call_id: m.tool_call_id.clone(),
+        }
+    }
+}
+
+impl From<StoredMessage> for crate::bindings::carson::agent::llm::Message {
+    fn from(m: StoredMessage) -> Self {
+        Self {
+            role: m.role,
+            content: m.content,
+            tool_calls: m.tool_calls.map(|calls| {
+                calls
+                    .into_iter()
+                    .map(|tc| crate::bindings::carson::agent::llm::ToolCall {
+                        id: tc.id,
+                        name: tc.name,
+                        arguments_json: tc.arguments,
+                    })
+                    .collect()
+            }),
+            tool_call_id: m.tool_call_id,
+        }
+    }
+}
+
+/// A persisted session snapshot (used to restore an agent session on boot).
+#[derive(Debug, Clone)]
+pub struct PersistedSession {
+    pub id: u64,
+    pub kind: String,
+    pub summary: Option<String>,
+    pub usage: Usage,
+    pub messages: Vec<StoredMessage>,
+}
+
+pub struct Db {
+    conn: Mutex<Connection>,
+}
+
+impl Db {
+    pub fn open(path: &Path) -> Result<Arc<Self>> {
+        let conn =
+            Connection::open(path).with_context(|| format!("open database {}", path.display()))?;
+        conn.execute_batch(SCHEMA)
+            .with_context(|| format!("initialize schema in {}", path.display()))?;
+        Ok(Arc::new(Self {
+            conn: Mutex::new(conn),
+        }))
+    }
+
+    pub fn open_in_memory() -> Result<Arc<Self>> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(SCHEMA)?;
+        Ok(Arc::new(Self {
+            conn: Mutex::new(conn),
+        }))
+    }
+
+    pub fn list_agents(&self) -> Result<Vec<AgentDef>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT kind, system_prompt, model, instances, max_history, context_window, \
+             compaction_ratio, auto_compact, capabilities_json FROM agents ORDER BY kind",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let caps: String = row.get(8)?;
+            Ok(AgentDef {
+                kind: row.get(0)?,
+                system_prompt: row.get(1)?,
+                model: row.get(2)?,
+                instances: row.get::<_, i64>(3)? as usize,
+                max_history: row.get::<_, i64>(4)? as usize,
+                context_window: row.get::<_, i64>(5)? as usize,
+                compaction_ratio: row.get(6)?,
+                auto_compact: row.get::<_, i64>(7)? != 0,
+                capabilities: serde_json::from_str(&caps).unwrap_or_default(),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn insert_agent(&self, def: &AgentDef) -> Result<()> {
+        let now = now_ms();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents (kind, system_prompt, model, instances, max_history, context_window, \
+             compaction_ratio, auto_compact, capabilities_json, created_at, updated_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10) \
+             ON CONFLICT(kind) DO UPDATE SET system_prompt=?2, model=?3, instances=?4, \
+             max_history=?5, context_window=?6, compaction_ratio=?7, auto_compact=?8, \
+             capabilities_json=?9, updated_at=?10",
+            params![
+                def.kind,
+                def.system_prompt,
+                def.model,
+                def.instances as i64,
+                def.max_history as i64,
+                def.context_window as i64,
+                def.compaction_ratio,
+                def.auto_compact as i64,
+                serde_json::to_string(&def.capabilities)?,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Delete an agent kind and cascade-delete its sessions (and their messages).
+    pub fn delete_agent(&self, kind: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE kind = ?1)",
+            params![kind],
+        )?;
+        let removed = tx.execute("DELETE FROM sessions WHERE kind = ?1", params![kind])?;
+        tx.execute("DELETE FROM agents WHERE kind = ?1", params![kind])?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    pub fn upsert_session(&self, session: &PersistedSession) -> Result<()> {
+        let now = now_ms();
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO sessions (id, kind, summary, input_tokens, cache_read_tokens, \
+             cache_creation_tokens, output_tokens, created_at, updated_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8) \
+             ON CONFLICT(id) DO UPDATE SET kind=?2, summary=?3, input_tokens=?4, \
+             cache_read_tokens=?5, cache_creation_tokens=?6, output_tokens=?7, updated_at=?8",
+            params![
+                session.id as i64,
+                session.kind,
+                session.summary,
+                session.usage.input_tokens,
+                session.usage.cache_read_tokens,
+                session.usage.cache_creation_tokens,
+                session.usage.output_tokens,
+                now,
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            params![session.id as i64],
+        )?;
+        for (seq, message) in session.messages.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO messages (session_id, seq, role, content, tool_calls_json, tool_call_id) \
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    session.id as i64,
+                    seq as i64,
+                    message.role,
+                    message.content,
+                    message
+                        .tool_calls
+                        .as_ref()
+                        .map(|calls| serde_json::to_string(calls).unwrap_or_else(|_| "[]".into())),
+                    message.tool_call_id,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn load_sessions(&self) -> Result<Vec<PersistedSession>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT s.id, s.kind, s.summary, s.input_tokens, s.cache_read_tokens, \
+             s.cache_creation_tokens, s.output_tokens, m.seq, m.role, m.content, \
+             m.tool_calls_json, m.tool_call_id \
+             FROM sessions s LEFT JOIN messages m ON m.session_id = s.id \
+             ORDER BY s.id, m.seq",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)? as u32,
+                row.get::<_, i64>(4)? as u32,
+                row.get::<_, i64>(5)? as u32,
+                row.get::<_, i64>(6)? as u32,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+            ))
+        })?;
+
+        let mut sessions: Vec<PersistedSession> = Vec::new();
+        for row in rows {
+            let (
+                id,
+                kind,
+                summary,
+                input,
+                cache_read,
+                cache_creation,
+                output,
+                seq,
+                role,
+                content,
+                tool_calls,
+                tool_call_id,
+            ) = row?;
+            let messages = &mut sessions.iter_mut().find(|s| s.id == id);
+            match messages {
+                Some(session) => {
+                    if let Some(seq) = seq {
+                        session.messages.resize(
+                            seq as usize + 1,
+                            StoredMessage {
+                                role: String::new(),
+                                content: None,
+                                tool_calls: None,
+                                tool_call_id: None,
+                            },
+                        );
+                        session.messages[seq as usize] = StoredMessage {
+                            role: role.unwrap_or_default(),
+                            content,
+                            tool_calls: tool_calls.and_then(|j| serde_json::from_str(&j).ok()),
+                            tool_call_id,
+                        };
+                    }
+                }
+                None => {
+                    let mut session = PersistedSession {
+                        id,
+                        kind,
+                        summary,
+                        usage: Usage {
+                            input_tokens: input,
+                            cache_read_tokens: cache_read,
+                            cache_creation_tokens: cache_creation,
+                            output_tokens: output,
+                        },
+                        messages: Vec::new(),
+                    };
+                    if let Some(seq) = seq {
+                        session.messages.resize(
+                            seq as usize + 1,
+                            StoredMessage {
+                                role: String::new(),
+                                content: None,
+                                tool_calls: None,
+                                tool_call_id: None,
+                            },
+                        );
+                        session.messages[seq as usize] = StoredMessage {
+                            role: role.unwrap_or_default(),
+                            content,
+                            tool_calls: tool_calls.and_then(|j| serde_json::from_str(&j).ok()),
+                            tool_call_id,
+                        };
+                    }
+                    sessions.push(session);
+                }
+            }
+        }
+        Ok(sessions)
+    }
+
+    pub fn delete_session(&self, id: u64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            params![id as i64],
+        )?;
+        tx.execute("DELETE FROM sessions WHERE id = ?1", params![id as i64])?;
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn def(kind: &str) -> AgentDef {
+        AgentDef {
+            kind: kind.into(),
+            system_prompt: "sys".into(),
+            model: "mock".into(),
+            instances: 1,
+            max_history: 40,
+            context_window: 128_000,
+            compaction_ratio: 0.8,
+            auto_compact: true,
+            capabilities: vec!["time".into()],
+        }
+    }
+
+    fn msg(role: &str, content: &str) -> StoredMessage {
+        StoredMessage {
+            role: role.into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn session(id: u64, kind: &str, messages: Vec<StoredMessage>) -> PersistedSession {
+        PersistedSession {
+            id,
+            kind: kind.into(),
+            summary: Some("summary".into()),
+            usage: Usage {
+                input_tokens: 10,
+                cache_read_tokens: 2,
+                cache_creation_tokens: 1,
+                output_tokens: 5,
+            },
+            messages,
+        }
+    }
+
+    #[test]
+    fn agent_upsert_and_list() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_agent(&def("coder")).unwrap();
+        let mut changed = def("coder");
+        changed.system_prompt = "changed".into();
+        db.insert_agent(&changed).unwrap();
+        let agents = db.list_agents().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].system_prompt, "changed");
+        assert_eq!(agents[0].capabilities, vec!["time"]);
+    }
+
+    #[test]
+    fn session_roundtrip() {
+        let db = Db::open_in_memory().unwrap();
+        let persisted = session(
+            1,
+            "coder",
+            vec![msg("user", "hi"), msg("assistant", "hello")],
+        );
+        db.upsert_session(&persisted).unwrap();
+        let loaded = db.load_sessions().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, 1);
+        assert_eq!(loaded[0].summary.as_deref(), Some("summary"));
+        assert_eq!(loaded[0].messages.len(), 2);
+        assert_eq!(loaded[0].messages[0].role, "user");
+        assert_eq!(loaded[0].messages[0].content.as_deref(), Some("hi"));
+        assert_eq!(loaded[0].messages[1].role, "assistant");
+        assert_eq!(loaded[0].usage.input_tokens, 10);
+        assert_eq!(loaded[0].usage.cache_read_tokens, 2);
+        assert_eq!(loaded[0].usage.cache_creation_tokens, 1);
+    }
+
+    #[test]
+    fn upsert_session_replaces_messages() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_session(&session(1, "coder", vec![msg("user", "a")]))
+            .unwrap();
+        db.upsert_session(&session(
+            1,
+            "coder",
+            vec![msg("user", "a"), msg("user", "b")],
+        ))
+        .unwrap();
+        let loaded = db.load_sessions().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].messages.len(), 2);
+    }
+
+    #[test]
+    fn delete_agent_cascades_sessions() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_agent(&def("coder")).unwrap();
+        db.upsert_session(&session(1, "coder", vec![msg("user", "x")]))
+            .unwrap();
+        db.upsert_session(&session(2, "coder", vec![])).unwrap();
+        let removed = db.delete_agent("coder").unwrap();
+        assert_eq!(removed, 2);
+        assert!(db.load_sessions().unwrap().is_empty());
+        assert!(db.list_agents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_agent_keeps_other_kinds() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_agent(&def("coder")).unwrap();
+        db.insert_agent(&def("researcher")).unwrap();
+        db.upsert_session(&session(1, "coder", vec![])).unwrap();
+        db.upsert_session(&session(2, "researcher", vec![]))
+            .unwrap();
+        db.delete_agent("coder").unwrap();
+        let agents = db.list_agents().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].kind, "researcher");
+        let sessions = db.load_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].kind, "researcher");
+    }
+}

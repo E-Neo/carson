@@ -1,0 +1,16 @@
+[package]
+name = "carson-tools"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "time"
+path = "src/bin/time.rs"
+
+[[bin]]
+name = "echo"
+path = "src/bin/echo.rs"
+
+[dependencies]
+serde_json.workspace = true
+wit-bindgen = "0.57"

@@ -1,0 +1,131 @@
+package carson:agent;
+
+interface events {
+    record part {
+        kind: string,
+        data: string,
+    }
+
+    enum event-error {
+        closed,
+    }
+
+    emit-event: func(session-id: u64, part: part) -> result<_, event-error>;
+    cancelled: func(session-id: u64) -> bool;
+}
+
+interface llm {
+    record message {
+        role: string,
+        content: option<string>,
+        tool-calls: option<list<tool-call>>,
+        tool-call-id: option<string>,
+    }
+
+    record tool-definition {
+        name: string,
+        description: string,
+        parameters-json: string,
+    }
+
+    record tool-call {
+        id: string,
+        name: string,
+        arguments-json: string,
+    }
+
+    record request {
+        session-id: u64,
+        model: string,
+        messages: list<message>,
+        system-prompt: option<string>,
+        tools: list<tool-definition>,
+        temperature: option<f32>,
+        max-tokens: option<u32>,
+    }
+
+    record usage {
+        input-tokens: u32,
+        cache-read-tokens: u32,
+        cache-creation-tokens: u32,
+        output-tokens: u32,
+    }
+
+    record chunk {
+        text: option<string>,
+        thinking: option<string>,
+        tool-call-start: option<tool-call>,
+        tool-input-delta: option<string>,
+        tool-call-end: option<tool-call>,
+    }
+
+    enum llm-error {
+        network,
+        auth,
+        rate-limited,
+        timeout,
+        cancelled,
+        internal,
+    }
+
+    stream-start: func(request: request) -> result<u64, llm-error>;
+    stream-next: func(handle: u64) -> result<option<chunk>, llm-error>;
+    stream-usage: func(handle: u64) -> result<usage, llm-error>;
+    stream-close: func(handle: u64) -> result<_, llm-error>;
+}
+
+interface tools {
+    use llm.{tool-definition};
+
+    enum tool-error {
+        not-found,
+        permission-denied,
+        failed,
+    }
+
+    list-tools: func() -> list<tool-definition>;
+    invoke: func(name: string, arguments-json: string) -> result<string, tool-error>;
+}
+
+interface agent {
+    use llm.{message, usage};
+
+    record session-config {
+        system-prompt: string,
+        model: string,
+        capabilities-json: string,
+        max-history: u32,
+        context-window: u32,
+        compaction-ratio: f32,
+        auto-compact: bool,
+    }
+
+    record state {
+        messages: list<message>,
+        summary: option<string>,
+        usage: usage,
+    }
+
+    enum error {
+        not-found,
+        busy,
+        internal,
+    }
+
+    create-session: func(session-id: u64, config: session-config) -> result<_, error>;
+    restore-session: func(session-id: u64, config: session-config, state: state) -> result<_, error>;
+    session-history: func(session-id: u64) -> result<list<message>, error>;
+    session-usage: func(session-id: u64) -> result<usage, error>;
+    session-state: func(session-id: u64) -> result<state, error>;
+    compact-session: func(session-id: u64) -> result<_, error>;
+    reset-session: func(session-id: u64) -> result<_, error>;
+    handle-message: func(session-id: u64, message: string) -> result<_, error>;
+    destroy-session: func(session-id: u64) -> result<_, error>;
+}
+
+world agent-world {
+    import events;
+    import llm;
+    import tools;
+    export agent;
+}
