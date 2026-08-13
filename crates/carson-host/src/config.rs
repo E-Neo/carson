@@ -46,7 +46,7 @@ impl Default for Server {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, Deserialize, utoipa::ToSchema)]
 pub struct DefaultModel {
     pub provider: String,
     pub model: String,

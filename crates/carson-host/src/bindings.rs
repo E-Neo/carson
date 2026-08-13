@@ -1,4 +1,4 @@
 wasmtime::component::bindgen!({
-    path: "wit",
+    path: "../../wit",
     world: "carson:agent/agent-world",
 });

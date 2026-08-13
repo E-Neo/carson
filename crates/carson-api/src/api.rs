@@ -1,7 +1,5 @@
-use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{FromRequestParts, State};
@@ -13,89 +11,303 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use axum_extra::extract::TypedHeader;
 use axum_extra::routing::TypedPath;
+use carson_host::app::{AppState, SessionEntry};
+use carson_host::config::DefaultModel;
+use carson_host::drivers::Usage;
+use carson_host::host;
+use carson_host::hub::{SseItem, sse_frame};
+use carson_host::registry::{AgentDef, AgentInstance};
 use headers::{Authorization, authorization::Bearer};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
+use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
+use utoipa::{Modify, OpenApi, ToSchema};
+use utoipa_swagger_ui::SwaggerUi;
 
-use crate::config::Config;
-use crate::db::Db;
-use crate::drivers::Usage;
-use crate::host::{self, HostContext};
-use crate::hub::{Hub, SseItem, sse_frame};
-use crate::registry::{AgentDef, AgentInstance, AgentRegistry};
-
-#[derive(Clone)]
-pub struct AppState {
-    pub ctx: Arc<HostContext>,
-    pub registry: Arc<Mutex<AgentRegistry>>,
-    pub db: Arc<Db>,
-    pub hub: Arc<Hub>,
-    pub sessions: Arc<Mutex<HashMap<u64, SessionEntry>>>,
-    pub next_session_id: Arc<AtomicU64>,
-    pub cfg: Arc<Config>,
-}
-
-#[derive(Clone)]
-pub struct SessionEntry {
-    pub kind: String,
-    pub instance: Arc<AgentInstance>,
-}
-
-#[derive(Deserialize)]
-struct CreateSessionReq {
+#[derive(Deserialize, ToSchema)]
+pub struct CreateSessionReq {
     agent: String,
 }
 
-#[derive(Deserialize)]
-struct MessageReq {
+#[derive(Deserialize, ToSchema)]
+pub struct MessageReq {
     content: String,
 }
 
 #[derive(TypedPath, Deserialize)]
 #[typed_path("/api/sessions/{id}")]
-struct SessionPath {
+pub(crate) struct SessionPath {
     id: u64,
 }
 
 #[derive(TypedPath, Deserialize)]
 #[typed_path("/api/sessions/{id}/message")]
-struct MessagePath {
+pub(crate) struct MessagePath {
     id: u64,
 }
 
 #[derive(TypedPath, Deserialize)]
 #[typed_path("/api/sessions/{id}/stream")]
-struct StreamPath {
+pub(crate) struct StreamPath {
     id: u64,
 }
 
 #[derive(TypedPath, Deserialize)]
 #[typed_path("/api/sessions/{id}/stop")]
-struct StopPath {
+pub(crate) struct StopPath {
     id: u64,
 }
 
 #[derive(TypedPath, Deserialize)]
 #[typed_path("/api/sessions/{id}/reset")]
-struct ResetPath {
+pub(crate) struct ResetPath {
     id: u64,
 }
 
 #[derive(TypedPath, Deserialize)]
 #[typed_path("/api/sessions/{id}/compact")]
-struct CompactPath {
+pub(crate) struct CompactPath {
     id: u64,
 }
 
 #[derive(TypedPath, Deserialize)]
 #[typed_path("/api/agents/{kind}")]
-struct AgentKindPath {
+pub(crate) struct AgentKindPath {
     kind: String,
 }
 
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "carson API",
+        version = "0.1.0",
+        description = "HTTP API for the carson wasm agent host"
+    ),
+    paths(
+        health,
+        status,
+        config_info,
+        list_agents,
+        create_agent,
+        update_agent,
+        delete_agent,
+        list_sessions,
+        create_session,
+        get_session,
+        destroy_session,
+        send_message,
+        send_stream,
+        stop_session,
+        reset_session,
+        compact_session,
+    ),
+    components(
+        schemas(
+            AgentDef,
+            CreateSessionReq,
+            MessageReq,
+            DefaultModel,
+            Usage,
+            HealthResponse,
+            StatusResponse,
+            ProviderInfo,
+            ToolInfo,
+            ConfigResponse,
+            AgentListResponse,
+            AgentCommandResponse,
+            AgentDeleteResponse,
+            SessionSummary,
+            SessionListResponse,
+            SessionCreateResponse,
+            ToolCallInfo,
+            MessageInfo,
+            SessionResponse,
+            SessionCommandResponse,
+            MessageResponse,
+            ErrorResponse,
+        )
+    ),
+    modifiers(&SecurityAddon),
+    security(("bearerAuth" = []))
+)]
+pub struct ApiDoc;
+
+struct SecurityAddon;
+
+impl Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "bearerAuth",
+                SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
+            );
+        }
+    }
+}
+
+#[derive(ToSchema)]
+#[schema(example = json!({"status": "ok"}))]
+pub struct HealthResponse {
+    pub status: String,
+}
+
+#[derive(ToSchema)]
+#[schema(example = json!({
+    "status": "running",
+    "agent_count": 1,
+    "session_count": 2,
+    "default_model": "mock/mock",
+    "bind": "127.0.0.1:8000"
+}))]
+pub struct StatusResponse {
+    pub status: String,
+    pub agent_count: usize,
+    pub session_count: usize,
+    pub default_model: String,
+    pub bind: String,
+}
+
+#[derive(ToSchema)]
+pub struct ProviderInfo {
+    pub name: String,
+    pub driver: String,
+    pub model: Option<String>,
+}
+
+#[derive(ToSchema)]
+pub struct ToolInfo {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(ToSchema)]
+#[schema(example = json!({
+    "bind": "127.0.0.1:8000",
+    "api_key_set": true,
+    "default_model": {"provider": "mock", "model": "mock"},
+    "providers": [{"name": "mock", "driver": "echo", "model": "mock"}],
+    "tools": [{"name": "time", "description": "Return the current unix time in milliseconds"}]
+}))]
+pub struct ConfigResponse {
+    pub bind: String,
+    pub api_key_set: bool,
+    pub default_model: Option<DefaultModel>,
+    pub providers: Vec<ProviderInfo>,
+    pub tools: Vec<ToolInfo>,
+}
+
+#[derive(ToSchema)]
+#[schema(example = json!({
+    "agents": [],
+    "total": 0
+}))]
+pub struct AgentListResponse {
+    pub agents: Vec<AgentDef>,
+    pub total: usize,
+}
+
+#[derive(ToSchema)]
+#[schema(example = json!({"kind": "assistant", "status": "created"}))]
+pub struct AgentCommandResponse {
+    pub kind: String,
+    pub status: String,
+}
+
+#[derive(ToSchema)]
+#[schema(example = json!({"kind": "assistant", "status": "deleted", "sessions_deleted": 0}))]
+pub struct AgentDeleteResponse {
+    pub kind: String,
+    pub status: String,
+    pub sessions_deleted: usize,
+}
+
+#[derive(ToSchema)]
+#[schema(example = json!({"id": 1, "agent": "assistant"}))]
+pub struct SessionSummary {
+    pub id: u64,
+    pub agent: String,
+}
+
+#[derive(ToSchema)]
+#[schema(example = json!({"sessions": [], "total": 0}))]
+pub struct SessionListResponse {
+    pub sessions: Vec<SessionSummary>,
+    pub total: usize,
+}
+
+#[derive(ToSchema)]
+#[schema(example = json!({"session_id": 1, "agent": "assistant"}))]
+pub struct SessionCreateResponse {
+    pub session_id: u64,
+    pub agent: String,
+}
+
+#[derive(ToSchema)]
+pub struct ToolCallInfo {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(ToSchema)]
+#[schema(example = json!({
+    "role": "user",
+    "content": "hello",
+    "tool_calls": null,
+    "tool_call_id": null
+}))]
+pub struct MessageInfo {
+    pub role: String,
+    pub content: String,
+    pub tool_calls: Option<Vec<ToolCallInfo>>,
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(ToSchema)]
+#[schema(example = json!({
+    "session_id": 1,
+    "agent": "assistant",
+    "message_count": 1,
+    "messages": [{"role": "user", "content": "hello", "tool_calls": null, "tool_call_id": null}]
+}))]
+pub struct SessionResponse {
+    pub session_id: u64,
+    pub agent: String,
+    pub message_count: usize,
+    pub messages: Vec<MessageInfo>,
+}
+
+#[derive(ToSchema)]
+#[schema(example = json!({"status": "deleted", "session_id": 1}))]
+pub struct SessionCommandResponse {
+    pub status: String,
+    pub session_id: u64,
+}
+
+#[derive(ToSchema)]
+#[schema(example = json!({
+    "response": "hello",
+    "usage": {
+        "input_tokens": 10,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "output_tokens": 5
+    }
+}))]
+pub struct MessageResponse {
+    pub response: String,
+    pub usage: Usage,
+}
+
+#[derive(ToSchema)]
+#[schema(example = json!({"error": "session not found"}))]
+pub struct ErrorResponse {
+    pub error: String,
+}
+
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let api = Router::new()
         .route("/api/health", get(health))
         .route("/api/status", get(status))
         .route("/api/config", get(config_info))
@@ -110,7 +322,10 @@ pub fn router(state: AppState) -> Router {
         .route(CompactPath::PATH, post(compact_session))
         .layer(middleware::from_fn(security))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
-        .with_state(state)
+        .with_state(state);
+
+    let docs = Router::from(SwaggerUi::new("/api").url("/api/openapi.json", ApiDoc::openapi()));
+    api.merge(docs)
 }
 
 fn json_response(status: StatusCode, body: Value) -> Response {
@@ -167,11 +382,28 @@ async fn auth(State(st): State<AppState>, mut req: Request<Body>, next: Next) ->
     next.run(req).await
 }
 
-async fn health() -> Response {
+/// Check service health.
+#[utoipa::path(
+    get,
+    path = "/api/health",
+    security(()),
+    responses(
+        (status = 200, description = "Service is healthy", body = HealthResponse)
+    )
+)]
+pub(crate) async fn health() -> Response {
     json_ok(json!({"status": "ok"}))
 }
 
-async fn status(State(st): State<AppState>) -> Response {
+/// Get runtime status.
+#[utoipa::path(
+    get,
+    path = "/api/status",
+    responses(
+        (status = 200, description = "Server status", body = StatusResponse)
+    )
+)]
+pub(crate) async fn status(State(st): State<AppState>) -> Response {
     let agent_count = st.registry.lock().await.pools().count();
     let session_count = st.sessions.lock().await.len();
     let default_model = st
@@ -189,7 +421,15 @@ async fn status(State(st): State<AppState>) -> Response {
     }))
 }
 
-async fn config_info(State(st): State<AppState>) -> Response {
+/// Get the effective runtime configuration.
+#[utoipa::path(
+    get,
+    path = "/api/config",
+    responses(
+        (status = 200, description = "Effective configuration", body = ConfigResponse)
+    )
+)]
+pub(crate) async fn config_info(State(st): State<AppState>) -> Response {
     let providers: Vec<Value> = st
         .cfg
         .providers
@@ -225,7 +465,15 @@ fn agent_json(def: &AgentDef) -> Value {
     })
 }
 
-async fn list_agents(State(st): State<AppState>) -> Response {
+/// List registered agents.
+#[utoipa::path(
+    get,
+    path = "/api/agents",
+    responses(
+        (status = 200, description = "Agent list", body = AgentListResponse)
+    )
+)]
+pub(crate) async fn list_agents(State(st): State<AppState>) -> Response {
     let registry = st.registry.lock().await;
     let agents: Vec<Value> = registry
         .pools()
@@ -246,7 +494,20 @@ async fn list_agents(State(st): State<AppState>) -> Response {
     json_ok(json!({"agents": agents, "total": agents.len()}))
 }
 
-async fn create_agent(State(st): State<AppState>, Json(def): Json<AgentDef>) -> Response {
+/// Create a new agent from an `AgentDef`.
+#[utoipa::path(
+    post,
+    path = "/api/agents",
+    request_body = AgentDef,
+    responses(
+        (status = 201, description = "Agent created", body = AgentCommandResponse),
+        (status = 500, description = "Agent build or db failure", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn create_agent(
+    State(st): State<AppState>,
+    Json(def): Json<AgentDef>,
+) -> Response {
     if let Err(err) = st.db.insert_agent(&def) {
         return json_err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -261,7 +522,20 @@ async fn create_agent(State(st): State<AppState>, Json(def): Json<AgentDef>) -> 
     json_created(json!({"kind": def.kind, "status": "created"}))
 }
 
-async fn update_agent(
+/// Update an existing agent definition.
+#[utoipa::path(
+    put,
+    path = "/api/agents/{kind}",
+    params(
+        ("kind" = String, Path, description = "Agent kind")
+    ),
+    request_body = AgentDef,
+    responses(
+        (status = 200, description = "Agent updated", body = AgentCommandResponse),
+        (status = 400, description = "Kind in body does not match path", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn update_agent(
     State(st): State<AppState>,
     path: AgentKindPath,
     Json(def): Json<AgentDef>,
@@ -283,7 +557,19 @@ async fn update_agent(
     json_ok(json!({"kind": def.kind, "status": "updated"}))
 }
 
-async fn delete_agent(State(st): State<AppState>, path: AgentKindPath) -> Response {
+/// Delete an agent and its sessions.
+#[utoipa::path(
+    delete,
+    path = "/api/agents/{kind}",
+    params(
+        ("kind" = String, Path, description = "Agent kind")
+    ),
+    responses(
+        (status = 200, description = "Agent deleted", body = AgentDeleteResponse),
+        (status = 500, description = "Db failure", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn delete_agent(State(st): State<AppState>, path: AgentKindPath) -> Response {
     let sessions_deleted = match st.db.delete_agent(&path.kind) {
         Ok(n) => n,
         Err(err) => {
@@ -301,7 +587,15 @@ async fn delete_agent(State(st): State<AppState>, path: AgentKindPath) -> Respon
     json_ok(json!({"kind": path.kind, "status": "deleted", "sessions_deleted": sessions_deleted}))
 }
 
-async fn list_sessions(State(st): State<AppState>) -> Response {
+/// List active sessions.
+#[utoipa::path(
+    get,
+    path = "/api/sessions",
+    responses(
+        (status = 200, description = "Session list", body = SessionListResponse)
+    )
+)]
+pub(crate) async fn list_sessions(State(st): State<AppState>) -> Response {
     let sessions: Vec<Value> = st
         .sessions
         .lock()
@@ -312,13 +606,26 @@ async fn list_sessions(State(st): State<AppState>) -> Response {
     json_ok(json!({"sessions": sessions, "total": sessions.len()}))
 }
 
-async fn create_session(State(st): State<AppState>, Json(req): Json<CreateSessionReq>) -> Response {
+/// Create a new session for an agent kind.
+#[utoipa::path(
+    post,
+    path = "/api/sessions",
+    request_body = CreateSessionReq,
+    responses(
+        (status = 201, description = "Session created", body = SessionCreateResponse),
+        (status = 404, description = "Unknown agent kind", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn create_session(
+    State(st): State<AppState>,
+    Json(req): Json<CreateSessionReq>,
+) -> Response {
     let Some(pool) = st.registry.lock().await.get(&req.agent) else {
         return json_err(StatusCode::NOT_FOUND, "unknown agent kind");
     };
     let instance = pool.next();
     let session_id = st.next_session_id.fetch_add(1, Ordering::SeqCst) + 1;
-    let config = crate::bindings::exports::carson::agent::agent::SessionConfig {
+    let config = carson_host::bindings::exports::carson::agent::agent::SessionConfig {
         system_prompt: pool.system_prompt.clone(),
         model: pool.model.clone(),
         capabilities_json: json!(pool.caps).to_string(),
@@ -360,7 +667,19 @@ async fn create_session(State(st): State<AppState>, Json(req): Json<CreateSessio
     }
 }
 
-async fn get_session(State(st): State<AppState>, path: SessionPath) -> Response {
+/// Get a session's message history.
+#[utoipa::path(
+    get,
+    path = "/api/sessions/{id}",
+    params(
+        ("id" = u64, Path, description = "Session id")
+    ),
+    responses(
+        (status = 200, description = "Session history", body = SessionResponse),
+        (status = 404, description = "Session not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_session(State(st): State<AppState>, path: SessionPath) -> Response {
     let id = path.id;
     let Some(entry) = st.sessions.lock().await.get(&id).cloned() else {
         return json_err(StatusCode::NOT_FOUND, "session not found");
@@ -398,7 +717,19 @@ async fn get_session(State(st): State<AppState>, path: SessionPath) -> Response 
     )
 }
 
-async fn destroy_session(State(st): State<AppState>, path: SessionPath) -> Response {
+/// Destroy a session.
+#[utoipa::path(
+    delete,
+    path = "/api/sessions/{id}",
+    params(
+        ("id" = u64, Path, description = "Session id")
+    ),
+    responses(
+        (status = 200, description = "Session deleted", body = SessionCommandResponse),
+        (status = 404, description = "Session not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn destroy_session(State(st): State<AppState>, path: SessionPath) -> Response {
     let id = path.id;
     let Some(entry) = st.sessions.lock().await.remove(&id) else {
         return json_err(StatusCode::NOT_FOUND, "session not found");
@@ -414,7 +745,19 @@ async fn destroy_session(State(st): State<AppState>, path: SessionPath) -> Respo
     json_ok(json!({"status": "deleted", "session_id": id}))
 }
 
-async fn reset_session(State(st): State<AppState>, path: ResetPath) -> Response {
+/// Reset a session's history.
+#[utoipa::path(
+    post,
+    path = "/api/sessions/{id}/reset",
+    params(
+        ("id" = u64, Path, description = "Session id")
+    ),
+    responses(
+        (status = 200, description = "Session reset", body = SessionCommandResponse),
+        (status = 404, description = "Session not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn reset_session(State(st): State<AppState>, path: ResetPath) -> Response {
     let id = path.id;
     let Some(entry) = st.sessions.lock().await.get(&id).cloned() else {
         return json_err(StatusCode::NOT_FOUND, "session not found");
@@ -435,7 +778,19 @@ async fn reset_session(State(st): State<AppState>, path: ResetPath) -> Response 
     }
 }
 
-async fn stop_session(State(st): State<AppState>, path: StopPath) -> Response {
+/// Stop a running session.
+#[utoipa::path(
+    post,
+    path = "/api/sessions/{id}/stop",
+    params(
+        ("id" = u64, Path, description = "Session id")
+    ),
+    responses(
+        (status = 200, description = "Session stopped", body = SessionCommandResponse),
+        (status = 404, description = "Session not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn stop_session(State(st): State<AppState>, path: StopPath) -> Response {
     let id = path.id;
     let Some(entry) = st.sessions.lock().await.get(&id).cloned() else {
         return json_err(StatusCode::NOT_FOUND, "session not found");
@@ -444,7 +799,20 @@ async fn stop_session(State(st): State<AppState>, path: StopPath) -> Response {
     json_ok(json!({"status": "stopped", "session_id": id}))
 }
 
-async fn compact_session(State(st): State<AppState>, path: CompactPath) -> Response {
+/// Compact a session's history.
+#[utoipa::path(
+    post,
+    path = "/api/sessions/{id}/compact",
+    params(
+        ("id" = u64, Path, description = "Session id")
+    ),
+    responses(
+        (status = 200, description = "Session compacted", body = SessionCommandResponse),
+        (status = 404, description = "Session not found", body = ErrorResponse),
+        (status = 500, description = "Compaction failed", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn compact_session(State(st): State<AppState>, path: CompactPath) -> Response {
     let id = path.id;
     let Some(entry) = st.sessions.lock().await.get(&id).cloned() else {
         return json_err(StatusCode::NOT_FOUND, "session not found");
@@ -461,7 +829,7 @@ async fn compact_session(State(st): State<AppState>, path: CompactPath) -> Respo
             host::snapshot_session(&st.db, &entry.instance, id).await;
             json_ok(json!({"status": "compacted", "session_id": id}))
         }
-        Ok((Err(crate::bindings::exports::carson::agent::agent::Error::NotFound),)) => {
+        Ok((Err(carson_host::bindings::exports::carson::agent::agent::Error::NotFound),)) => {
             json_err(StatusCode::NOT_FOUND, "session not found")
         }
         _ => json_err(StatusCode::INTERNAL_SERVER_ERROR, "compaction failed"),
@@ -500,7 +868,20 @@ async fn session_usage(instance: &AgentInstance, session_id: u64) -> Usage {
     }
 }
 
-async fn send_stream(
+/// Send a message to a session and stream the response as Server-Sent Events.
+#[utoipa::path(
+    post,
+    path = "/api/sessions/{id}/stream",
+    params(
+        ("id" = u64, Path, description = "Session id")
+    ),
+    request_body = MessageReq,
+    responses(
+        (status = 200, description = "SSE event stream", content_type = "text/event-stream"),
+        (status = 404, description = "Session not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn send_stream(
     State(st): State<AppState>,
     path: StreamPath,
     Json(req): Json<MessageReq>,
@@ -552,7 +933,20 @@ async fn send_stream(
     resp
 }
 
-async fn send_message(
+/// Send a message to a session and await the full response.
+#[utoipa::path(
+    post,
+    path = "/api/sessions/{id}/message",
+    params(
+        ("id" = u64, Path, description = "Session id")
+    ),
+    request_body = MessageReq,
+    responses(
+        (status = 200, description = "Full response", body = MessageResponse),
+        (status = 404, description = "Session not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn send_message(
     State(st): State<AppState>,
     path: MessagePath,
     Json(req): Json<MessageReq>,
@@ -621,10 +1015,19 @@ async fn send_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use axum::http::header::AUTHORIZATION;
+    use carson_host::config::Config;
+    use carson_host::db::Db;
+    use carson_host::hub::Hub;
+    use carson_host::registry::AgentRegistry;
     use http_body_util::BodyExt;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use tokio::sync::Mutex;
     use tower::ServiceExt;
+
+    use carson_host::host::HostContext;
 
     fn config(api_key: &str) -> Config {
         toml::from_str(&format!(
@@ -711,5 +1114,34 @@ mod tests {
         let app = router(app_state(config("")).await);
         let (status, _, _) = read(response(app, "/api/nope", None).await).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn docs_page_is_public_and_served() {
+        let app = router(app_state(config("sekret")).await);
+        let (status, headers, _) = read(response(app.clone(), "/api", None).await).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(headers.iter().any(|(k, v)| k == "location" && v == "/api/"));
+        let (status, _, body) = read(response(app, "/api/", None).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("swagger"), "expected swagger page");
+    }
+
+    #[tokio::test]
+    async fn openapi_spec_is_public_and_complete() {
+        let app = router(app_state(config("sekret")).await);
+        let (status, headers, body) = read(response(app, "/api/openapi.json", None).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers.iter().any(|(k, _)| k == "content-type"));
+        for needle in [
+            "\"openapi\"",
+            "\"/api/agents\"",
+            "\"/api/sessions/{id}\"",
+            "\"/api/sessions/{id}/stream\"",
+            "\"bearerAuth\"",
+            "\"security\":[{\"bearerAuth\":[]}]",
+        ] {
+            assert!(body.contains(needle), "spec missing {needle}");
+        }
     }
 }

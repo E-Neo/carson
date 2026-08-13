@@ -10,7 +10,7 @@ use crate::bindings::AgentWorld;
 use crate::state::State;
 
 /// A persisted agent definition (DB is the single source of truth).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AgentDef {
     pub kind: String,
     #[serde(default)]

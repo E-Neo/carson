@@ -47,7 +47,9 @@ pub enum DriverEvent {
     Failed(DriverError),
 }
 
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 pub struct Usage {
     pub input_tokens: u32,
     pub cache_read_tokens: u32,

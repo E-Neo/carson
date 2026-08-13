@@ -1,19 +1,30 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
-use serde_json::json;
-
-use carson_host::api::{self, SessionEntry};
+use axum::body::Body;
+use axum::extract::ConnectInfo;
+use axum::http::Request;
+use axum::middleware::{self, Next};
+use axum::response::Response;
+use carson_api::api::router;
 use carson_host::bindings::exports::carson::agent::agent::SessionConfig;
 use carson_host::config::Config;
 use carson_host::db::Db;
 use carson_host::host::{self, HostContext};
+use clap::Parser;
+use serde_json::json;
 
-fn carson_home() -> PathBuf {
-    if let Ok(home) = std::env::var("CARSON_HOME") {
-        return PathBuf::from(home);
+use crate::cli::Cli;
+
+mod cli;
+
+fn carson_home(cli_home: Option<PathBuf>) -> PathBuf {
+    if let Some(home) = cli_home {
+        return home;
     }
     if let Ok(home) = std::env::var("HOME") {
         return PathBuf::from(home).join(".carson");
@@ -21,24 +32,41 @@ fn carson_home() -> PathBuf {
     PathBuf::from(".carson")
 }
 
+/// Log every incoming request at `info`, http.server style.
+async fn trace(req: Request<Body>, next: Next) -> Response {
+    let start = Instant::now();
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.to_string());
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let resp = next.run(req).await;
+    tracing::info!(
+        peer = peer.as_deref().unwrap_or("-"),
+        method = %method,
+        path = %path,
+        status = resp.status().as_u16(),
+        elapsed_ms = start.elapsed().as_millis(),
+        "request"
+    );
+    resp
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
-    let args: Vec<String> = std::env::args().collect();
-    let home = carson_home();
+    let home = carson_home(cli.home);
     std::fs::create_dir_all(&home).with_context(|| format!("create {}", home.display()))?;
 
-    let config_path = args
-        .iter()
-        .position(|a| a == "--config")
-        .map(|i| PathBuf::from(&args[i + 1]))
-        .unwrap_or_else(|| home.join("carson.toml"));
-    let config = Config::load(&config_path)?;
+    let config = Config::load(&home.join("config.toml"))?;
 
     let db_path = home.join("carson.db");
     let db = Db::open(&db_path)?;
@@ -47,7 +75,7 @@ async fn main() -> Result<()> {
 
     let agents = db.list_agents()?;
     let registry = host::build_registry(&ctx, &agents).await?;
-    let app_state = host::build_app_state(ctx, registry, db.clone(), config.clone());
+    let app_state = carson_host::app::build_app_state(ctx, registry, db.clone(), config.clone());
 
     let sessions = db.load_sessions()?;
     let mut max_session_id = 0u64;
@@ -77,7 +105,7 @@ async fn main() -> Result<()> {
         }
         app_state.sessions.lock().await.insert(
             persisted.id,
-            SessionEntry {
+            carson_host::app::SessionEntry {
                 kind: persisted.kind.clone(),
                 instance,
             },
@@ -89,9 +117,14 @@ async fn main() -> Result<()> {
             .store(max_session_id, Ordering::SeqCst);
     }
 
-    let app = api::router(app_state);
+    let app = router(app_state).layer(middleware::from_fn(trace));
     let listener = tokio::net::TcpListener::bind(config.server.bind).await?;
-    tracing::info!("carson listening on http://{}", config.server.bind);
-    axum::serve(listener, app).await?;
+    let addr = listener.local_addr()?;
+    tracing::info!("carson listening on http://{addr}");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

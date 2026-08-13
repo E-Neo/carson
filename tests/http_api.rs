@@ -8,10 +8,10 @@ use tower::ServiceExt;
 
 use std::sync::Arc;
 
-use carson_host::api;
+use carson_api::api::router;
 use carson_host::config::Config;
 use carson_host::db::Db;
-use carson_host::host::{HostContext, build_app_state, build_registry};
+use carson_host::host::{HostContext, build_registry};
 use carson_host::registry::AgentDef;
 
 fn config(api_key: &str) -> Config {
@@ -54,7 +54,7 @@ async fn app(api_key: &str) -> Router {
     let ctx = Arc::new(HostContext::new(&config).unwrap());
     let registry = build_registry(&ctx, &[coder_def()]).await.unwrap();
     let db = Db::open_in_memory().unwrap();
-    api::router(build_app_state(ctx, registry, db, config))
+    router(carson_host::app::build_app_state(ctx, registry, db, config))
 }
 
 async fn post(app: &Router, uri: &str, body: &str, bearer: Option<&str>) -> (u16, Value) {

@@ -1,4 +1,4 @@
-pub mod api;
+pub mod app;
 pub mod bindings;
 pub mod config;
 pub mod db;

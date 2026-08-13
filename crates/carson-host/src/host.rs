@@ -7,7 +7,6 @@ use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Engine, Store};
 use wasmtime_wasi::WasiCtxBuilder;
 
-use crate::api::AppState;
 use crate::bindings::AgentWorld;
 use crate::config::Config;
 use crate::db::{Db, PersistedSession, StoredMessage};
@@ -82,23 +81,6 @@ pub async fn build_pool(ctx: &HostContext, def: &AgentDef) -> Result<AgentPool> 
         instances.push(Arc::new(build_instance(ctx, def).await?));
     }
     Ok(AgentPool::from_def(def, instances))
-}
-
-pub fn build_app_state(
-    ctx: Arc<HostContext>,
-    registry: AgentRegistry,
-    db: Arc<Db>,
-    config: Config,
-) -> AppState {
-    AppState {
-        hub: ctx.hub.clone(),
-        ctx,
-        registry: Arc::new(tokio::sync::Mutex::new(registry)),
-        db,
-        sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-        next_session_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        cfg: Arc::new(config),
-    }
 }
 
 /// Snapshot a session from the guest and persist it to the database.

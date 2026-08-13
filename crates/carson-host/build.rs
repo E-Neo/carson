@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    let workspace_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir.join("..").join("..");
     let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
     let cargo_profile = if profile == "debug" { "dev" } else { &profile };
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
