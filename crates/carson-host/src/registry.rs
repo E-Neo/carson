@@ -50,6 +50,32 @@ fn default_true() -> bool {
     true
 }
 
+/// A persisted LLM provider (always OpenAI-compatible).
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ProviderDef {
+    pub name: String,
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+}
+
+/// A persisted tool definition. `core/` names map to embedded bytes; `custom/` names carry their
+/// wasm in the DB.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ToolDef {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default = "default_parameters")]
+    pub parameters: serde_json::Value,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+}
+
+fn default_parameters() -> serde_json::Value {
+    serde_json::json!({})
+}
+
 pub struct AgentInstance {
     pub kind: String,
     pub store: Mutex<Store<State>>,

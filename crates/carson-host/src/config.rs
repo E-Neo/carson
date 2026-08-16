@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -9,58 +8,28 @@ use serde::Deserialize;
 #[serde(default)]
 pub struct Config {
     pub server: Server,
-    pub default_model: Option<DefaultModel>,
-    pub providers: HashMap<String, Provider>,
-    pub tools: HashMap<String, ToolKind>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct ToolKind {
-    #[serde(default)]
-    pub module: Option<String>,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default = "default_parameters")]
-    pub parameters: serde_json::Value,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-}
-
-fn default_parameters() -> serde_json::Value {
-    serde_json::json!({})
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Server {
-    pub bind: SocketAddr,
-    pub api_key: String,
+    pub ip: IpAddr,
+    pub port: u16,
 }
 
 impl Default for Server {
     fn default() -> Self {
         Self {
-            bind: "127.0.0.1:8000".parse().expect("valid default address"),
-            api_key: String::new(),
+            ip: "127.0.0.1".parse().expect("valid default ip"),
+            port: 8000,
         }
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, Deserialize, utoipa::ToSchema)]
-pub struct DefaultModel {
-    pub provider: String,
-    pub model: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Provider {
-    pub driver: String,
-    #[serde(default)]
-    pub base_url: Option<String>,
-    #[serde(default)]
-    pub api_key_env: Option<String>,
-    #[serde(default)]
-    pub model: Option<String>,
+impl Server {
+    pub fn bind(&self) -> SocketAddr {
+        SocketAddr::new(self.ip, self.port)
+    }
 }
 
 impl Config {
@@ -70,11 +39,6 @@ impl Config {
         let cfg: Config =
             toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
         Ok(cfg)
-    }
-
-    pub fn api_key(&self) -> Option<&str> {
-        let key = self.server.api_key.trim();
-        if key.is_empty() { None } else { Some(key) }
     }
 }
 
@@ -86,42 +50,26 @@ mod tests {
     fn parse_config() {
         let text = r#"
 [server]
-bind = "127.0.0.1:8000"
-api_key = "k"
-
-[default_model]
-provider = "mock"
-model = "mock"
-
-[providers.mock]
-driver = "echo"
-model = "mock"
-
-[tools.time]
-description = "Return the current unix time in milliseconds"
+ip = "127.0.0.1"
+port = 9000
 "#;
         let cfg: Config = toml::from_str(text).unwrap();
-        assert_eq!(cfg.server.bind.to_string(), "127.0.0.1:8000");
-        assert_eq!(cfg.api_key(), Some("k"));
-        assert!(cfg.tools.contains_key("time"));
-        assert!(cfg.providers.contains_key("mock"));
+        assert_eq!(cfg.server.bind().to_string(), "127.0.0.1:9000");
     }
 
     #[test]
-    fn empty_api_key_is_unset() {
+    fn empty_config_uses_defaults() {
         let cfg: Config = toml::from_str("").unwrap();
-        assert!(cfg.api_key().is_none());
-        assert!(cfg.default_model.is_none());
-        assert_eq!(cfg.server.bind.to_string(), "127.0.0.1:8000");
+        assert_eq!(cfg.server.bind().to_string(), "127.0.0.1:8000");
     }
 
     #[test]
     fn load_parses_a_config_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.toml");
-        std::fs::write(&path, "[server]\nbind = \"127.0.0.1:9000\"\n").unwrap();
+        std::fs::write(&path, "[server]\nip = \"0.0.0.0\"\nport = 8080\n").unwrap();
         let cfg = Config::load(&path).unwrap();
-        assert_eq!(cfg.server.bind.to_string(), "127.0.0.1:9000");
+        assert_eq!(cfg.server.bind().to_string(), "0.0.0.0:8080");
     }
 
     #[test]

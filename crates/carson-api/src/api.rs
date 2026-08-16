@@ -2,27 +2,23 @@ use std::convert::Infallible;
 use std::sync::atomic::Ordering;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{FromRequestParts, State};
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use axum_extra::extract::TypedHeader;
 use axum_extra::routing::TypedPath;
 use carson_host::app::{AppState, SessionEntry};
-use carson_host::config::DefaultModel;
 use carson_host::drivers::Usage;
 use carson_host::host;
 use carson_host::hub::{SseItem, sse_frame};
-use carson_host::registry::{AgentDef, AgentInstance};
-use headers::{Authorization, authorization::Bearer};
+use carson_host::registry::{AgentDef, AgentInstance, ProviderDef, ToolDef};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
-use utoipa::{Modify, OpenApi, ToSchema};
+use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 #[derive(Deserialize, ToSchema)]
@@ -33,6 +29,19 @@ pub struct CreateSessionReq {
 #[derive(Deserialize, ToSchema)]
 pub struct MessageReq {
     content: String,
+}
+
+/// Request body for registering or updating a `custom/` tool. The wasm is base64-encoded.
+#[derive(Deserialize, ToSchema)]
+pub struct ToolReq {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub parameters: Value,
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    pub wasm_b64: String,
 }
 
 #[derive(TypedPath, Deserialize)]
@@ -77,6 +86,18 @@ pub(crate) struct AgentKindPath {
     kind: String,
 }
 
+#[derive(TypedPath, Deserialize)]
+#[typed_path("/api/providers/{name}")]
+pub(crate) struct ProviderNamePath {
+    name: String,
+}
+
+#[derive(TypedPath, Deserialize)]
+#[typed_path("/api/tools/{*name}")]
+pub(crate) struct ToolNamePath {
+    name: String,
+}
+
 #[derive(OpenApi)]
 #[openapi(
     info(
@@ -92,6 +113,14 @@ pub(crate) struct AgentKindPath {
         create_agent,
         update_agent,
         delete_agent,
+        list_providers,
+        create_provider,
+        update_provider,
+        delete_provider,
+        list_tools,
+        create_tool,
+        update_tool,
+        delete_tool,
         list_sessions,
         create_session,
         get_session,
@@ -102,49 +131,36 @@ pub(crate) struct AgentKindPath {
         reset_session,
         compact_session,
     ),
-    components(
-        schemas(
-            AgentDef,
-            CreateSessionReq,
-            MessageReq,
-            DefaultModel,
-            Usage,
-            HealthResponse,
-            StatusResponse,
-            ProviderInfo,
-            ToolInfo,
-            ConfigResponse,
-            AgentListResponse,
-            AgentCommandResponse,
-            AgentDeleteResponse,
-            SessionSummary,
-            SessionListResponse,
-            SessionCreateResponse,
-            ToolCallInfo,
-            MessageInfo,
-            SessionResponse,
-            SessionCommandResponse,
-            MessageResponse,
-            ErrorResponse,
-        )
-    ),
-    modifiers(&SecurityAddon),
-    security(("bearerAuth" = []))
+    components(schemas(
+        AgentDef,
+        ProviderDef,
+        ToolDef,
+        ToolReq,
+        CreateSessionReq,
+        MessageReq,
+        Usage,
+        HealthResponse,
+        StatusResponse,
+        ProviderListResponse,
+        ToolListResponse,
+        ConfigResponse,
+        AgentListResponse,
+        AgentCommandResponse,
+        AgentDeleteResponse,
+        ProviderCommandResponse,
+        ToolCommandResponse,
+        SessionSummary,
+        SessionListResponse,
+        SessionCreateResponse,
+        ToolCallInfo,
+        MessageInfo,
+        SessionResponse,
+        SessionCommandResponse,
+        MessageResponse,
+        ErrorResponse,
+    ))
 )]
 pub struct ApiDoc;
-
-struct SecurityAddon;
-
-impl Modify for SecurityAddon {
-    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
-        if let Some(components) = openapi.components.as_mut() {
-            components.add_security_scheme(
-                "bearerAuth",
-                SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
-            );
-        }
-    }
-}
 
 #[derive(ToSchema)]
 #[schema(example = json!({"status": "ok"}))]
@@ -157,44 +173,59 @@ pub struct HealthResponse {
     "status": "running",
     "agent_count": 1,
     "session_count": 2,
-    "default_model": "mock/mock",
+    "provider_count": 1,
+    "tool_count": 2,
     "bind": "127.0.0.1:8000"
 }))]
 pub struct StatusResponse {
     pub status: String,
     pub agent_count: usize,
     pub session_count: usize,
-    pub default_model: String,
+    pub provider_count: usize,
+    pub tool_count: usize,
     pub bind: String,
-}
-
-#[derive(ToSchema)]
-pub struct ProviderInfo {
-    pub name: String,
-    pub driver: String,
-    pub model: Option<String>,
-}
-
-#[derive(ToSchema)]
-pub struct ToolInfo {
-    pub name: String,
-    pub description: String,
 }
 
 #[derive(ToSchema)]
 #[schema(example = json!({
-    "bind": "127.0.0.1:8000",
-    "api_key_set": true,
-    "default_model": {"provider": "mock", "model": "mock"},
-    "providers": [{"name": "mock", "driver": "echo", "model": "mock"}],
-    "tools": [{"name": "time", "description": "Return the current unix time in milliseconds"}]
+    "providers": [{"name": "groq", "base_url": "https://api.groq.com/openai/v1", "api_key_env": "GROQ_API_KEY"}],
+    "total": 1
+}))]
+pub struct ProviderListResponse {
+    pub providers: Vec<ProviderDef>,
+    pub total: usize,
+}
+
+#[derive(ToSchema)]
+#[schema(example = json!({
+    "tools": [{"name": "core/time", "description": "Return the current unix time in milliseconds", "parameters": {}}],
+    "total": 1
+}))]
+pub struct ToolListResponse {
+    pub tools: Vec<ToolDef>,
+    pub total: usize,
+}
+
+#[derive(ToSchema)]
+#[schema(example = json!({"name": "groq", "status": "created"}))]
+pub struct ProviderCommandResponse {
+    pub name: String,
+    pub status: String,
+}
+
+#[derive(ToSchema)]
+#[schema(example = json!({"name": "core/time", "status": "created"}))]
+pub struct ToolCommandResponse {
+    pub name: String,
+    pub status: String,
+}
+
+#[derive(ToSchema)]
+#[schema(example = json!({
+    "bind": "127.0.0.1:8000"
 }))]
 pub struct ConfigResponse {
     pub bind: String,
-    pub api_key_set: bool,
-    pub default_model: Option<DefaultModel>,
-    pub providers: Vec<ProviderInfo>,
-    pub tools: Vec<ToolInfo>,
 }
 
 #[derive(ToSchema)]
@@ -313,6 +344,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/config", get(config_info))
         .route("/api/agents", get(list_agents).post(create_agent))
         .route(AgentKindPath::PATH, put(update_agent).delete(delete_agent))
+        .route("/api/providers", get(list_providers).post(create_provider))
+        .route(
+            ProviderNamePath::PATH,
+            put(update_provider).delete(delete_provider),
+        )
+        .route("/api/tools", get(list_tools).post(create_tool))
+        .route(ToolNamePath::PATH, put(update_tool).delete(delete_tool))
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route(SessionPath::PATH, get(get_session).delete(destroy_session))
         .route(MessagePath::PATH, post(send_message))
@@ -321,7 +360,6 @@ pub fn router(state: AppState) -> Router {
         .route(ResetPath::PATH, post(reset_session))
         .route(CompactPath::PATH, post(compact_session))
         .layer(middleware::from_fn(security))
-        .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state);
 
     let docs = Router::from(SwaggerUi::new("/api").url("/api/openapi.json", ApiDoc::openapi()));
@@ -366,27 +404,10 @@ async fn security(req: Request<Body>, next: Next) -> Response {
     resp
 }
 
-async fn auth(State(st): State<AppState>, mut req: Request<Body>, next: Next) -> Response {
-    if let Some(key) = st.cfg.api_key() {
-        let public = req.uri().path() == "/api/health";
-        let (mut parts, body) = req.into_parts();
-        let authorized = TypedHeader::<Authorization<Bearer>>::from_request_parts(&mut parts, &st)
-            .await
-            .map(|TypedHeader(auth)| auth.0.token() == key)
-            .unwrap_or(false);
-        req = Request::from_parts(parts, body);
-        if !authorized && !public {
-            return json_err(StatusCode::UNAUTHORIZED, "unauthorized");
-        }
-    }
-    next.run(req).await
-}
-
 /// Check service health.
 #[utoipa::path(
     get,
     path = "/api/health",
-    security(()),
     responses(
         (status = 200, description = "Service is healthy", body = HealthResponse)
     )
@@ -406,18 +427,15 @@ pub(crate) async fn health() -> Response {
 pub(crate) async fn status(State(st): State<AppState>) -> Response {
     let agent_count = st.registry.lock().await.pools().count();
     let session_count = st.sessions.lock().await.len();
-    let default_model = st
-        .cfg
-        .default_model
-        .as_ref()
-        .map(|m| format!("{}/{}", m.provider, m.model))
-        .unwrap_or_default();
+    let provider_count = st.ctx.drivers.read().unwrap().len();
+    let tool_count = st.ctx.tool_runner.specs().len();
     json_ok(json!({
         "status": "running",
         "agent_count": agent_count,
         "session_count": session_count,
-        "default_model": default_model,
-        "bind": st.cfg.server.bind.to_string(),
+        "provider_count": provider_count,
+        "tool_count": tool_count,
+        "bind": st.cfg.server.bind().to_string(),
     }))
 }
 
@@ -430,24 +448,8 @@ pub(crate) async fn status(State(st): State<AppState>) -> Response {
     )
 )]
 pub(crate) async fn config_info(State(st): State<AppState>) -> Response {
-    let providers: Vec<Value> = st
-        .cfg
-        .providers
-        .iter()
-        .map(|(name, p)| json!({"name": name, "driver": p.driver, "model": p.model}))
-        .collect();
-    let tools: Vec<Value> = st
-        .cfg
-        .tools
-        .iter()
-        .map(|(name, t)| json!({"name": name, "description": t.description}))
-        .collect();
     json_ok(json!({
-        "bind": st.cfg.server.bind.to_string(),
-        "api_key_set": st.cfg.api_key().is_some(),
-        "default_model": st.cfg.default_model,
-        "providers": providers,
-        "tools": tools,
+        "bind": st.cfg.server.bind().to_string(),
     }))
 }
 
@@ -501,6 +503,7 @@ pub(crate) async fn list_agents(State(st): State<AppState>) -> Response {
     request_body = AgentDef,
     responses(
         (status = 201, description = "Agent created", body = AgentCommandResponse),
+        (status = 400, description = "Model is not in 'provider/model' form or the provider is unknown", body = ErrorResponse),
         (status = 500, description = "Agent build or db failure", body = ErrorResponse)
     )
 )]
@@ -508,6 +511,9 @@ pub(crate) async fn create_agent(
     State(st): State<AppState>,
     Json(def): Json<AgentDef>,
 ) -> Response {
+    if let Some(err) = validate_agent_model(&st, &def) {
+        return json_err(StatusCode::BAD_REQUEST, err);
+    }
     if let Err(err) = st.db.insert_agent(&def) {
         return json_err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -520,6 +526,18 @@ pub(crate) async fn create_agent(
     };
     st.registry.lock().await.insert(def.kind.clone(), pool);
     json_created(json!({"kind": def.kind, "status": "created"}))
+}
+
+/// Validate that the agent's model is `provider/model` and the provider is registered.
+fn validate_agent_model(st: &AppState, def: &AgentDef) -> Option<&'static str> {
+    let (provider, model) = def.model.split_once('/')?;
+    if provider.is_empty() || model.is_empty() {
+        return Some("model must be in 'provider/model' form");
+    }
+    if !st.ctx.has_driver(provider) {
+        return Some("unknown provider in model");
+    }
+    None
 }
 
 /// Update an existing agent definition.
@@ -542,6 +560,9 @@ pub(crate) async fn update_agent(
 ) -> Response {
     if def.kind != path.kind {
         return json_err(StatusCode::BAD_REQUEST, "kind in body must match path");
+    }
+    if let Some(err) = validate_agent_model(&st, &def) {
+        return json_err(StatusCode::BAD_REQUEST, err);
     }
     if let Err(err) = st.db.insert_agent(&def) {
         return json_err(
@@ -585,6 +606,259 @@ pub(crate) async fn delete_agent(State(st): State<AppState>, path: AgentKindPath
         .await
         .retain(|_, entry| entry.kind != path.kind);
     json_ok(json!({"kind": path.kind, "status": "deleted", "sessions_deleted": sessions_deleted}))
+}
+
+/// List registered providers.
+#[utoipa::path(
+    get,
+    path = "/api/providers",
+    responses(
+        (status = 200, description = "Provider list", body = ProviderListResponse)
+    )
+)]
+pub(crate) async fn list_providers(State(st): State<AppState>) -> Response {
+    let providers = match st.db.list_providers() {
+        Ok(p) => p,
+        Err(err) => {
+            return json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("db error: {err}"),
+            );
+        }
+    };
+    json_ok(json!({"providers": providers, "total": providers.len()}))
+}
+
+/// Register a new provider (always OpenAI-compatible).
+#[utoipa::path(
+    post,
+    path = "/api/providers",
+    request_body = ProviderDef,
+    responses(
+        (status = 201, description = "Provider created", body = ProviderCommandResponse),
+        (status = 400, description = "Missing base_url", body = ErrorResponse),
+        (status = 500, description = "Driver build or db failure", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn create_provider(
+    State(st): State<AppState>,
+    Json(def): Json<ProviderDef>,
+) -> Response {
+    if def.base_url.is_empty() {
+        return json_err(StatusCode::BAD_REQUEST, "base_url is required");
+    }
+    let driver = match host::openai_driver(&def) {
+        Ok(d) => d,
+        Err(err) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
+    };
+    if let Err(err) = st.db.upsert_provider(&def) {
+        return json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("db error: {err}"),
+        );
+    }
+    st.ctx.register_driver(&def.name, driver);
+    json_created(json!({"name": def.name, "status": "created"}))
+}
+
+/// Update an existing provider.
+#[utoipa::path(
+    put,
+    path = "/api/providers/{name}",
+    params(
+        ("name" = String, Path, description = "Provider name")
+    ),
+    request_body = ProviderDef,
+    responses(
+        (status = 200, description = "Provider updated", body = ProviderCommandResponse),
+        (status = 400, description = "Name in body does not match path", body = ErrorResponse),
+        (status = 500, description = "Driver build or db failure", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn update_provider(
+    State(st): State<AppState>,
+    path: ProviderNamePath,
+    Json(def): Json<ProviderDef>,
+) -> Response {
+    if def.name != path.name {
+        return json_err(StatusCode::BAD_REQUEST, "name in body must match path");
+    }
+    if def.base_url.is_empty() {
+        return json_err(StatusCode::BAD_REQUEST, "base_url is required");
+    }
+    let driver = match host::openai_driver(&def) {
+        Ok(d) => d,
+        Err(err) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
+    };
+    if let Err(err) = st.db.upsert_provider(&def) {
+        return json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("db error: {err}"),
+        );
+    }
+    st.ctx.register_driver(&def.name, driver);
+    json_ok(json!({"name": def.name, "status": "updated"}))
+}
+
+/// Delete a provider.
+#[utoipa::path(
+    delete,
+    path = "/api/providers/{name}",
+    params(
+        ("name" = String, Path, description = "Provider name")
+    ),
+    responses(
+        (status = 200, description = "Provider deleted", body = ProviderCommandResponse),
+        (status = 500, description = "Db failure", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn delete_provider(
+    State(st): State<AppState>,
+    path: ProviderNamePath,
+) -> Response {
+    match st.db.delete_provider(&path.name) {
+        Ok(_) => {
+            st.ctx.remove_driver(&path.name);
+            json_ok(json!({"name": path.name, "status": "deleted"}))
+        }
+        Err(err) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("db error: {err}"),
+        ),
+    }
+}
+
+/// List registered tools (bundled `core/` built-ins plus `custom/` tools from the DB).
+#[utoipa::path(
+    get,
+    path = "/api/tools",
+    responses(
+        (status = 200, description = "Tool list", body = ToolListResponse)
+    )
+)]
+pub(crate) async fn list_tools(State(st): State<AppState>) -> Response {
+    let mut tools: Vec<ToolDef> = st
+        .ctx
+        .tool_runner
+        .specs()
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    json_ok(json!({"tools": tools, "total": tools.len()}))
+}
+
+/// Register a new `custom/` tool. The wasm module is base64-encoded in the request.
+#[utoipa::path(
+    post,
+    path = "/api/tools",
+    request_body = ToolReq,
+    responses(
+        (status = 201, description = "Tool created", body = ToolCommandResponse),
+        (status = 400, description = "Invalid tool name or wasm", body = ErrorResponse),
+        (status = 500, description = "Tool compile or db failure", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn create_tool(State(st): State<AppState>, Json(req): Json<ToolReq>) -> Response {
+    upsert_tool_common(&st, &req, "created", true)
+}
+
+fn upsert_tool_common(st: &AppState, req: &ToolReq, status: &str, created: bool) -> Response {
+    if !req.name.starts_with("custom/") {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            "tool name must start with 'custom/'",
+        );
+    }
+    let wasm =
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.wasm_b64) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    &format!("invalid base64 wasm: {err}"),
+                );
+            }
+        };
+    if wasm.is_empty() {
+        return json_err(StatusCode::BAD_REQUEST, "wasm must not be empty");
+    }
+    let def = ToolDef {
+        name: req.name.clone(),
+        description: req.description.clone(),
+        parameters: req.parameters.clone(),
+        env: req.env.clone(),
+    };
+    if let Err(err) = st.db.upsert_tool(&def, &wasm) {
+        return json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("db error: {err}"),
+        );
+    }
+    match st.ctx.register_tool(&def, &wasm) {
+        Ok(()) => {}
+        Err(err) => {
+            return json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("tool compile failed: {err}"),
+            );
+        }
+    }
+    if created {
+        json_created(json!({"name": def.name, "status": status}))
+    } else {
+        json_ok(json!({"name": def.name, "status": status}))
+    }
+}
+
+/// Update an existing `custom/` tool.
+#[utoipa::path(
+    put,
+    path = "/api/tools/{name}",
+    params(
+        ("name" = String, Path, description = "Tool name")
+    ),
+    request_body = ToolReq,
+    responses(
+        (status = 200, description = "Tool updated", body = ToolCommandResponse),
+        (status = 400, description = "Invalid tool name or wasm", body = ErrorResponse),
+        (status = 500, description = "Tool compile or db failure", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn update_tool(
+    State(st): State<AppState>,
+    path: ToolNamePath,
+    Json(req): Json<ToolReq>,
+) -> Response {
+    if req.name != path.name {
+        return json_err(StatusCode::BAD_REQUEST, "name in body must match path");
+    }
+    upsert_tool_common(&st, &req, "updated", false)
+}
+
+/// Delete a tool.
+#[utoipa::path(
+    delete,
+    path = "/api/tools/{name}",
+    params(
+        ("name" = String, Path, description = "Tool name")
+    ),
+    responses(
+        (status = 200, description = "Tool deleted", body = ToolCommandResponse),
+        (status = 500, description = "Db failure", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn delete_tool(State(st): State<AppState>, path: ToolNamePath) -> Response {
+    match st.db.delete_tool(&path.name) {
+        Ok(_) => {
+            st.ctx.remove_tool(&path.name);
+            json_ok(json!({"name": path.name, "status": "deleted"}))
+        }
+        Err(err) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("db error: {err}"),
+        ),
+    }
 }
 
 /// List active sessions.
@@ -1015,7 +1289,7 @@ pub(crate) async fn send_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::header::AUTHORIZATION;
+    use axum::http::Request;
     use carson_host::config::Config;
     use carson_host::db::Db;
     use carson_host::hub::Hub;
@@ -1029,15 +1303,12 @@ mod tests {
 
     use carson_host::host::HostContext;
 
-    fn config(api_key: &str) -> Config {
-        toml::from_str(&format!(
-            "[server]\nbind = \"127.0.0.1:8000\"\napi_key = \"{api_key}\"\n"
-        ))
-        .unwrap()
+    fn config() -> Config {
+        toml::from_str("[server]\nip = \"127.0.0.1\"\nport = 8000\n").unwrap()
     }
 
-    async fn app_state(config: Config) -> AppState {
-        let ctx = Arc::new(HostContext::new(&config).unwrap());
+    async fn app_state() -> AppState {
+        let ctx = Arc::new(HostContext::new().unwrap());
         let db = Db::open_in_memory().unwrap();
         AppState {
             ctx,
@@ -1046,16 +1317,14 @@ mod tests {
             hub: Hub::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             next_session_id: Arc::new(AtomicU64::new(0)),
-            cfg: Arc::new(config),
+            cfg: Arc::new(config()),
         }
     }
 
-    async fn response(app: Router, uri: &str, bearer: Option<&str>) -> Response {
-        let mut req = Request::builder().uri(uri);
-        if let Some(token) = bearer {
-            req = req.header(AUTHORIZATION, format!("Bearer {token}"));
-        }
-        app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
+    async fn response(app: Router, uri: &str) -> Response {
+        app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
     }
 
     async fn read(resp: Response) -> (StatusCode, Vec<(String, String)>, String) {
@@ -1069,10 +1338,51 @@ mod tests {
         (status, headers, String::from_utf8_lossy(&body).to_string())
     }
 
+    async fn post(app: &Router, uri: &str, body: &str) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn put(app: &Router, uri: &str, body: &str) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn delete(app: &Router, uri: &str) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn health_is_public_and_carries_security_headers() {
-        let app = router(app_state(config("sekret")).await);
-        let (status, headers, body) = read(response(app, "/api/health", None).await).await;
+        let app = router(app_state().await);
+        let (status, headers, body) = read(response(app, "/api/health").await).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("\"status\":\"ok\""));
         let header = |name: &str| headers.iter().any(|(k, _)| k == name);
@@ -1083,54 +1393,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_requires_valid_bearer_token() {
-        let app = router(app_state(config("sekret")).await);
-        let (status, _, _) = read(response(app.clone(), "/api/agents", None).await).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        let (status, _, _) = read(response(app.clone(), "/api/agents", Some("wrong")).await).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        let (status, _, _) = read(response(app, "/api/agents", Some("sekret")).await).await;
-        assert_eq!(status, StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn no_auth_required_when_api_key_unset() {
-        let app = router(app_state(config("")).await);
-        let (status, _, _) = read(response(app, "/api/agents", None).await).await;
-        assert_eq!(status, StatusCode::OK);
-    }
-
-    #[tokio::test]
     async fn read_endpoints_with_empty_registry() {
-        let app = router(app_state(config("")).await);
-        for path in ["/api/agents", "/api/sessions", "/api/status", "/api/config"] {
-            let (status, _, body) = read(response(app.clone(), path, None).await).await;
+        let app = router(app_state().await);
+        for path in [
+            "/api/agents",
+            "/api/sessions",
+            "/api/status",
+            "/api/config",
+            "/api/providers",
+            "/api/tools",
+        ] {
+            let (status, _, body) = read(response(app.clone(), path).await).await;
             assert_eq!(status, StatusCode::OK, "{path}: {body}");
         }
     }
 
     #[tokio::test]
     async fn unknown_path_is_404() {
-        let app = router(app_state(config("")).await);
-        let (status, _, _) = read(response(app, "/api/nope", None).await).await;
+        let app = router(app_state().await);
+        let (status, _, _) = read(response(app, "/api/nope").await).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn docs_page_is_public_and_served() {
-        let app = router(app_state(config("sekret")).await);
-        let (status, headers, _) = read(response(app.clone(), "/api", None).await).await;
+        let app = router(app_state().await);
+        let (status, headers, _) = read(response(app.clone(), "/api").await).await;
         assert_eq!(status, StatusCode::SEE_OTHER);
         assert!(headers.iter().any(|(k, v)| k == "location" && v == "/api/"));
-        let (status, _, body) = read(response(app, "/api/", None).await).await;
+        let (status, _, body) = read(response(app, "/api/").await).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("swagger"), "expected swagger page");
     }
 
     #[tokio::test]
     async fn openapi_spec_is_public_and_complete() {
-        let app = router(app_state(config("sekret")).await);
-        let (status, headers, body) = read(response(app, "/api/openapi.json", None).await).await;
+        let app = router(app_state().await);
+        let (status, headers, body) = read(response(app, "/api/openapi.json").await).await;
         assert_eq!(status, StatusCode::OK);
         assert!(headers.iter().any(|(k, _)| k == "content-type"));
         for needle in [
@@ -1138,10 +1437,87 @@ mod tests {
             "\"/api/agents\"",
             "\"/api/sessions/{id}\"",
             "\"/api/sessions/{id}/stream\"",
-            "\"bearerAuth\"",
-            "\"security\":[{\"bearerAuth\":[]}]",
+            "\"/api/providers\"",
+            "\"/api/tools\"",
         ] {
             assert!(body.contains(needle), "spec missing {needle}");
         }
+    }
+
+    #[tokio::test]
+    async fn provider_crud_roundtrip() {
+        let app = router(app_state().await);
+        let (status, _, body) = read(post(
+            &app,
+            "/api/providers",
+            r#"{"name":"groq","base_url":"https://api.groq.com/openai/v1","api_key_env":"GROQ_API_KEY"}"#,
+        ).await)
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, _, body) = read(response(app.clone(), "/api/providers").await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("groq"), "{body}");
+        let (status, _, body) = read(
+            put(
+                &app,
+                "/api/providers/groq",
+                r#"{"name":"groq","base_url":"https://changed.example","api_key_env":null}"#,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, _, _) = read(delete(&app, "/api/providers/groq").await).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn provider_requires_base_url() {
+        let app = router(app_state().await);
+        let (status, _, body) = read(
+            post(
+                &app,
+                "/api/providers",
+                r#"{"name":"groq","base_url":"","api_key_env":null}"#,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test]
+    async fn custom_tool_roundtrip() {
+        let app = router(app_state().await);
+        let engine = base64::engine::general_purpose::STANDARD;
+        let wasm =
+            base64::Engine::encode(&engine, carson_host::host::embedded_tool("echo").unwrap());
+        let (status, _, body) = read(post(
+            &app,
+            "/api/tools",
+            &format!(r#"{{"name":"custom/x","description":"d","parameters":{{}},"env":{{}},"wasm_b64":"{wasm}"}}"#),
+        ).await)
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, _, body) = read(response(app.clone(), "/api/tools").await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("custom/x"), "{body}");
+        let (status, _, _) = read(delete(&app, "/api/tools/custom/x").await).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn bundled_tool_name_is_rejected() {
+        let app = router(app_state().await);
+        let engine = base64::engine::general_purpose::STANDARD;
+        let wasm =
+            base64::Engine::encode(&engine, carson_host::host::embedded_tool("echo").unwrap());
+        let (status, _, body) = read(post(
+            &app,
+            "/api/tools",
+            &format!(r#"{{"name":"core/time","description":"d","parameters":{{}},"env":{{}},"wasm_b64":"{wasm}"}}"#),
+        ).await)
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     }
 }

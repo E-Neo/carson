@@ -1,23 +1,25 @@
-use carson_host::config::Config;
+use carson_host::registry::ToolDef;
 use carson_host::tools::ToolRunner;
 use wasmtime::Engine;
 
-fn tools_config() -> Config {
-    toml::from_str(
-        r#"
-[tools.time]
-description = "Return the current unix time in milliseconds"
-
-[tools.echo]
-description = "Echo back the provided arguments"
-"#,
-    )
-    .unwrap()
-}
-
 fn runner() -> ToolRunner {
     let engine = Engine::new(&wasmtime::Config::new()).unwrap();
-    ToolRunner::new(&engine, &tools_config()).unwrap()
+    let runner = ToolRunner::new(&engine);
+    for name in ["time", "echo"] {
+        let wasm = carson_host::host::embedded_tool(name).unwrap();
+        runner
+            .register(
+                &ToolDef {
+                    name: format!("core/{name}"),
+                    description: String::new(),
+                    parameters: serde_json::json!({}),
+                    env: Default::default(),
+                },
+                wasm,
+            )
+            .unwrap();
+    }
+    runner
 }
 
 #[test]
@@ -27,7 +29,7 @@ fn sandboxed_time_tool_returns_unix_ms() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis();
-    let out = runner.run("time", "{}").unwrap().unwrap();
+    let out = runner.run("core/time", "{}").unwrap().unwrap();
     let after = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -40,7 +42,7 @@ fn sandboxed_time_tool_returns_unix_ms() {
 #[test]
 fn sandboxed_echo_tool_returns_args() {
     let runner = runner();
-    assert_eq!(runner.run("echo", "abc").unwrap().unwrap(), "abc");
+    assert_eq!(runner.run("core/echo", "abc").unwrap().unwrap(), "abc");
 }
 
 #[test]
@@ -50,22 +52,38 @@ fn unknown_tool_is_none() {
 }
 
 #[test]
-fn third_party_tool_from_disk() {
-    let bytes = carson_host::host::embedded_tool("echo").unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("third-party.wasm");
-    std::fs::write(&path, bytes).unwrap();
+fn remove_drops_a_tool() {
+    let runner = runner();
+    assert!(runner.remove("core/echo"));
+    assert!(runner.run("core/echo", "x").is_none());
+    assert_eq!(
+        runner
+            .specs()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        ["core/time"]
+    );
+}
 
-    let config: Config = toml::from_str(&format!(
-        r#"
-[tools.custom]
-module = "{}"
-description = "Third-party tool"
-"#,
-        path.display()
-    ))
-    .unwrap();
+#[test]
+fn third_party_tool_registered_with_bytes() {
+    let bytes = carson_host::host::embedded_tool("echo").unwrap().to_vec();
     let engine = Engine::new(&wasmtime::Config::new()).unwrap();
-    let runner = ToolRunner::new(&engine, &config).unwrap();
-    assert_eq!(runner.run("custom", "hello").unwrap().unwrap(), "hello");
+    let runner = ToolRunner::new(&engine);
+    runner
+        .register(
+            &ToolDef {
+                name: "custom/tool".into(),
+                description: "Third-party tool".into(),
+                parameters: serde_json::json!({}),
+                env: Default::default(),
+            },
+            &bytes,
+        )
+        .unwrap();
+    assert_eq!(
+        runner.run("custom/tool", "hello").unwrap().unwrap(),
+        "hello"
+    );
 }

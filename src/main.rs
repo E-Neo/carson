@@ -71,7 +71,30 @@ async fn main() -> Result<()> {
     let db_path = home.join("carson.db");
     let db = Db::open(&db_path)?;
 
-    let ctx = Arc::new(HostContext::new(&config)?);
+    let ctx = Arc::new(HostContext::new()?);
+
+    for provider in db.list_providers()? {
+        match host::openai_driver(&provider) {
+            Ok(driver) => {
+                ctx.register_driver(&provider.name, driver);
+                tracing::info!(provider = %provider.name, "loaded provider");
+            }
+            Err(err) => {
+                tracing::warn!(provider = %provider.name, error = %err, "failed to build provider driver")
+            }
+        }
+    }
+    for tool in db.list_tools()? {
+        match db.get_tool_wasm(&tool.name)? {
+            Some(wasm) => match ctx.register_tool(&tool, &wasm) {
+                Ok(()) => tracing::info!(tool = %tool.name, "loaded tool"),
+                Err(err) => {
+                    tracing::warn!(tool = %tool.name, error = %err, "failed to compile tool")
+                }
+            },
+            None => tracing::warn!(tool = %tool.name, "tool row has no wasm"),
+        }
+    }
 
     let agents = db.list_agents()?;
     let registry = host::build_registry(&ctx, &agents).await?;
@@ -118,7 +141,7 @@ async fn main() -> Result<()> {
     }
 
     let app = router(app_state).layer(middleware::from_fn(trace));
-    let listener = tokio::net::TcpListener::bind(config.server.bind).await?;
+    let listener = tokio::net::TcpListener::bind(config.server.bind()).await?;
     let addr = listener.local_addr()?;
     tracing::info!("carson listening on http://{addr}");
     axum::serve(

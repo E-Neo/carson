@@ -1,40 +1,42 @@
 use std::sync::Arc;
 
 use carson_host::bindings::exports::carson::agent::agent::SessionConfig;
-use carson_host::config::Config;
 use carson_host::db::Db;
+use carson_host::drivers::EchoDriver;
 use carson_host::host::{HostContext, build_instance, restore_session, snapshot_session};
 use carson_host::hub::{Hub, SseItem};
-use carson_host::registry::{AgentDef, AgentInstance};
+use carson_host::registry::{AgentDef, AgentInstance, ToolDef};
 
-fn config() -> Config {
-    toml::from_str(
-        r#"
-[providers.mock]
-driver = "echo"
-model = "mock"
-
-[tools.time]
-description = "Return the current unix time in milliseconds"
-
-[tools.echo]
-description = "Echo back the provided arguments"
-"#,
-    )
-    .unwrap()
+fn ctx_with_fake() -> Arc<HostContext> {
+    let ctx = Arc::new(HostContext::new().unwrap());
+    ctx.register_driver("mock", Arc::new(EchoDriver));
+    for name in ["time", "echo"] {
+        let wasm = carson_host::host::embedded_tool(name).unwrap();
+        ctx.register_tool(
+            &ToolDef {
+                name: format!("core/{name}"),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+                env: Default::default(),
+            },
+            wasm,
+        )
+        .unwrap();
+    }
+    ctx
 }
 
 fn def() -> AgentDef {
     AgentDef {
         kind: "coder".into(),
         system_prompt: "You are a coding agent.".into(),
-        model: "mock".into(),
+        model: "mock/mock".into(),
         instances: 1,
         max_history: 40,
         context_window: 128_000,
         compaction_ratio: 0.8,
         auto_compact: true,
-        capabilities: vec!["time".into(), "echo".into()],
+        capabilities: vec!["core/time".into(), "core/echo".into()],
     }
 }
 
@@ -53,8 +55,7 @@ fn session_config(def: &AgentDef) -> SessionConfig {
 async fn make_instance_with(
     def: &AgentDef,
 ) -> (Arc<HostContext>, Arc<AgentInstance>, SessionConfig) {
-    let config = config();
-    let ctx = Arc::new(HostContext::new(&config).unwrap());
+    let ctx = ctx_with_fake();
     let instance = Arc::new(build_instance(&ctx, def).await.unwrap());
     (ctx, instance, session_config(def))
 }

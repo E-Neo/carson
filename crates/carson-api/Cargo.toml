@@ -7,6 +7,7 @@ edition.workspace = true
 anyhow.workspace = true
 axum = { version = "0.8", features = ["json", "query"] }
 axum-extra = { version = "0.12", features = ["typed-routing", "typed-header"] }
+base64 = "0.22"
 carson-host.workspace = true
 futures-util.workspace = true
 headers = "0.4"

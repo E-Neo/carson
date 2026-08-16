@@ -1,40 +1,42 @@
 use std::sync::Arc;
 
 use carson_host::bindings::exports::carson::agent::agent::{Error, SessionConfig};
-use carson_host::config::Config;
+use carson_host::drivers::EchoDriver;
 use carson_host::host::{HostContext, build_registry};
 use carson_host::hub::{Hub, SseItem};
-use carson_host::registry::{AgentDef, AgentInstance, AgentRegistry};
-
-fn config() -> Config {
-    toml::from_str(
-        r#"
-[providers.mock]
-driver = "echo"
-model = "mock"
-
-[tools.time]
-description = "Return the current unix time in milliseconds"
-
-[tools.echo]
-description = "Echo back the provided arguments"
-"#,
-    )
-    .unwrap()
-}
+use carson_host::registry::{AgentDef, AgentInstance, AgentRegistry, ToolDef};
 
 fn coder_def() -> AgentDef {
     AgentDef {
         kind: "coder".into(),
         system_prompt: "You are a coding agent.".into(),
-        model: "mock".into(),
+        model: "mock/mock".into(),
         instances: 1,
         max_history: 40,
         context_window: 128_000,
         compaction_ratio: 0.8,
         auto_compact: true,
-        capabilities: vec!["time".into(), "echo".into()],
+        capabilities: vec!["core/time".into(), "core/echo".into()],
     }
+}
+
+fn ctx_with_fake() -> Arc<HostContext> {
+    let ctx = Arc::new(HostContext::new().unwrap());
+    ctx.register_driver("mock", Arc::new(EchoDriver));
+    for name in ["time", "echo"] {
+        let wasm = carson_host::host::embedded_tool(name).unwrap();
+        ctx.register_tool(
+            &ToolDef {
+                name: format!("core/{name}"),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+                env: Default::default(),
+            },
+            wasm,
+        )
+        .unwrap();
+    }
+    ctx
 }
 
 async fn setup() -> (Arc<Hub>, Arc<AgentRegistry>, Arc<AgentInstance>) {
@@ -42,12 +44,11 @@ async fn setup() -> (Arc<Hub>, Arc<AgentRegistry>, Arc<AgentInstance>) {
 }
 
 async fn setup_with(agents: &[AgentDef]) -> (Arc<Hub>, Arc<AgentRegistry>, Arc<AgentInstance>) {
-    let config = config();
-    let ctx = HostContext::new(&config).unwrap();
+    let ctx = ctx_with_fake();
     let registry = build_registry(&ctx, agents).await.unwrap();
     let pool = registry.get("coder").expect("coder pool");
     let instance = pool.next();
-    (ctx.hub, Arc::new(registry), instance)
+    (ctx.hub.clone(), Arc::new(registry), instance)
 }
 
 async fn create_session_for(instance: &AgentInstance, session_id: u64, agent: &AgentDef) {
@@ -134,7 +135,7 @@ async fn tool_loop_invokes_time_and_continues() {
         .filter_map(|i| i.data.as_str())
         .collect::<Vec<_>>();
     assert_eq!(tool_use.len(), 1);
-    assert!(tool_use[0].contains("\"name\":\"time\""));
+    assert!(tool_use[0].contains("\"name\":\"core/time\""));
     assert_eq!(tool_result.len(), 1);
     assert!(tool_result[0].contains("unix_ms"));
     assert_eq!(chunk_text(&items), "Echo: what time is it?");
@@ -228,13 +229,13 @@ fn compaction_def(max_history: usize, context_window: usize, auto_compact: bool)
     AgentDef {
         kind: "coder".into(),
         system_prompt: "You are a coding agent.".into(),
-        model: "mock".into(),
+        model: "mock/mock".into(),
         instances: 1,
         max_history,
         context_window,
         compaction_ratio: 0.8,
         auto_compact,
-        capabilities: vec!["time".into(), "echo".into()],
+        capabilities: vec!["core/time".into(), "core/echo".into()],
     }
 }
 

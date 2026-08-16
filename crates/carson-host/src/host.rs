@@ -1,18 +1,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Engine, Store};
 use wasmtime_wasi::WasiCtxBuilder;
 
 use crate::bindings::AgentWorld;
-use crate::config::Config;
 use crate::db::{Db, PersistedSession, StoredMessage};
-use crate::drivers::{EchoDriver, LlmDriver, OpenAiCompatDriver, Usage};
+use crate::drivers::{LlmDriver, OpenAiCompatDriver, Usage};
 use crate::hub::Hub;
-use crate::registry::{AgentDef, AgentInstance, AgentPool, AgentRegistry};
+use crate::registry::{AgentDef, AgentInstance, AgentPool, AgentRegistry, ProviderDef, ToolDef};
 use crate::state::State;
 use crate::tools::{Capabilities, ToolRunner};
 
@@ -32,38 +32,66 @@ pub fn embedded_tool(name: &str) -> Option<&'static [u8]> {
     }
 }
 
-/// Shared, immutable state used to build every agent instance.
+/// Shared, immutable state used to build every agent instance. Providers and tools are registered
+/// at runtime via the API; the shared maps are the live source of truth.
 pub struct HostContext {
     pub engine: Engine,
     pub component: Component,
     pub hub: Arc<Hub>,
-    pub drivers: Arc<HashMap<String, Arc<dyn LlmDriver>>>,
-    pub default_provider: String,
+    pub drivers: Arc<RwLock<HashMap<String, Arc<dyn LlmDriver>>>>,
     pub tool_runner: Arc<ToolRunner>,
 }
 
 impl HostContext {
-    pub fn new(config: &Config) -> Result<Self> {
+    pub fn new() -> Result<Self> {
         let engine = Engine::new(&wasmtime::Config::new())?;
         let component = Component::new(&engine, EMBEDDED_AGENT)?;
-        let drivers = build_drivers(config)?;
         let hub = Hub::new();
-        let tool_runner = Arc::new(ToolRunner::new(&engine, config)?);
-        let default_provider = config
-            .default_model
-            .as_ref()
-            .map(|m| m.provider.clone())
-            .or_else(|| config.providers.keys().next().cloned())
-            .unwrap_or_default();
+        let tool_runner = Arc::new(ToolRunner::new(&engine));
         Ok(Self {
             engine,
             component,
             hub,
-            drivers,
-            default_provider,
+            drivers: Arc::new(RwLock::new(HashMap::new())),
             tool_runner,
         })
     }
+
+    pub fn register_driver(&self, name: &str, driver: Arc<dyn LlmDriver>) {
+        self.drivers
+            .write()
+            .unwrap()
+            .insert(name.to_string(), driver);
+    }
+
+    pub fn remove_driver(&self, name: &str) -> bool {
+        self.drivers.write().unwrap().remove(name).is_some()
+    }
+
+    pub fn has_driver(&self, name: &str) -> bool {
+        self.drivers.read().unwrap().contains_key(name)
+    }
+
+    pub fn register_tool(&self, def: &ToolDef, wasm: &[u8]) -> Result<()> {
+        self.tool_runner.register(def, wasm)
+    }
+
+    pub fn remove_tool(&self, name: &str) -> bool {
+        self.tool_runner.remove(name)
+    }
+}
+
+/// Build the runtime driver for a persisted provider (always OpenAI-compatible).
+pub fn openai_driver(def: &ProviderDef) -> Result<Arc<dyn LlmDriver>> {
+    let api_key = def
+        .api_key_env
+        .as_ref()
+        .and_then(|env| std::env::var(env).ok())
+        .unwrap_or_default();
+    Ok(Arc::new(OpenAiCompatDriver {
+        base_url: def.base_url.clone(),
+        api_key,
+    }))
 }
 
 pub async fn build_registry(ctx: &HostContext, agents: &[AgentDef]) -> Result<AgentRegistry> {
@@ -142,30 +170,6 @@ pub async fn restore_session(
     result.map_err(|err| anyhow::anyhow!("agent error: {err:?}"))
 }
 
-fn build_drivers(config: &Config) -> Result<Arc<HashMap<String, Arc<dyn LlmDriver>>>> {
-    let mut drivers: HashMap<String, Arc<dyn LlmDriver>> = HashMap::new();
-    for (name, provider) in &config.providers {
-        let driver: Arc<dyn LlmDriver> = match provider.driver.as_str() {
-            "echo" => Arc::new(EchoDriver),
-            "openai_compat" => {
-                let base_url = provider
-                    .base_url
-                    .clone()
-                    .context("openai_compat provider requires base_url")?;
-                let api_key = provider
-                    .api_key_env
-                    .as_ref()
-                    .and_then(|env| std::env::var(env).ok())
-                    .unwrap_or_default();
-                Arc::new(OpenAiCompatDriver { base_url, api_key })
-            }
-            other => anyhow::bail!("provider {name}: unknown driver {other}"),
-        };
-        drivers.insert(name.clone(), driver);
-    }
-    Ok(Arc::new(drivers))
-}
-
 pub async fn build_instance(ctx: &HostContext, def: &AgentDef) -> Result<AgentInstance> {
     let mut linker: Linker<State> = Linker::new(&ctx.engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
@@ -180,7 +184,6 @@ pub async fn build_instance(ctx: &HostContext, def: &AgentDef) -> Result<AgentIn
         table: ResourceTable::new(),
         hub: ctx.hub.clone(),
         drivers: ctx.drivers.clone(),
-        default_provider: ctx.default_provider.clone(),
         tool_runner: ctx.tool_runner.clone(),
         caps: Capabilities::from_names(def.capabilities.clone()),
         stop: Arc::new(AtomicBool::new(false)),

@@ -354,6 +354,7 @@ dependencies = [
  "anyhow",
  "axum",
  "axum-extra",
+ "base64",
  "carson-host",
  "futures-util",
  "headers",

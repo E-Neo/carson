@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 
 use crate::drivers::Usage;
-use crate::registry::AgentDef;
+use crate::registry::{AgentDef, ProviderDef, ToolDef};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS agents (
@@ -18,6 +18,22 @@ CREATE TABLE IF NOT EXISTS agents (
     compaction_ratio REAL NOT NULL DEFAULT 0.8,
     auto_compact INTEGER NOT NULL DEFAULT 1,
     capabilities_json TEXT NOT NULL DEFAULT '[]',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS providers (
+    name TEXT PRIMARY KEY,
+    base_url TEXT NOT NULL,
+    api_key_env TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tools (
+    name TEXT PRIMARY KEY,
+    description TEXT NOT NULL DEFAULT '',
+    parameters_json TEXT NOT NULL DEFAULT '{}',
+    env_json TEXT NOT NULL DEFAULT '{}',
+    wasm BLOB NOT NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -200,6 +216,90 @@ impl Db {
         tx.execute("DELETE FROM agents WHERE kind = ?1", params![kind])?;
         tx.commit()?;
         Ok(removed)
+    }
+
+    pub fn list_providers(&self) -> Result<Vec<ProviderDef>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT name, base_url, api_key_env FROM providers ORDER BY name")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ProviderDef {
+                name: row.get(0)?,
+                base_url: row.get(1)?,
+                api_key_env: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn upsert_provider(&self, def: &ProviderDef) -> Result<()> {
+        let now = now_ms();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO providers (name, base_url, api_key_env, created_at, updated_at) \
+             VALUES (?1,?2,?3,?4,?4) \
+             ON CONFLICT(name) DO UPDATE SET base_url=?2, api_key_env=?3, updated_at=?4",
+            params![def.name, def.base_url, def.api_key_env, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_provider(&self, name: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM providers WHERE name = ?1", params![name])?)
+    }
+
+    pub fn list_tools(&self) -> Result<Vec<ToolDef>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT name, description, parameters_json, env_json FROM tools ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let params: String = row.get(2)?;
+            let env: String = row.get(3)?;
+            Ok(ToolDef {
+                name: row.get(0)?,
+                description: row.get(1)?,
+                parameters: serde_json::from_str(&params).unwrap_or_default(),
+                env: serde_json::from_str(&env).unwrap_or_default(),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn get_tool_wasm(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT wasm FROM tools WHERE name = ?1")?;
+        let mut rows = stmt.query(params![name])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn upsert_tool(&self, def: &ToolDef, wasm: &[u8]) -> Result<()> {
+        let now = now_ms();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO tools (name, description, parameters_json, env_json, wasm, created_at, updated_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?6) \
+             ON CONFLICT(name) DO UPDATE SET description=?2, parameters_json=?3, env_json=?4, \
+             wasm=?5, updated_at=?6",
+            params![
+                def.name,
+                def.description,
+                serde_json::to_string(&def.parameters)?,
+                serde_json::to_string(&def.env)?,
+                wasm,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_tool(&self, name: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM tools WHERE name = ?1", params![name])?)
     }
 
     pub fn upsert_session(&self, session: &PersistedSession) -> Result<()> {
@@ -482,5 +582,50 @@ mod tests {
         let sessions = db.load_sessions().unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].kind, "researcher");
+    }
+
+    #[test]
+    fn provider_upsert_and_list() {
+        let db = Db::open_in_memory().unwrap();
+        let def = ProviderDef {
+            name: "groq".into(),
+            base_url: "https://api.groq.com/openai/v1".into(),
+            api_key_env: Some("GROQ_API_KEY".into()),
+        };
+        db.upsert_provider(&def).unwrap();
+        let mut changed = def.clone();
+        changed.base_url = "https://changed.example".into();
+        db.upsert_provider(&changed).unwrap();
+        let providers = db.list_providers().unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].base_url, "https://changed.example");
+        assert_eq!(providers[0].api_key_env.as_deref(), Some("GROQ_API_KEY"));
+        assert_eq!(db.delete_provider("groq").unwrap(), 1);
+        assert!(db.list_providers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn tool_upsert_list_and_wasm_roundtrip() {
+        let db = Db::open_in_memory().unwrap();
+        let def = ToolDef {
+            name: "custom/websearch".into(),
+            description: "Search the web".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            env: [("KEY".to_string(), "value".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        db.upsert_tool(&def, b"wasm-bytes").unwrap();
+        let tools = db.list_tools().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "custom/websearch");
+        assert_eq!(tools[0].description, "Search the web");
+        assert_eq!(tools[0].env["KEY"], "value");
+        assert_eq!(
+            db.get_tool_wasm("custom/websearch").unwrap().unwrap(),
+            b"wasm-bytes"
+        );
+        assert_eq!(db.delete_tool("custom/websearch").unwrap(), 1);
+        assert!(db.list_tools().unwrap().is_empty());
     }
 }

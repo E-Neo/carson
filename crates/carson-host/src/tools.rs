@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::RwLock;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-use crate::config::Config;
+use crate::registry::ToolDef;
 use crate::tool_bindings::ToolWorld;
 
 #[derive(Debug, Clone)]
@@ -14,6 +15,17 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+}
+
+impl From<ToolSpec> for ToolDef {
+    fn from(spec: ToolSpec) -> Self {
+        Self {
+            name: spec.name,
+            description: spec.description,
+            parameters: spec.parameters,
+            env: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -51,53 +63,58 @@ struct ToolSandbox {
     env: HashMap<String, String>,
 }
 
-/// Registers tool components that run in their own wasm sandboxes.
+/// Registers tool components that run in their own wasm sandboxes. Tools are added and removed at
+/// runtime as they are registered via the API.
 pub struct ToolRunner {
     engine: Arc<Engine>,
-    tools: HashMap<String, Arc<ToolSandbox>>,
-    specs: Vec<ToolSpec>,
+    tools: RwLock<HashMap<String, Arc<ToolSandbox>>>,
+    specs: RwLock<Vec<ToolSpec>>,
 }
 
 impl ToolRunner {
-    pub fn new(engine: &Engine, config: &Config) -> Result<Self> {
-        let mut tools = HashMap::new();
-        let mut specs = Vec::new();
-        for (name, kind) in &config.tools {
-            let bytes: &[u8] = match &kind.module {
-                Some(path) => {
-                    &std::fs::read(path).with_context(|| format!("read tool module {path}"))?
-                }
-                None => crate::host::embedded_tool(name)
-                    .with_context(|| format!("no embedded tool named '{name}'"))?,
-            };
-            let component = Arc::new(Component::new(engine, bytes)?);
-            tools.insert(
-                name.clone(),
-                Arc::new(ToolSandbox {
-                    component,
-                    env: kind.env.clone(),
-                }),
-            );
-            specs.push(ToolSpec {
-                name: name.clone(),
-                description: kind.description.clone(),
-                parameters: kind.parameters.clone(),
-            });
-        }
-        Ok(Self {
+    pub fn new(engine: &Engine) -> Self {
+        Self {
             engine: Arc::new(engine.clone()),
-            tools,
-            specs,
-        })
+            tools: RwLock::new(HashMap::new()),
+            specs: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// Register a tool component. `core/` names resolve to embedded bytes; `custom/` names use the
+    /// provided wasm.
+    pub fn register(&self, def: &ToolDef, wasm: &[u8]) -> Result<()> {
+        let component = Arc::new(Component::new(&self.engine, wasm)?);
+        let sandbox = Arc::new(ToolSandbox {
+            component,
+            env: def.env.clone(),
+        });
+        let mut tools = self.tools.write().unwrap();
+        let mut specs = self.specs.write().unwrap();
+        tools.insert(def.name.clone(), sandbox);
+        specs.retain(|spec| spec.name != def.name);
+        specs.push(ToolSpec {
+            name: def.name.clone(),
+            description: def.description.clone(),
+            parameters: def.parameters.clone(),
+        });
+        Ok(())
+    }
+
+    pub fn remove(&self, name: &str) -> bool {
+        let removed = self.tools.write().unwrap().remove(name).is_some();
+        if removed {
+            self.specs.write().unwrap().retain(|spec| spec.name != name);
+        }
+        removed
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.specs.clone()
+        self.specs.read().unwrap().clone()
     }
 
     pub fn run(&self, name: &str, args_json: &str) -> Option<Result<String, String>> {
-        let sandbox = self.tools.get(name)?;
-        Some(invoke_tool(&self.engine, sandbox, args_json))
+        let sandbox = self.tools.read().unwrap().get(name).cloned()?;
+        Some(invoke_tool(&self.engine, &sandbox, args_json))
     }
 }
 

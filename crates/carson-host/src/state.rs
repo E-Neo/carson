@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 
 use wasmtime::component::ResourceTable;
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
@@ -23,8 +23,7 @@ pub struct State {
     pub wasi: WasiCtx,
     pub table: ResourceTable,
     pub hub: Arc<Hub>,
-    pub drivers: Arc<HashMap<String, Arc<dyn LlmDriver>>>,
-    pub default_provider: String,
+    pub drivers: Arc<RwLock<HashMap<String, Arc<dyn LlmDriver>>>>,
     pub tool_runner: Arc<ToolRunner>,
     pub caps: Capabilities,
     pub stop: Arc<AtomicBool>,
@@ -41,12 +40,12 @@ impl WasiView for State {
     }
 }
 
-fn resolve_model(model: &str, default_provider: &str) -> (String, String) {
+fn resolve_model(model: &str) -> Option<(String, String)> {
     match model.split_once('/') {
         Some((provider, model)) if !provider.is_empty() && !model.is_empty() => {
-            (provider.to_string(), model.to_string())
+            Some((provider.to_string(), model.to_string()))
         }
-        _ => (default_provider.to_string(), model.to_string()),
+        _ => None,
     }
 }
 
@@ -88,9 +87,11 @@ impl crate::bindings::carson::agent::events::Host for State {
 
 impl crate::bindings::carson::agent::llm::Host for State {
     fn stream_start(&mut self, request: Request) -> Result<u64, LlmError> {
-        let (provider, model) = resolve_model(&request.model, &self.default_provider);
+        let (provider, model) = resolve_model(&request.model).ok_or(LlmError::Internal)?;
         let driver = self
             .drivers
+            .read()
+            .unwrap()
             .get(&provider)
             .cloned()
             .ok_or(LlmError::Internal)?;
@@ -260,40 +261,45 @@ mod tests {
     #[test]
     fn resolve_model_with_provider() {
         assert_eq!(
-            resolve_model("groq/llama-3", "mock"),
-            ("groq".to_string(), "llama-3".to_string())
+            resolve_model("groq/llama-3"),
+            Some(("groq".to_string(), "llama-3".to_string()))
         );
     }
 
     #[test]
-    fn resolve_model_default_provider() {
-        assert_eq!(
-            resolve_model("mock", "groq"),
-            ("groq".to_string(), "mock".to_string())
-        );
+    fn resolve_model_requires_provider() {
+        assert_eq!(resolve_model("mock"), None);
+        assert_eq!(resolve_model("/model"), None);
+        assert_eq!(resolve_model("provider/"), None);
     }
 
     fn test_state(tool_names: &[&str]) -> State {
         let engine = Engine::new(&wasmtime::Config::new()).unwrap();
-        let config: crate::config::Config = toml::from_str(
-            r#"
-[tools.time]
-description = "Return the current unix time in milliseconds"
-
-[tools.echo]
-description = "Echo back the provided arguments"
-"#,
-        )
-        .unwrap();
+        let tool_runner = Arc::new(ToolRunner::new(&engine));
+        let register = |name: &str| {
+            let wasm = crate::host::embedded_tool(name).unwrap();
+            tool_runner
+                .register(
+                    &crate::registry::ToolDef {
+                        name: format!("core/{name}"),
+                        description: String::new(),
+                        parameters: serde_json::json!({}),
+                        env: HashMap::new(),
+                    },
+                    wasm,
+                )
+                .unwrap();
+        };
+        register("time");
+        register("echo");
         let mut drivers: HashMap<String, Arc<dyn LlmDriver>> = HashMap::new();
         drivers.insert("mock".into(), Arc::new(crate::drivers::EchoDriver));
         State {
             wasi: WasiCtxBuilder::new().build(),
             table: ResourceTable::new(),
             hub: Hub::new(),
-            drivers: Arc::new(drivers),
-            default_provider: "mock".into(),
-            tool_runner: Arc::new(ToolRunner::new(&engine, &config).unwrap()),
+            drivers: Arc::new(RwLock::new(drivers)),
+            tool_runner,
             caps: Capabilities::from_names(tool_names.iter().map(|s| s.to_string()).collect()),
             stop: Arc::new(AtomicBool::new(false)),
             streams: HashMap::new(),
@@ -352,36 +358,36 @@ description = "Echo back the provided arguments"
 
     #[test]
     fn list_tools_is_filtered_by_capabilities() {
-        let mut state = test_state(&["time"]);
+        let mut state = test_state(&["core/time"]);
         let tools = state.list_tools();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "time");
+        assert_eq!(tools[0].name, "core/time");
     }
 
     #[test]
     fn invoke_enforces_capabilities() {
         use crate::bindings::carson::agent::tools::ToolError;
 
-        let mut state = test_state(&["time"]);
+        let mut state = test_state(&["core/time"]);
         assert_eq!(
-            state.invoke("echo".into(), "x".into()),
+            state.invoke("core/echo".into(), "x".into()),
             Err(ToolError::PermissionDenied)
         );
 
-        let mut state = test_state(&["nonexistent"]);
+        let mut state = test_state(&["core/nonexistent"]);
         assert_eq!(
-            state.invoke("nonexistent".into(), "{}".into()),
+            state.invoke("core/nonexistent".into(), "{}".into()),
             Err(ToolError::NotFound)
         );
 
-        let mut state = test_state(&["echo"]);
-        assert_eq!(state.invoke("echo".into(), "x".into()), Ok("x".into()));
+        let mut state = test_state(&["core/echo"]);
+        assert_eq!(state.invoke("core/echo".into(), "x".into()), Ok("x".into()));
     }
 
     fn request() -> Request {
         Request {
             session_id: 1,
-            model: "mock".into(),
+            model: "mock/mock".into(),
             messages: Vec::new(),
             system_prompt: None,
             tools: Vec::new(),

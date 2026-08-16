@@ -218,9 +218,14 @@ impl LlmDriver for EchoDriver {
             / 4;
 
         if wants_time && !has_tool_result && !req.tools.is_empty() {
+            let tool = req
+                .tools
+                .iter()
+                .find(|t| t.name.ends_with("/time") || t.name == "time")
+                .unwrap_or(&req.tools[0]);
             let tc = DriverToolCall {
                 id: "call_time".into(),
-                name: "time".into(),
+                name: tool.name.clone(),
                 arguments: "{}".into(),
             };
             let _ = tx.send(DriverEvent::ToolCallStart(tc.clone()));
