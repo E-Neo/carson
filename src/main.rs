@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use axum::Router;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::Request;
@@ -21,6 +22,12 @@ use serde_json::json;
 use crate::cli::Cli;
 
 mod cli;
+mod ui;
+
+/// The full app: JSON/SSE API (with strict CSP) merged with the embedded web UI.
+pub fn build_app(app_state: carson_host::app::AppState) -> Router {
+    router(app_state).merge(ui::router())
+}
 
 fn carson_home(cli_home: Option<PathBuf>) -> PathBuf {
     if let Some(home) = cli_home {
@@ -140,7 +147,7 @@ async fn main() -> Result<()> {
             .store(max_session_id, Ordering::SeqCst);
     }
 
-    let app = router(app_state).layer(middleware::from_fn(trace));
+    let app = build_app(app_state).layer(middleware::from_fn(trace));
     let listener = tokio::net::TcpListener::bind(config.server.bind()).await?;
     let addr = listener.local_addr()?;
     tracing::info!("carson listening on http://{addr}");
@@ -150,4 +157,135 @@ async fn main() -> Result<()> {
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use carson_host::app::AppState;
+    use carson_host::config::Config;
+    use carson_host::db::Db;
+    use carson_host::host::HostContext;
+    use carson_host::hub::Hub;
+    use carson_host::registry::AgentRegistry;
+    use http_body_util::BodyExt;
+    use tokio::sync::Mutex;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    fn config() -> Config {
+        toml::from_str("[server]\nip = \"127.0.0.1\"\nport = 8000\n").unwrap()
+    }
+
+    fn app() -> Router {
+        let ctx = Arc::new(HostContext::new().unwrap());
+        let db = Db::open_in_memory().unwrap();
+        let state = AppState {
+            ctx,
+            registry: Arc::new(Mutex::new(AgentRegistry::new())),
+            db,
+            hub: Hub::new(),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            next_session_id: Arc::new(AtomicU64::new(0)),
+            cfg: Arc::new(config()),
+        };
+        build_app(state)
+    }
+
+    async fn read(resp: Response) -> (StatusCode, String) {
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).to_string())
+    }
+
+    #[tokio::test]
+    async fn ui_serves_shell_at_root() {
+        let (status, body) = read(
+            app()
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("carson"), "{body}");
+        assert!(body.contains("/pkg/carson_ui.js"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn ui_serves_wasm_loader_glue() {
+        let (status, body) = read(
+            app()
+                .oneshot(
+                    Request::builder()
+                        .uri("/pkg/carson_ui.js")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("carson_ui_bg.wasm"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn ui_serves_the_wasm_module() {
+        let (status, body) = read(
+            app()
+                .oneshot(
+                    Request::builder()
+                        .uri("/pkg/carson_ui_bg.wasm")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.starts_with("\0asm"), "wasm magic bytes");
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_serves_shell_for_client_routes() {
+        let (status, body) = read(
+            app()
+                .oneshot(
+                    Request::builder()
+                        .uri("/chat/3")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("/pkg/carson_ui.js"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn unknown_api_path_stays_404() {
+        let (status, _) = read(
+            app()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/nope")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
 }
