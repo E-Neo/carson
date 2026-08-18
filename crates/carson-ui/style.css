@@ -41,16 +41,29 @@ body {
   overflow-y: auto;
 }
 
-.sidebar h1 {
+.brand-row h1 {
   font-size: 18px;
-  margin: 0 0 4px 0;
+  margin: 0;
 }
 
-.sidebar .sub {
+.brand-row .sub {
   color: var(--text-dim);
   font-size: 12px;
   margin-bottom: 8px;
 }
+
+.admin-link {
+  display: block;
+  text-align: center;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-dim);
+  text-decoration: none;
+  font-size: 13px;
+}
+
+.admin-link:hover { border-color: var(--accent); color: var(--text); }
 
 .session-list {
   display: flex;
@@ -135,13 +148,46 @@ body {
 
 .msg.user { align-self: flex-end; background: var(--accent); }
 
-.msg.assistant { align-self: flex-start; background: var(--bg-panel); border: 1px solid var(--border); }
+.msg.assistant {
+  align-self: flex-start;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.msg.assistant .assistant-text { white-space: pre-wrap; word-break: break-word; }
 
 .msg.system, .msg.summary { align-self: center; background: transparent; color: var(--text-dim); font-size: 13px; }
 
 .msg.tool { align-self: flex-start; background: var(--bg-input); font-family: var(--mono); font-size: 13px; }
 
 .msg.error { align-self: center; color: var(--danger); font-size: 13px; }
+
+.tool-card-inline {
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-family: var(--mono);
+}
+
+.tool-card-inline .tc-name { color: var(--accent); font-weight: 600; }
+
+.tool-card-inline .tc-args { margin-top: 2px; color: var(--text-dim); white-space: pre-wrap; word-break: break-word; }
+
+.tool-card-inline .tc-result {
+  margin-top: 4px;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-top: 1px dashed var(--border);
+  padding-top: 4px;
+}
+
+.tool-card-inline .tc-result.tc-error { color: var(--danger); }
 
 .tool-card {
   align-self: flex-start;
@@ -201,6 +247,17 @@ body {
   color: var(--text-dim);
   text-align: center;
 }
+
+.new-chat {
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-items: stretch;
+  width: min(360px, 90%);
+}
+
+.new-chat h2 { margin: 0 0 8px 0; text-align: center; }
 
 /* ---------- buttons / fields ---------- */
 .btn {
