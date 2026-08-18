@@ -311,7 +311,7 @@ mod tests {
     fn emit_event_forwards_to_hub() {
         let mut state = test_state(&["time"]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        state.hub.register(1, tx);
+        state.hub.register(1, tx.clone());
 
         let result = state.emit_event(
             1,
@@ -324,7 +324,7 @@ mod tests {
         let item: SseItem = rx.try_recv().unwrap();
         assert_eq!(item.event, "chunk");
         assert_eq!(item.data, serde_json::Value::String("hello".into()));
-        state.hub.unregister(1);
+        state.hub.unregister(1, &tx);
     }
 
     #[test]
@@ -344,7 +344,7 @@ mod tests {
     fn cancelled_tracks_stop_flag_and_hub() {
         let mut state = test_state(&["time"]);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        state.hub.register(3, tx);
+        state.hub.register(3, tx.clone());
         assert!(!state.cancelled(3));
 
         state.stop.store(true, Ordering::SeqCst);
@@ -352,7 +352,7 @@ mod tests {
         state.stop.store(false, Ordering::SeqCst);
         assert!(!state.cancelled(3));
 
-        state.hub.unregister(3);
+        state.hub.unregister(3, &tx);
         assert!(state.cancelled(3));
     }
 

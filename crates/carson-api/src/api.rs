@@ -1165,7 +1165,7 @@ pub(crate) async fn send_stream(
         return json_err(StatusCode::NOT_FOUND, "session not found");
     };
     let (tx, rx) = mpsc::unbounded_channel::<SseItem>();
-    st.hub.register(id, tx);
+    st.hub.register(id, tx.clone());
     let hub = st.hub.clone();
     let db = st.db.clone();
     let instance = entry.instance.clone();
@@ -1191,7 +1191,8 @@ pub(crate) async fn send_stream(
                 data: json!({"done": true, "usage": usage}),
             },
         );
-        hub.unregister(id);
+        hub.unregister(id, &tx);
+        drop(tx);
     });
 
     let stream = futures_util::stream::unfold(rx, |mut rx| async move {
@@ -1230,7 +1231,7 @@ pub(crate) async fn send_message(
         return json_err(StatusCode::NOT_FOUND, "session not found");
     };
     let (tx, mut rx) = mpsc::unbounded_channel::<SseItem>();
-    st.hub.register(id, tx);
+    st.hub.register(id, tx.clone());
     let hub = st.hub.clone();
     let db = st.db.clone();
     let instance = entry.instance.clone();
@@ -1256,7 +1257,8 @@ pub(crate) async fn send_message(
                 data: json!({"done": true, "usage": usage}),
             },
         );
-        hub.unregister(id);
+        hub.unregister(id, &tx);
+        drop(tx);
         usage
     });
 

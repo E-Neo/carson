@@ -77,7 +77,7 @@ async fn create_session(instance: &AgentInstance, id: u64, config: &SessionConfi
 
 async fn send_message(instance: &AgentInstance, hub: &Arc<Hub>, id: u64, content: &str) {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<SseItem>();
-    hub.register(id, tx);
+    hub.register(id, tx.clone());
     let mut store = instance.store.lock().await;
     let guest = instance.agent.carson_agent_agent();
     let (result,) = guest
@@ -87,7 +87,7 @@ async fn send_message(instance: &AgentInstance, hub: &Arc<Hub>, id: u64, content
         .unwrap();
     result.unwrap();
     drop(store);
-    hub.unregister(id);
+    hub.unregister(id, &tx);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -82,7 +82,7 @@ async fn send_message(
     content: &str,
 ) -> Vec<SseItem> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SseItem>();
-    hub.register(session_id, tx);
+    hub.register(session_id, tx.clone());
     let mut store = instance.store.lock().await;
     let guest = instance.agent.carson_agent_agent();
     let (result,) = guest
@@ -92,7 +92,7 @@ async fn send_message(
         .unwrap();
     result.unwrap();
     drop(store);
-    hub.unregister(session_id);
+    hub.unregister(session_id, &tx);
 
     let mut items = Vec::new();
     while let Ok(item) = rx.try_recv() {
