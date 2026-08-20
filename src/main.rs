@@ -237,7 +237,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(body.contains("carson"), "{body}");
+        assert!(body.contains("Carson"), "{body}");
         assert!(body.contains("/index.js"), "{body}");
     }
 

@@ -93,6 +93,15 @@ body {
 .session-item.active { background: var(--accent-dim); border-color: var(--accent); }
 
 .session-item .name {
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -157,7 +166,48 @@ body {
   gap: 6px;
 }
 
-.msg.assistant .assistant-text { white-space: pre-wrap; word-break: break-word; }
+.msg.assistant .assistant-text { white-space: normal; word-break: break-word; }
+
+.assistant-text > *:first-child { margin-top: 0; }
+.assistant-text > *:last-child { margin-bottom: 0; }
+.assistant-text p { margin: 0.5em 0; }
+.assistant-text h1, .assistant-text h2, .assistant-text h3, .assistant-text h4 {
+  margin: 0.7em 0 0.35em;
+  font-size: 1.15em;
+  line-height: 1.3;
+}
+.assistant-text h1 { font-size: 1.35em; }
+.assistant-text ul, .assistant-text ol { margin: 0.5em 0; padding-left: 1.4em; }
+.assistant-text li { margin: 0.2em 0; }
+.assistant-text code {
+  font-family: var(--mono);
+  font-size: 0.9em;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+.assistant-text pre {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  overflow-x: auto;
+  white-space: pre;
+}
+.assistant-text pre code { background: none; border: none; padding: 0; }
+.assistant-text a { color: var(--accent); }
+.assistant-text blockquote {
+  margin: 0.5em 0;
+  padding: 2px 12px;
+  border-left: 3px solid var(--accent);
+  color: var(--text-dim);
+}
+.assistant-text hr { border: none; border-top: 1px solid var(--border); margin: 0.8em 0; }
+.assistant-text table { border-collapse: collapse; margin: 0.5em 0; }
+.assistant-text th, .assistant-text td { border: 1px solid var(--border); padding: 4px 8px; }
+.assistant-text th { background: var(--bg-input); }
+.assistant-text input[type="checkbox"] { accent-color: var(--accent); }
 
 .msg.system, .msg.summary { align-self: center; background: transparent; color: var(--text-dim); font-size: 13px; }
 

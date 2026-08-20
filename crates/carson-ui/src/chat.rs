@@ -313,7 +313,7 @@ fn render_msg(msg: UiMsg) -> AnyView {
                         let t = thinking.get();
                         (!t.is_empty()).then(|| view! { <div class="thinking">{t}</div> })
                     }}
-                    <div class="assistant-text">{move || content.get()}</div>
+                    <MarkdownText text=content/>
                     <For
                         each=move || tools.get()
                         key=|card: &ToolCard| card.id.clone()
@@ -334,6 +334,43 @@ fn render_msg(msg: UiMsg) -> AnyView {
             }
             .into_any(),
     }
+}
+
+#[component]
+fn MarkdownText(text: RwSignal<String>) -> impl IntoView {
+    let node = NodeRef::<leptos::html::Div>::new();
+    Effect::new(move |_| {
+        if let Some(el) = node.get() {
+            el.set_inner_html(&render_md(&text.get()));
+        }
+    });
+    view! { <div class="assistant-text" node_ref=node></div> }
+}
+
+fn render_md(text: &str) -> String {
+    use pulldown_cmark::{Options, Parser};
+    let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let mut html = String::new();
+    pulldown_cmark::html::push_html(&mut html, Parser::new_ext(text, opts));
+    sanitize_hrefs(&html)
+}
+
+fn sanitize_hrefs(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(rel) = rest.find("href=\"") {
+        out.push_str(&rest[..rel]);
+        rest = &rest[rel + "href=\"".len()..];
+        let end = rest.find('"').map(|i| i + 1).unwrap_or(rest.len());
+        let (url, after) = rest.split_at(end);
+        let inner = url.strip_prefix('"').unwrap_or(url);
+        let blocked = inner.to_ascii_lowercase().starts_with("javascript:")
+            || inner.to_ascii_lowercase().starts_with("data:");
+        out.push_str(if blocked { "#\"" } else { url });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 #[component]
@@ -497,7 +534,7 @@ pub fn ChatPage() -> impl IntoView {
         <div class="app">
             <aside class="sidebar">
                 <div class="brand-row">
-                    <h1>"carson"</h1>
+                    <h1>"Carson"</h1>
                     <div class="sub">"wasm agent host"</div>
                 </div>
                 <button class="btn primary" on:click=move |_| new_chat()>"+ New chat"</button>

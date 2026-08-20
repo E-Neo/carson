@@ -68,6 +68,47 @@ async fn fetch_tools(tools: &RwSignal<Vec<Value>>) {
     }
 }
 
+fn tool_checks(tools: RwSignal<Vec<Value>>, caps: RwSignal<Vec<String>>) -> impl IntoView {
+    view! {
+        <div class="field">
+            <label>"Tools"</label>
+            {move || {
+                tools
+                    .get()
+                    .iter()
+                    .map(|t| {
+                        let owned = t.clone();
+                        let name = item_name(&owned);
+                        let label = name.clone();
+                        let checked_caps = caps;
+                        let checked_name = name.clone();
+                        let change_caps = caps;
+                        let change_name = name.clone();
+                        view! {
+                            <label class="check">
+                                <input type="checkbox"
+                                    prop:checked=move || checked_caps.get().contains(&checked_name)
+                                    on:change=move |ev| {
+                                        let checked = event_target_checked(&ev);
+                                        let mut v = change_caps.get();
+                                        if checked {
+                                            v.push(change_name.clone());
+                                        } else {
+                                            v.retain(|n| n != &change_name);
+                                        }
+                                        change_caps.set(v);
+                                    }/>
+                                {label}
+                            </label>
+                        }
+                        .into_any()
+                    })
+                    .collect::<Vec<_>>()
+            }}
+        </div>
+    }
+}
+
 fn show_notice(notice: &RwSignal<Option<String>>, ok: bool, msg: String) {
     notice.set(Some(format!("{}: {msg}", if ok { "ok" } else { "error" })));
 }
@@ -89,7 +130,7 @@ pub fn AdminPage() -> impl IntoView {
         <div class="app">
             <aside class="sidebar">
                 <div class="brand-row">
-                    <h1>"carson"</h1>
+                    <h1>"Carson"</h1>
                     <div class="sub">"admin"</div>
                 </div>
                 <button class=tab_class("status") on:click=move |_| tab.set("status".to_string())>"Status"</button>
@@ -356,9 +397,13 @@ fn AgentsPanel() -> impl IntoView {
     let edit_context_window = RwSignal::new(String::new());
     let edit_compaction_ratio = RwSignal::new(String::new());
     let edit_auto_compact = RwSignal::new(false);
+    let tools = RwSignal::new(Vec::<Value>::new());
+    let create_caps = RwSignal::new(Vec::<String>::new());
+    let edit_caps = RwSignal::new(Vec::<String>::new());
 
     spawn_local(async move {
         fetch_agents(&agents).await;
+        fetch_tools(&tools).await;
     });
 
     let create = move || {
@@ -381,7 +426,7 @@ fn AgentsPanel() -> impl IntoView {
                 "context_window": 4000,
                 "compaction_ratio": 0.8,
                 "auto_compact": false,
-                "capabilities": [],
+                "capabilities": create_caps.get(),
             });
             let (status, v) = api::post("/api/agents", &body)
                 .await
@@ -441,6 +486,16 @@ fn AgentsPanel() -> impl IntoView {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
         );
+        edit_caps.set(
+            item.get("capabilities")
+                .and_then(|c| c.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
         editing.set(Some(item));
     };
 
@@ -466,7 +521,7 @@ fn AgentsPanel() -> impl IntoView {
                 "context_window": edit_context_window.get().parse::<usize>().unwrap_or(4000),
                 "compaction_ratio": edit_compaction_ratio.get().parse::<f32>().unwrap_or(0.8),
                 "auto_compact": edit_auto_compact.get(),
-                "capabilities": [],
+                "capabilities": edit_caps.get(),
             });
             let path = format!("/api/agents/{k}");
             let (status, v) = api::put(&path, &body).await.unwrap_or((0, Value::Null));
@@ -502,6 +557,7 @@ fn AgentsPanel() -> impl IntoView {
                     <label>"System prompt"</label>
                     <textarea prop:value=move || system_prompt.get() on:input=move |ev| system_prompt.set(event_target_value(&ev))></textarea>
                 </div>
+                {tool_checks(tools, create_caps)}
                 <div><button class="btn primary" on:click=move |_| create()>"Create"</button></div>
             </div>
             <div class="panel-grid">
@@ -524,6 +580,16 @@ fn AgentsPanel() -> impl IntoView {
                             let instances = owned.get("instances").and_then(|n| n.as_u64()).unwrap_or(0);
                             let history = owned.get("max_history").and_then(|n| n.as_u64()).unwrap_or(0);
                             let auto = owned.get("auto_compact").and_then(|n| n.as_bool()).unwrap_or(false);
+                            let caps = owned
+                                .get("capabilities")
+                                .and_then(|c| c.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|x| x.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                                .unwrap_or_default();
                             let k2 = kind.clone();
                             let edit_item = owned.clone();
                             let is_editing = editing
@@ -566,6 +632,7 @@ fn AgentsPanel() -> impl IntoView {
                                             <input type="checkbox" prop:checked=move || edit_auto_compact.get() on:change=move |ev| edit_auto_compact.set(event_target_checked(&ev))/>
                                             "Auto compact"
                                         </label>
+                                        {tool_checks(tools, edit_caps)}
                                         <div class="row">
                                             <button class="btn primary" on:click=move |_| save_edit()>"Confirm"</button>
                                             <button class="btn" on:click=move |_| cancel_edit()>"Cancel"</button>
@@ -585,6 +652,7 @@ fn AgentsPanel() -> impl IntoView {
                                         </div>
                                         <div class="muted">{model}</div>
                                         <div class="muted">{format!("instances {instances} · max_history {history} · auto_compact {auto}")}</div>
+                                        <div class="muted">{format!("tools: {caps}")}</div>
                                     </div>
                                 }
                                 .into_any()
