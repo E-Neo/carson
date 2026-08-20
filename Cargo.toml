@@ -13,16 +13,18 @@ axum = { version = "0.8", features = ["json", "query"] }
 carson-api = { path = "crates/carson-api" }
 carson-host = { path = "crates/carson-host" }
 clap = { version = "4", features = ["derive", "env"] }
+hyper = "1"
+hyper-util = "0.1"
 include_dir = "0.7"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "sync", "macros"] }
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 toml = "1.1"
 http-body-util = "0.1"
-tower = { version = "0.5", features = ["util"] }
 
 [build-dependencies]
 serde_json = "1"

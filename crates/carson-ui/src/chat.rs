@@ -209,13 +209,16 @@ fn send(
     let body = json!({ "content": text });
     spawn_local(async move {
         let result = sse::stream_post(&path, &body, move |ev| match ev.event.as_str() {
-            "chunk" => content.update(|s| s.push_str(&ev.data)),
-            "thinking" => thinking.update(|s| {
-                if !s.is_empty() {
-                    s.push('\n');
-                }
-                s.push_str(&ev.data);
-            }),
+            "chunk" => {
+                let text =
+                    serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
+                content.update(|s| s.push_str(&text));
+            }
+            "thinking" => {
+                let text =
+                    serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
+                thinking.update(|s| s.push_str(&text));
+            }
             "tool_use" => {
                 if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
                     tools.update(|t| {
@@ -264,7 +267,11 @@ fn send(
                     });
                 }
             }
-            "status" => status_line.set(Some(ev.data.clone())),
+            "status" => {
+                let text =
+                    serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
+                status_line.set(Some(text));
+            }
             "error" => {
                 let msg = serde_json::from_str::<Value>(&ev.data)
                     .ok()

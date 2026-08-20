@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS agents (
 CREATE TABLE IF NOT EXISTS providers (
     name TEXT PRIMARY KEY,
     base_url TEXT NOT NULL,
-    api_key_env TEXT,
+    api_key TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -64,6 +64,30 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Apply additive schema changes to databases created by older binaries.
+fn migrate(conn: &Connection) -> Result<()> {
+    let has_column = |table: &str, column: &str| -> Result<bool> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    if !has_column("providers", "api_key")? {
+        conn.execute("ALTER TABLE providers ADD COLUMN api_key TEXT", [])
+            .context("migrate providers.api_key")?;
+    }
+    // Drop the legacy env-var column when the sqlite version supports it.
+    if has_column("providers", "api_key_env")? {
+        let _ = conn.execute("ALTER TABLE providers DROP COLUMN api_key_env", []);
+    }
+    Ok(())
 }
 
 /// A serializable conversation message (mirrors the WIT `message` record).
@@ -142,6 +166,7 @@ impl Db {
             Connection::open(path).with_context(|| format!("open database {}", path.display()))?;
         conn.execute_batch(SCHEMA)
             .with_context(|| format!("initialize schema in {}", path.display()))?;
+        migrate(&conn)?;
         Ok(Arc::new(Self {
             conn: Mutex::new(conn),
         }))
@@ -150,6 +175,7 @@ impl Db {
     pub fn open_in_memory() -> Result<Arc<Self>> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Arc::new(Self {
             conn: Mutex::new(conn),
         }))
@@ -221,12 +247,12 @@ impl Db {
     pub fn list_providers(&self) -> Result<Vec<ProviderDef>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt =
-            conn.prepare("SELECT name, base_url, api_key_env FROM providers ORDER BY name")?;
+            conn.prepare("SELECT name, base_url, api_key FROM providers ORDER BY name")?;
         let rows = stmt.query_map([], |row| {
             Ok(ProviderDef {
                 name: row.get(0)?,
                 base_url: row.get(1)?,
-                api_key_env: row.get(2)?,
+                api_key: row.get(2)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -236,10 +262,10 @@ impl Db {
         let now = now_ms();
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO providers (name, base_url, api_key_env, created_at, updated_at) \
+            "INSERT INTO providers (name, base_url, api_key, created_at, updated_at) \
              VALUES (?1,?2,?3,?4,?4) \
-             ON CONFLICT(name) DO UPDATE SET base_url=?2, api_key_env=?3, updated_at=?4",
-            params![def.name, def.base_url, def.api_key_env, now],
+             ON CONFLICT(name) DO UPDATE SET base_url=?2, api_key=?3, updated_at=?4",
+            params![def.name, def.base_url, def.api_key, now],
         )?;
         Ok(())
     }
@@ -273,6 +299,27 @@ impl Db {
         let mut rows = stmt.query(params![name])?;
         match rows.next()? {
             Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn get_tool_def(&self, name: &str) -> Result<Option<ToolDef>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT name, description, parameters_json, env_json FROM tools WHERE name = ?1",
+        )?;
+        let mut rows = stmt.query(params![name])?;
+        match rows.next()? {
+            Some(row) => {
+                let params: String = row.get(2)?;
+                let env: String = row.get(3)?;
+                Ok(Some(ToolDef {
+                    name: row.get(0)?,
+                    description: row.get(1)?,
+                    parameters: serde_json::from_str(&params).unwrap_or_default(),
+                    env: serde_json::from_str(&env).unwrap_or_default(),
+                }))
+            }
             None => Ok(None),
         }
     }
@@ -590,7 +637,7 @@ mod tests {
         let def = ProviderDef {
             name: "groq".into(),
             base_url: "https://api.groq.com/openai/v1".into(),
-            api_key_env: Some("GROQ_API_KEY".into()),
+            api_key: Some("gsk-secret".into()),
         };
         db.upsert_provider(&def).unwrap();
         let mut changed = def.clone();
@@ -599,7 +646,7 @@ mod tests {
         let providers = db.list_providers().unwrap();
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].base_url, "https://changed.example");
-        assert_eq!(providers[0].api_key_env.as_deref(), Some("GROQ_API_KEY"));
+        assert_eq!(providers[0].api_key.as_deref(), Some("gsk-secret"));
         assert_eq!(db.delete_provider("groq").unwrap(), 1);
         assert!(db.list_providers().unwrap().is_empty());
     }

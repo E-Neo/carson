@@ -10,7 +10,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use crate::registry::ToolDef;
 use crate::tool_bindings::ToolWorld;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,

@@ -83,11 +83,7 @@ impl HostContext {
 
 /// Build the runtime driver for a persisted provider (always OpenAI-compatible).
 pub fn openai_driver(def: &ProviderDef) -> Result<Arc<dyn LlmDriver>> {
-    let api_key = def
-        .api_key_env
-        .as_ref()
-        .and_then(|env| std::env::var(env).ok())
-        .unwrap_or_default();
+    let api_key = def.api_key.clone().unwrap_or_default();
     Ok(Arc::new(OpenAiCompatDriver {
         base_url: def.base_url.clone(),
         api_key,

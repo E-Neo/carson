@@ -13,6 +13,7 @@ fn main() {
         "crates/carson-ui/Cargo.toml",
         "crates/carson-ui/src",
         "crates/carson-ui/index.html",
+        "crates/carson-ui/index.js",
         "crates/carson-ui/style.css",
     ] {
         println!(
@@ -31,6 +32,11 @@ fn main() {
         dist.join("index.html"),
     )
     .expect("copy index.html");
+    std::fs::copy(
+        manifest_dir.join("crates/carson-ui/index.js"),
+        dist.join("index.js"),
+    )
+    .expect("copy index.js");
     std::fs::copy(
         manifest_dir.join("crates/carson-ui/style.css"),
         dist.join("style.css"),

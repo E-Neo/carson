@@ -346,6 +346,8 @@ body {
 
 .card .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
+.check { display: flex; gap: 6px; align-items: center; font-size: 13px; color: var(--text-dim); cursor: pointer; }
+
 .status-ok { color: var(--ok); }
 .status-err { color: var(--danger); }
 

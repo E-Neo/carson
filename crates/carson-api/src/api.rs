@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use axum::body::{Body, Bytes};
@@ -188,7 +189,7 @@ pub struct StatusResponse {
 
 #[derive(ToSchema)]
 #[schema(example = json!({
-    "providers": [{"name": "groq", "base_url": "https://api.groq.com/openai/v1", "api_key_env": "GROQ_API_KEY"}],
+    "providers": [{"name": "groq", "base_url": "https://api.groq.com/openai/v1"}],
     "total": 1
 }))]
 pub struct ProviderListResponse {
@@ -737,14 +738,39 @@ pub(crate) async fn delete_provider(
     )
 )]
 pub(crate) async fn list_tools(State(st): State<AppState>) -> Response {
-    let mut tools: Vec<ToolDef> = st
+    let mut tools: Vec<Value> = st
         .ctx
         .tool_runner
         .specs()
         .into_iter()
-        .map(Into::into)
+        .map(|spec| {
+            let name = spec.name.clone();
+            if name.starts_with("custom/")
+                && let Ok(Some(def)) = st.db.get_tool_def(&name)
+            {
+                let mut v = serde_json::to_value(&def).unwrap_or(Value::Null);
+                if let Ok(Some(wasm)) = st.db.get_tool_wasm(&name)
+                    && let Some(obj) = v.as_object_mut()
+                {
+                    obj.insert(
+                        "wasm_b64".into(),
+                        Value::String(base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            wasm,
+                        )),
+                    );
+                }
+                v
+            } else {
+                serde_json::to_value(spec).unwrap_or(Value::Null)
+            }
+        })
         .collect();
-    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    tools.sort_by(|a, b| {
+        a.get("name")
+            .and_then(|n| n.as_str())
+            .cmp(&b.get("name").and_then(|n| n.as_str()))
+    });
     json_ok(json!({"tools": tools, "total": tools.len()}))
 }
 
@@ -1110,6 +1136,22 @@ pub(crate) async fn compact_session(State(st): State<AppState>, path: CompactPat
     }
 }
 
+async fn run_message_blocking(
+    instance: Arc<AgentInstance>,
+    session_id: u64,
+    content: String,
+) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build blocking runtime");
+        rt.block_on(run_message(&instance, session_id, &content))
+    })
+    .await
+    .unwrap_or_else(|err| Err(anyhow::anyhow!("agent task join failed: {err}")))
+}
+
 async fn run_message(
     instance: &AgentInstance,
     session_id: u64,
@@ -1172,7 +1214,7 @@ pub(crate) async fn send_stream(
 
     tokio::spawn(async move {
         instance.stop.store(false, Ordering::SeqCst);
-        let result = run_message(&instance, id, &req.content).await;
+        let result = run_message_blocking(instance.clone(), id, req.content.clone()).await;
         host::snapshot_session(&db, &instance, id).await;
         let usage = session_usage(&instance, id).await;
         if result.is_err() {
@@ -1238,7 +1280,7 @@ pub(crate) async fn send_message(
 
     let task = tokio::spawn(async move {
         instance.stop.store(false, Ordering::SeqCst);
-        let result = run_message(&instance, id, &req.content).await;
+        let result = run_message_blocking(instance.clone(), id, req.content.clone()).await;
         host::snapshot_session(&db, &instance, id).await;
         let usage = session_usage(&instance, id).await;
         if result.is_err() {
@@ -1452,18 +1494,22 @@ mod tests {
         let (status, _, body) = read(post(
             &app,
             "/api/providers",
-            r#"{"name":"groq","base_url":"https://api.groq.com/openai/v1","api_key_env":"GROQ_API_KEY"}"#,
+            r#"{"name":"groq","base_url":"https://api.groq.com/openai/v1","api_key":"gsk-secret"}"#,
         ).await)
         .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         let (status, _, body) = read(response(app.clone(), "/api/providers").await).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("groq"), "{body}");
+        assert!(
+            !body.contains("gsk-secret"),
+            "api key must not be exposed: {body}"
+        );
         let (status, _, body) = read(
             put(
                 &app,
                 "/api/providers/groq",
-                r#"{"name":"groq","base_url":"https://changed.example","api_key_env":null}"#,
+                r#"{"name":"groq","base_url":"https://changed.example","api_key":null}"#,
             )
             .await,
         )
@@ -1480,7 +1526,7 @@ mod tests {
             post(
                 &app,
                 "/api/providers",
-                r#"{"name":"groq","base_url":"","api_key_env":null}"#,
+                r#"{"name":"groq","base_url":"","api_key":null}"#,
             )
             .await,
         )

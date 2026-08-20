@@ -37,6 +37,13 @@ fn err_of(v: &Value) -> String {
         .to_string()
 }
 
+fn item_name(item: &Value) -> String {
+    item.get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
 async fn fetch_providers(providers: &RwSignal<Vec<Value>>) {
     if let Ok((_, v)) = api::get("/api/providers").await
         && let Some(list) = v.get("providers").and_then(|x| x.as_array())
@@ -153,8 +160,11 @@ fn ProvidersPanel() -> impl IntoView {
     let providers = RwSignal::new(Vec::<Value>::new());
     let name = RwSignal::new(String::new());
     let base_url = RwSignal::new(String::new());
-    let api_key_env = RwSignal::new(String::new());
+    let api_key = RwSignal::new(String::new());
     let notice = RwSignal::new(None::<String>);
+    let editing = RwSignal::new(None::<Value>);
+    let edit_base_url = RwSignal::new(String::new());
+    let edit_api_key = RwSignal::new(String::new());
 
     spawn_local(async move {
         fetch_providers(&providers).await;
@@ -163,12 +173,12 @@ fn ProvidersPanel() -> impl IntoView {
     let create = move || {
         let n = name.get();
         let b = base_url.get();
-        let k = api_key_env.get();
+        let k = api_key.get();
         if n.is_empty() || b.is_empty() {
             show_notice(&notice, false, "name and base_url are required".to_string());
             return;
         }
-        let key_env = if k.is_empty() {
+        let key = if k.is_empty() {
             Value::Null
         } else {
             Value::String(k)
@@ -178,14 +188,14 @@ fn ProvidersPanel() -> impl IntoView {
         spawn_local(async move {
             let (status, v) = api::post(
                 "/api/providers",
-                &json!({ "name": n, "base_url": b, "api_key_env": key_env }),
+                &json!({ "name": n, "base_url": b, "api_key": key }),
             )
             .await
             .unwrap_or((0, Value::Null));
             if status == 201 {
                 name.set(String::new());
                 base_url.set(String::new());
-                api_key_env.set(String::new());
+                api_key.set(String::new());
                 show_notice(&notice, true, "provider created".to_string());
                 fetch_providers(&providers).await;
             } else {
@@ -201,6 +211,47 @@ fn ProvidersPanel() -> impl IntoView {
             let _ = api::delete(&format!("/api/providers/{name}")).await;
             show_notice(&notice, true, format!("deleted {name}"));
             fetch_providers(&providers).await;
+        });
+    };
+
+    let start_edit = move |item: Value| {
+        edit_base_url.set(
+            item.get("base_url")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string(),
+        );
+        edit_api_key.set(String::new());
+        editing.set(Some(item));
+    };
+
+    let cancel_edit = move || editing.set(None);
+
+    let save_edit = move || {
+        let Some(item) = editing.get() else { return };
+        let n = item_name(&item);
+        let b = edit_base_url.get();
+        let k = edit_api_key.get();
+        let key = if k.is_empty() {
+            Value::Null
+        } else {
+            Value::String(k)
+        };
+        let providers = providers;
+        let notice = notice;
+        let editing = editing;
+        spawn_local(async move {
+            let path = format!("/api/providers/{n}");
+            let (status, v) = api::put(&path, &json!({ "name": n, "base_url": b, "api_key": key }))
+                .await
+                .unwrap_or((0, Value::Null));
+            if status == 200 {
+                editing.set(None);
+                show_notice(&notice, true, "provider updated".to_string());
+                fetch_providers(&providers).await;
+            } else {
+                show_notice(&notice, false, err_of(&v));
+            }
         });
     };
 
@@ -223,8 +274,8 @@ fn ProvidersPanel() -> impl IntoView {
                     <input prop:value=move || base_url.get() on:input=move |ev| base_url.set(event_target_value(&ev)) placeholder="https://api.groq.com/openai/v1"/>
                 </div>
                 <div class="field">
-                    <label>"API key env var (optional)"</label>
-                    <input prop:value=move || api_key_env.get() on:input=move |ev| api_key_env.set(event_target_value(&ev)) placeholder="GROQ_API_KEY"/>
+                    <label>"API key (optional)"</label>
+                    <input type="password" prop:value=move || api_key.get() on:input=move |ev| api_key.set(event_target_value(&ev)) placeholder="sk-…"/>
                 </div>
                 <div><button class="btn primary" on:click=move |_| create()>"Create"</button></div>
             </div>
@@ -234,19 +285,53 @@ fn ProvidersPanel() -> impl IntoView {
                         .get()
                         .iter()
                         .map(|p| {
-                            let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                            let base = p.get("base_url").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                            let env = p.get("api_key_env").and_then(|n| n.as_str()).unwrap_or("-").to_string();
+                            let owned = p.clone();
+                            let name = item_name(&owned);
+                            let base = owned
+                                .get("base_url")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             let n2 = name.clone();
-                            view! {
-                                <div class="card">
-                                    <div class="row">
+                            let edit_item = owned.clone();
+                            let is_editing = editing
+                                .get()
+                                .as_ref()
+                                .map(item_name)
+                                == Some(name.clone());
+                            if is_editing {
+                                view! {
+                                    <div class="card">
                                         <h3>{name}</h3>
-                                        <button class="btn danger" on:click=move |_| remove(n2.clone())>"Delete"</button>
+                                        <div class="field">
+                                            <label>"Base URL"</label>
+                                            <input prop:value=move || edit_base_url.get() on:input=move |ev| edit_base_url.set(event_target_value(&ev))/>
+                                        </div>
+                                        <div class="field">
+                                            <label>"API key (blank clears it)"</label>
+                                            <input type="password" prop:value=move || edit_api_key.get() on:input=move |ev| edit_api_key.set(event_target_value(&ev)) placeholder="sk-…"/>
+                                        </div>
+                                        <div class="row">
+                                            <button class="btn primary" on:click=move |_| save_edit()>"Confirm"</button>
+                                            <button class="btn" on:click=move |_| cancel_edit()>"Cancel"</button>
+                                        </div>
                                     </div>
-                                    <div class="muted">{base}</div>
-                                    <div class="muted">{"env: "}{env}</div>
-                                </div>
+                                }
+                                .into_any()
+                            } else {
+                                view! {
+                                    <div class="card">
+                                        <div class="row">
+                                            <h3>{name}</h3>
+                                            <div class="row">
+                                                <button class="btn" on:click=move |_| start_edit(edit_item.clone())>"Edit"</button>
+                                                <button class="btn danger" on:click=move |_| remove(n2.clone())>"Delete"</button>
+                                            </div>
+                                        </div>
+                                        <div class="muted">{base}</div>
+                                    </div>
+                                }
+                                .into_any()
                             }
                         })
                         .collect::<Vec<_>>()
@@ -263,6 +348,14 @@ fn AgentsPanel() -> impl IntoView {
     let system_prompt = RwSignal::new(String::new());
     let model = RwSignal::new(String::new());
     let notice = RwSignal::new(None::<String>);
+    let editing = RwSignal::new(None::<Value>);
+    let edit_system_prompt = RwSignal::new(String::new());
+    let edit_model = RwSignal::new(String::new());
+    let edit_instances = RwSignal::new(String::new());
+    let edit_max_history = RwSignal::new(String::new());
+    let edit_context_window = RwSignal::new(String::new());
+    let edit_compaction_ratio = RwSignal::new(String::new());
+    let edit_auto_compact = RwSignal::new(false);
 
     spawn_local(async move {
         fetch_agents(&agents).await;
@@ -315,6 +408,78 @@ fn AgentsPanel() -> impl IntoView {
         });
     };
 
+    let start_edit = move |item: Value| {
+        let num = |key: &str, d: i64| {
+            item.get(key)
+                .and_then(|v| v.as_i64())
+                .unwrap_or(d)
+                .to_string()
+        };
+        edit_system_prompt.set(
+            item.get("system_prompt")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string(),
+        );
+        edit_model.set(
+            item.get("model")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string(),
+        );
+        edit_instances.set(num("instances", 1));
+        edit_max_history.set(num("max_history", 20));
+        edit_context_window.set(num("context_window", 4000));
+        edit_compaction_ratio.set(
+            item.get("compaction_ratio")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.8)
+                .to_string(),
+        );
+        edit_auto_compact.set(
+            item.get("auto_compact")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        );
+        editing.set(Some(item));
+    };
+
+    let cancel_edit = move || editing.set(None);
+
+    let save_edit = move || {
+        let Some(item) = editing.get() else { return };
+        let k = item
+            .get("kind")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let agents = agents;
+        let notice = notice;
+        let editing = editing;
+        spawn_local(async move {
+            let body = json!({
+                "kind": k,
+                "system_prompt": edit_system_prompt.get(),
+                "model": edit_model.get(),
+                "instances": edit_instances.get().parse::<usize>().unwrap_or(1),
+                "max_history": edit_max_history.get().parse::<usize>().unwrap_or(20),
+                "context_window": edit_context_window.get().parse::<usize>().unwrap_or(4000),
+                "compaction_ratio": edit_compaction_ratio.get().parse::<f32>().unwrap_or(0.8),
+                "auto_compact": edit_auto_compact.get(),
+                "capabilities": [],
+            });
+            let path = format!("/api/agents/{k}");
+            let (status, v) = api::put(&path, &body).await.unwrap_or((0, Value::Null));
+            if status == 200 {
+                editing.set(None);
+                show_notice(&notice, true, "agent updated".to_string());
+                fetch_agents(&agents).await;
+            } else {
+                show_notice(&notice, false, err_of(&v));
+            }
+        });
+    };
+
     view! {
         <div class="admin">
             <h2>"Agents"</h2>
@@ -345,21 +510,84 @@ fn AgentsPanel() -> impl IntoView {
                         .get()
                         .iter()
                         .map(|a| {
-                            let kind = a.get("kind").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                            let model = a.get("model").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                            let instances = a.get("instances").and_then(|n| n.as_u64()).unwrap_or(0);
-                            let history = a.get("max_history").and_then(|n| n.as_u64()).unwrap_or(0);
-                            let auto = a.get("auto_compact").and_then(|n| n.as_bool()).unwrap_or(false);
+                            let owned = a.clone();
+                            let kind = owned
+                                .get("kind")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let model = owned
+                                .get("model")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let instances = owned.get("instances").and_then(|n| n.as_u64()).unwrap_or(0);
+                            let history = owned.get("max_history").and_then(|n| n.as_u64()).unwrap_or(0);
+                            let auto = owned.get("auto_compact").and_then(|n| n.as_bool()).unwrap_or(false);
                             let k2 = kind.clone();
-                            view! {
-                                <div class="card">
-                                    <div class="row">
+                            let edit_item = owned.clone();
+                            let is_editing = editing
+                                .get()
+                                .and_then(|e| e.get("kind").and_then(|x| x.as_str()).map(|s| s.to_string()))
+                                == Some(kind.clone());
+                            if is_editing {
+                                view! {
+                                    <div class="card">
                                         <h3>{kind}</h3>
-                                        <button class="btn danger" on:click=move |_| remove(k2.clone())>"Delete"</button>
+                                        <div class="field">
+                                            <label>"Model (provider/model)"</label>
+                                            <input prop:value=move || edit_model.get() on:input=move |ev| edit_model.set(event_target_value(&ev))/>
+                                        </div>
+                                        <div class="field">
+                                            <label>"System prompt"</label>
+                                            <textarea prop:value=move || edit_system_prompt.get() on:input=move |ev| edit_system_prompt.set(event_target_value(&ev))></textarea>
+                                        </div>
+                                        <div class="row">
+                                            <div class="field">
+                                                <label>"Instances"</label>
+                                                <input prop:value=move || edit_instances.get() on:input=move |ev| edit_instances.set(event_target_value(&ev))/>
+                                            </div>
+                                            <div class="field">
+                                                <label>"Max history"</label>
+                                                <input prop:value=move || edit_max_history.get() on:input=move |ev| edit_max_history.set(event_target_value(&ev))/>
+                                            </div>
+                                        </div>
+                                        <div class="row">
+                                            <div class="field">
+                                                <label>"Context window"</label>
+                                                <input prop:value=move || edit_context_window.get() on:input=move |ev| edit_context_window.set(event_target_value(&ev))/>
+                                            </div>
+                                            <div class="field">
+                                                <label>"Compaction ratio"</label>
+                                                <input prop:value=move || edit_compaction_ratio.get() on:input=move |ev| edit_compaction_ratio.set(event_target_value(&ev))/>
+                                            </div>
+                                        </div>
+                                        <label class="check">
+                                            <input type="checkbox" prop:checked=move || edit_auto_compact.get() on:change=move |ev| edit_auto_compact.set(event_target_checked(&ev))/>
+                                            "Auto compact"
+                                        </label>
+                                        <div class="row">
+                                            <button class="btn primary" on:click=move |_| save_edit()>"Confirm"</button>
+                                            <button class="btn" on:click=move |_| cancel_edit()>"Cancel"</button>
+                                        </div>
                                     </div>
-                                    <div class="muted">{model}</div>
-                                    <div class="muted">{format!("instances {instances} · max_history {history} · auto_compact {auto}")}</div>
-                                </div>
+                                }
+                                .into_any()
+                            } else {
+                                view! {
+                                    <div class="card">
+                                        <div class="row">
+                                            <h3>{kind}</h3>
+                                            <div class="row">
+                                                <button class="btn" on:click=move |_| start_edit(edit_item.clone())>"Edit"</button>
+                                                <button class="btn danger" on:click=move |_| remove(k2.clone())>"Delete"</button>
+                                            </div>
+                                        </div>
+                                        <div class="muted">{model}</div>
+                                        <div class="muted">{format!("instances {instances} · max_history {history} · auto_compact {auto}")}</div>
+                                    </div>
+                                }
+                                .into_any()
                             }
                         })
                         .collect::<Vec<_>>()
@@ -376,6 +604,12 @@ fn ToolsPanel() -> impl IntoView {
     let description = RwSignal::new(String::new());
     let file = RwSignal::new(None::<web_sys::File>);
     let notice = RwSignal::new(None::<String>);
+    let editing = RwSignal::new(None::<Value>);
+    let edit_description = RwSignal::new(String::new());
+    let edit_parameters = RwSignal::new(String::new());
+    let edit_env = RwSignal::new(String::new());
+    let wasm_mode = RwSignal::new("keep".to_string());
+    let edit_file = RwSignal::new(None::<web_sys::File>);
 
     spawn_local(async move {
         fetch_tools(&tools).await;
@@ -387,6 +621,14 @@ fn ToolsPanel() -> impl IntoView {
             .and_then(|t| t.dyn_into::<HtmlInputElement>().ok())
             .expect("file input");
         file.set(input.files().and_then(|f| f.get(0)));
+    };
+
+    let on_edit_file = move |ev: web_sys::Event| {
+        let input = ev
+            .target()
+            .and_then(|t| t.dyn_into::<HtmlInputElement>().ok())
+            .expect("file input");
+        edit_file.set(input.files().and_then(|f| f.get(0)));
     };
 
     let create = move || {
@@ -443,6 +685,94 @@ fn ToolsPanel() -> impl IntoView {
         });
     };
 
+    let start_edit = move |item: Value| {
+        let params = item.get("parameters").cloned().unwrap_or(Value::Null);
+        let env = item.get("env").cloned().unwrap_or(Value::Null);
+        edit_description.set(
+            item.get("description")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string(),
+        );
+        edit_parameters.set(serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string()));
+        edit_env.set(serde_json::to_string(&env).unwrap_or_else(|_| "{}".to_string()));
+        wasm_mode.set("keep".to_string());
+        edit_file.set(None);
+        editing.set(Some(item));
+    };
+
+    let cancel_edit = move || editing.set(None);
+
+    let save_edit = move || {
+        let Some(item) = editing.get() else { return };
+        let n = item_name(&item);
+        let tools = tools;
+        let notice = notice;
+        let editing = editing;
+        spawn_local(async move {
+            let params: Value = match serde_json::from_str(&edit_parameters.get()) {
+                Ok(v) => v,
+                Err(e) => {
+                    show_notice(&notice, false, format!("invalid parameters JSON: {e}"));
+                    return;
+                }
+            };
+            let env: Value = match serde_json::from_str(&edit_env.get()) {
+                Ok(v) => v,
+                Err(e) => {
+                    show_notice(&notice, false, format!("invalid env JSON: {e}"));
+                    return;
+                }
+            };
+            let b64 = if wasm_mode.get() == "replace" {
+                let Some(f) = edit_file.get() else {
+                    show_notice(
+                        &notice,
+                        false,
+                        "select a .wasm file to replace with".to_string(),
+                    );
+                    return;
+                };
+                match JsFuture::from(read_file_b64(f)).await {
+                    Ok(v) => v.as_string().unwrap_or_default(),
+                    Err(_) => {
+                        show_notice(&notice, false, "failed to read wasm file".to_string());
+                        return;
+                    }
+                }
+            } else {
+                item.get("wasm_b64")
+                    .and_then(|w| w.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            if b64.is_empty() {
+                show_notice(
+                    &notice,
+                    false,
+                    "wasm is required (keep the original or replace it with a file)".to_string(),
+                );
+                return;
+            }
+            let body = json!({
+                "name": n,
+                "description": edit_description.get(),
+                "parameters": params,
+                "env": env,
+                "wasm_b64": b64,
+            });
+            let path = format!("/api/tools/{n}");
+            let (status, v) = api::put(&path, &body).await.unwrap_or((0, Value::Null));
+            if status == 200 {
+                editing.set(None);
+                show_notice(&notice, true, "tool updated".to_string());
+                fetch_tools(&tools).await;
+            } else {
+                show_notice(&notice, false, err_of(&v));
+            }
+        });
+    };
+
     view! {
         <div class="admin">
             <h2>"Tools"</h2>
@@ -473,19 +803,81 @@ fn ToolsPanel() -> impl IntoView {
                         .get()
                         .iter()
                         .map(|t| {
-                            let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                            let desc = t.get("description").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                            let params = t.get("parameters").cloned().unwrap_or(Value::Null).to_string();
+                            let owned = t.clone();
+                            let name = item_name(&owned);
+                            let desc = owned
+                                .get("description")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let params = owned
+                                .get("parameters")
+                                .cloned()
+                                .unwrap_or(Value::Null)
+                                .to_string();
                             let n2 = name.clone();
-                            view! {
-                                <div class="card">
-                                    <div class="row">
+                            let edit_item = owned.clone();
+                            let is_editing = editing
+                                .get()
+                                .as_ref()
+                                .map(item_name)
+                                == Some(name.clone());
+                            if is_editing {
+                                view! {
+                                    <div class="card">
                                         <h3>{name}</h3>
-                                        <button class="btn danger" on:click=move |_| remove(n2.clone())>"Delete"</button>
+                                        <div class="field">
+                                            <label>"Description"</label>
+                                            <input prop:value=move || edit_description.get() on:input=move |ev| edit_description.set(event_target_value(&ev))/>
+                                        </div>
+                                        <div class="field">
+                                            <label>"Parameters (JSON schema)"</label>
+                                            <textarea prop:value=move || edit_parameters.get() on:input=move |ev| edit_parameters.set(event_target_value(&ev))></textarea>
+                                        </div>
+                                        <div class="field">
+                                            <label>"Env (JSON)"</label>
+                                            <textarea prop:value=move || edit_env.get() on:input=move |ev| edit_env.set(event_target_value(&ev))></textarea>
+                                        </div>
+                                        <div class="field">
+                                            <label>"Wasm module"</label>
+                                            <label class="check">
+                                                <input type="radio" name="wasm-mode" prop:checked=move || wasm_mode.get() == "keep" on:change=move |_| wasm_mode.set("keep".to_string())/>
+                                                "Keep original"
+                                            </label>
+                                            <label class="check">
+                                                <input type="radio" name="wasm-mode" prop:checked=move || wasm_mode.get() == "replace" on:change=move |_| wasm_mode.set("replace".to_string())/>
+                                                "Replace"
+                                            </label>
+                                            {move || {
+                                                if wasm_mode.get() == "replace" {
+                                                    view! { <input type="file" accept=".wasm" on:change=on_edit_file/> }.into_any()
+                                                } else {
+                                                    ().into_any()
+                                                }
+                                            }}
+                                        </div>
+                                        <div class="row">
+                                            <button class="btn primary" on:click=move |_| save_edit()>"Confirm"</button>
+                                            <button class="btn" on:click=move |_| cancel_edit()>"Cancel"</button>
+                                        </div>
                                     </div>
-                                    <div class="muted">{desc}</div>
-                                    <pre>{params}</pre>
-                                </div>
+                                }
+                                .into_any()
+                            } else {
+                                view! {
+                                    <div class="card">
+                                        <div class="row">
+                                            <h3>{name}</h3>
+                                            <div class="row">
+                                                <button class="btn" on:click=move |_| start_edit(edit_item.clone())>"Edit"</button>
+                                                <button class="btn danger" on:click=move |_| remove(n2.clone())>"Delete"</button>
+                                            </div>
+                                        </div>
+                                        <div class="muted">{desc}</div>
+                                        <pre>{params}</pre>
+                                    </div>
+                                }
+                                .into_any()
                             }
                         })
                         .collect::<Vec<_>>()

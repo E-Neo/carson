@@ -18,6 +18,7 @@ use carson_host::db::Db;
 use carson_host::host::{self, HostContext};
 use clap::Parser;
 use serde_json::json;
+use tower::ServiceExt;
 
 use crate::cli::Cli;
 
@@ -151,12 +152,34 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(config.server.bind()).await?;
     let addr = listener.local_addr()?;
     tracing::info!("carson listening on http://{addr}");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+    serve_nodelay(listener, app).await;
     Ok(())
+}
+
+/// Serve HTTP/1.1 with TCP_NODELAY on every accepted socket so SSE frames flush
+/// immediately instead of being coalesced into bursts by Nagle's algorithm.
+async fn serve_nodelay(listener: tokio::net::TcpListener, app: axum::Router) {
+    loop {
+        let Ok((socket, peer)) = listener.accept().await else {
+            continue;
+        };
+        let _ = socket.set_nodelay(true);
+        let io = hyper_util::rt::TokioIo::new(socket);
+        let app = app.clone();
+        tokio::spawn(async move {
+            let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                let app = app.clone();
+                async move {
+                    let mut req = req.map(axum::body::Body::new);
+                    req.extensions_mut().insert(ConnectInfo(peer));
+                    app.oneshot(req).await
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, svc)
+                .await;
+        });
+    }
 }
 
 #[cfg(test)]
@@ -215,7 +238,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body.contains("carson"), "{body}");
-        assert!(body.contains("/pkg/carson_ui.js"), "{body}");
+        assert!(body.contains("/index.js"), "{body}");
     }
 
     #[tokio::test]
@@ -269,7 +292,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(body.contains("/pkg/carson_ui.js"), "{body}");
+        assert!(body.contains("/index.js"), "{body}");
     }
 
     #[tokio::test]
