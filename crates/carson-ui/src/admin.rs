@@ -885,11 +885,13 @@ fn ToolsPanel() -> impl IntoView {
                                 .to_string();
                             let n2 = name.clone();
                             let edit_item = owned.clone();
-                            let is_editing = editing
-                                .get()
-                                .as_ref()
-                                .map(item_name)
-                                == Some(name.clone());
+                            let builtin = name.starts_with("core/");
+                            let is_editing = !builtin
+                                && editing
+                                    .get()
+                                    .as_ref()
+                                    .map(item_name)
+                                    == Some(name.clone());
                             if is_editing {
                                 view! {
                                     <div class="card">
@@ -935,11 +937,31 @@ fn ToolsPanel() -> impl IntoView {
                                 view! {
                                     <div class="card">
                                         <div class="row">
-                                            <h3>{name}</h3>
                                             <div class="row">
-                                                <button class="btn" on:click=move |_| start_edit(edit_item.clone())>"Edit"</button>
-                                                <button class="btn danger" on:click=move |_| remove(n2.clone())>"Delete"</button>
+                                                <h3>{name}</h3>
+                                                {move || {
+                                                    if builtin {
+                                                        view! { <span class="badge">"built-in"</span> }.into_any()
+                                                    } else {
+                                                        ().into_any()
+                                                    }
+                                                }}
                                             </div>
+                                            {move || {
+                                                if builtin {
+                                                    ().into_any()
+                                                } else {
+                                                    let edit = edit_item.clone();
+                                                    let del = n2.clone();
+                                                    view! {
+                                                        <div class="row">
+                                                            <button class="btn" on:click=move |_| start_edit(edit.clone())>"Edit"</button>
+                                                            <button class="btn danger" on:click=move |_| remove(del.clone())>"Delete"</button>
+                                                        </div>
+                                                    }
+                                                    .into_any()
+                                                }
+                                            }}
                                         </div>
                                         <div class="muted">{desc}</div>
                                         <pre>{params}</pre>
