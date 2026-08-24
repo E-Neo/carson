@@ -131,7 +131,7 @@ pub fn AdminPage() -> impl IntoView {
             <aside class="sidebar">
                 <div class="brand-row">
                     <h1>"Carson"</h1>
-                    <div class="sub">"admin"</div>
+                    <div class="sub">"Admin"</div>
                 </div>
                 <button class=tab_class("status") on:click=move |_| tab.set("status".to_string())>"Status"</button>
                 <button class=tab_class("providers") on:click=move |_| tab.set("providers".to_string())>"Providers"</button>
@@ -418,7 +418,7 @@ fn AgentsPanel() -> impl IntoView {
         let notice = notice;
         spawn_local(async move {
             let body = json!({
-                "kind": k,
+                "name": k,
                 "system_prompt": sp,
                 "model": m,
                 "instances": 1,
@@ -504,7 +504,7 @@ fn AgentsPanel() -> impl IntoView {
     let save_edit = move || {
         let Some(item) = editing.get() else { return };
         let k = item
-            .get("kind")
+            .get("name")
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
@@ -513,7 +513,7 @@ fn AgentsPanel() -> impl IntoView {
         let editing = editing;
         spawn_local(async move {
             let body = json!({
-                "kind": k,
+                "name": k,
                 "system_prompt": edit_system_prompt.get(),
                 "model": edit_model.get(),
                 "instances": edit_instances.get().parse::<usize>().unwrap_or(1),
@@ -568,10 +568,15 @@ fn AgentsPanel() -> impl IntoView {
                         .map(|a| {
                             let owned = a.clone();
                             let kind = owned
-                                .get("kind")
+                                .get("name")
                                 .and_then(|n| n.as_str())
                                 .unwrap_or("")
                                 .to_string();
+                            let version = owned
+                                .get("id")
+                                .and_then(|n| n.as_str())
+                                .map(|v| v.chars().take(8).collect::<String>())
+                                .unwrap_or_default();
                             let model = owned
                                 .get("model")
                                 .and_then(|n| n.as_str())
@@ -594,7 +599,7 @@ fn AgentsPanel() -> impl IntoView {
                             let edit_item = owned.clone();
                             let is_editing = editing
                                 .get()
-                                .and_then(|e| e.get("kind").and_then(|x| x.as_str()).map(|s| s.to_string()))
+                                .and_then(|e| e.get("name").and_then(|x| x.as_str()).map(|s| s.to_string()))
                                 == Some(kind.clone());
                             if is_editing {
                                 view! {
@@ -651,6 +656,7 @@ fn AgentsPanel() -> impl IntoView {
                                             </div>
                                         </div>
                                         <div class="muted">{model}</div>
+                                        <div class="muted">{format!("version {version}")}</div>
                                         <div class="muted">{format!("instances {instances} · max_history {history} · auto_compact {auto}")}</div>
                                         <div class="muted">{format!("tools: {caps}")}</div>
                                     </div>

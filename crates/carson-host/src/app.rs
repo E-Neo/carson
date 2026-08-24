@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use tokio::sync::Mutex;
 
@@ -16,14 +15,16 @@ pub struct AppState {
     pub registry: Arc<Mutex<AgentRegistry>>,
     pub db: Arc<Db>,
     pub hub: Arc<Hub>,
-    pub sessions: Arc<Mutex<HashMap<u64, SessionEntry>>>,
-    pub next_session_id: Arc<AtomicU64>,
+    /// Live sessions keyed by uuid. Each entry pins the agent version that
+    /// created it; agent edits never move existing sessions off their version.
+    pub sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
     pub cfg: Arc<Config>,
 }
 
 #[derive(Clone)]
 pub struct SessionEntry {
-    pub kind: String,
+    pub agent_name: String,
+    pub agent_version_id: String,
     pub instance: Arc<AgentInstance>,
 }
 
@@ -39,7 +40,6 @@ pub fn build_app_state(
         registry: Arc::new(Mutex::new(registry)),
         db,
         sessions: Arc::new(Mutex::new(HashMap::new())),
-        next_session_id: Arc::new(AtomicU64::new(0)),
         cfg: Arc::new(config),
     }
 }

@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -12,7 +11,6 @@ use axum::http::Request;
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use carson_api::api::router;
-use carson_host::bindings::exports::carson::agent::agent::SessionConfig;
 use carson_host::config::Config;
 use carson_host::db::Db;
 use carson_host::host::{self, HostContext};
@@ -128,44 +126,52 @@ async fn main() -> Result<()> {
     let registry = host::build_registry(&ctx, &agents).await?;
     let app_state = carson_host::app::build_app_state(ctx, registry, db.clone(), config.clone());
 
-    let sessions = db.load_sessions()?;
-    let mut max_session_id = 0u64;
-    for persisted in &sessions {
-        max_session_id = max_session_id.max(persisted.id);
-        let Some(pool) = app_state.registry.lock().await.get(&persisted.kind) else {
-            tracing::warn!(
-                kind = %persisted.kind,
-                id = persisted.id,
-                "dropping persisted session for unknown agent kind"
-            );
-            continue;
+    // Restore persisted sessions. Each session is pinned to the agent version
+    // that created it; pools for non-current versions are built on demand.
+    for persisted in db.load_sessions()? {
+        let def = match app_state
+            .db
+            .get_agent_version(&persisted.agent_version_id)?
+        {
+            Some(def) => def,
+            None => {
+                tracing::warn!(
+                    id = %persisted.id,
+                    version = %persisted.agent_version_id,
+                    "dropping persisted session for missing agent version"
+                );
+                continue;
+            }
+        };
+        let pool = match carson_host::registry::get_or_build_pool(
+            &app_state.ctx,
+            &app_state.registry,
+            &def,
+        )
+        .await
+        {
+            Ok(pool) => pool,
+            Err(err) => {
+                tracing::warn!(id = %persisted.id, error = %err, "failed to build agent pool");
+                continue;
+            }
         };
         let instance = pool.next();
-        let config = SessionConfig {
-            system_prompt: pool.system_prompt.clone(),
-            model: pool.model.clone(),
-            capabilities_json: json!(pool.caps).to_string(),
-            max_history: pool.max_history,
-            context_window: pool.context_window,
-            compaction_ratio: pool.compaction_ratio,
-            auto_compact: pool.auto_compact,
-        };
-        if let Err(err) = host::restore_session(&instance, persisted.id, persisted, &config).await {
-            tracing::warn!(id = persisted.id, error = %err, "failed to restore session");
+        if let Err(err) =
+            host::restore_session(&instance, &persisted.id, &persisted, &pool.config()).await
+        {
+            tracing::warn!(id = %persisted.id, error = %err, "failed to restore session");
             continue;
         }
         app_state.sessions.lock().await.insert(
-            persisted.id,
+            persisted.id.clone(),
             carson_host::app::SessionEntry {
-                kind: persisted.kind.clone(),
+                agent_name: persisted.agent_name.clone(),
+                agent_version_id: persisted.agent_version_id.clone(),
                 instance,
             },
         );
-    }
-    if max_session_id > 0 {
-        app_state
-            .next_session_id
-            .store(max_session_id, Ordering::SeqCst);
+        tracing::info!(session = %persisted.id, agent = %persisted.agent_name, "restored session");
     }
 
     let app = build_app(app_state).layer(middleware::from_fn(trace));
@@ -206,7 +212,6 @@ async fn serve_nodelay(listener: tokio::net::TcpListener, app: axum::Router) {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -235,7 +240,6 @@ mod tests {
             db,
             hub: Hub::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            next_session_id: Arc::new(AtomicU64::new(0)),
             cfg: Arc::new(config()),
         };
         build_app(state)

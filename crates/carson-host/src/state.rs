@@ -62,26 +62,36 @@ fn chunk() -> Chunk {
         text: None,
         thinking: None,
         tool_call_start: None,
-        tool_input_delta: None,
         tool_call_end: None,
     }
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 impl crate::bindings::carson::agent::events::Host for State {
-    fn emit_event(&mut self, session_id: u64, part: Part) -> Result<(), EventError> {
+    fn emit_event(&mut self, session_id: String, part: Part) -> Result<(), EventError> {
         let item = crate::hub::SseItem {
             event: part.kind,
             data: serde_json::Value::String(part.data),
         };
-        if self.hub.send(session_id, item) {
+        if self.hub.send(&session_id, item) {
             Ok(())
         } else {
             Err(EventError::Closed)
         }
     }
 
-    fn cancelled(&mut self, session_id: u64) -> bool {
-        self.stop.load(Ordering::SeqCst) || !self.hub.alive(session_id)
+    fn cancelled(&mut self, session_id: String) -> bool {
+        self.stop.load(Ordering::SeqCst) || !self.hub.alive(&session_id)
+    }
+
+    fn now_ms(&mut self) -> u64 {
+        now_ms()
     }
 }
 
@@ -185,10 +195,6 @@ impl crate::bindings::carson::agent::llm::Host for State {
             })),
             Ok(DriverEvent::ToolCallStart(tc)) => Ok(Some(Chunk {
                 tool_call_start: Some(to_wit_tool_call(tc)),
-                ..chunk()
-            })),
-            Ok(DriverEvent::ToolInputDelta(text)) => Ok(Some(Chunk {
-                tool_input_delta: Some(text),
                 ..chunk()
             })),
             Ok(DriverEvent::ToolCallEnd(tc)) => Ok(Some(Chunk {
@@ -311,10 +317,10 @@ mod tests {
     fn emit_event_forwards_to_hub() {
         let mut state = test_state(&["time"]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        state.hub.register(1, tx.clone());
+        state.hub.register("s1", tx.clone());
 
         let result = state.emit_event(
-            1,
+            "s1".into(),
             Part {
                 kind: "chunk".into(),
                 data: "hello".into(),
@@ -324,14 +330,14 @@ mod tests {
         let item: SseItem = rx.try_recv().unwrap();
         assert_eq!(item.event, "chunk");
         assert_eq!(item.data, serde_json::Value::String("hello".into()));
-        state.hub.unregister(1, &tx);
+        state.hub.unregister("s1", &tx);
     }
 
     #[test]
     fn emit_event_closed_without_client() {
         let mut state = test_state(&["time"]);
         let result = state.emit_event(
-            99,
+            "missing".into(),
             Part {
                 kind: "chunk".into(),
                 data: "x".into(),
@@ -341,19 +347,28 @@ mod tests {
     }
 
     #[test]
+    fn now_ms_is_close_to_host_clock() {
+        let mut state = test_state(&[]);
+        let before = now_ms();
+        let stamp = state.now_ms();
+        let after = now_ms();
+        assert!((before..=after).contains(&stamp));
+    }
+
+    #[test]
     fn cancelled_tracks_stop_flag_and_hub() {
         let mut state = test_state(&["time"]);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        state.hub.register(3, tx.clone());
-        assert!(!state.cancelled(3));
+        state.hub.register("s3", tx.clone());
+        assert!(!state.cancelled("s3".into()));
 
         state.stop.store(true, Ordering::SeqCst);
-        assert!(state.cancelled(3));
+        assert!(state.cancelled("s3".into()));
         state.stop.store(false, Ordering::SeqCst);
-        assert!(!state.cancelled(3));
+        assert!(!state.cancelled("s3".into()));
 
-        state.hub.unregister(3, &tx);
-        assert!(state.cancelled(3));
+        state.hub.unregister("s3", &tx);
+        assert!(state.cancelled("s3".into()));
     }
 
     #[test]
@@ -386,7 +401,7 @@ mod tests {
 
     fn request() -> Request {
         Request {
-            session_id: 1,
+            session_id: "s1".into(),
             model: "mock/mock".into(),
             messages: Vec::new(),
             system_prompt: None,

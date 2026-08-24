@@ -9,7 +9,7 @@ use wasmtime::{Engine, Store};
 use wasmtime_wasi::WasiCtxBuilder;
 
 use crate::bindings::AgentWorld;
-use crate::db::{Db, PersistedSession, StoredMessage};
+use crate::db::{Db, PersistedSession, StoredBlock};
 use crate::drivers::{LlmDriver, OpenAiCompatDriver, Usage};
 use crate::hub::Hub;
 use crate::registry::{AgentDef, AgentInstance, AgentPool, AgentRegistry, ProviderDef, ToolDef};
@@ -93,7 +93,7 @@ pub fn openai_driver(def: &ProviderDef) -> Result<Arc<dyn LlmDriver>> {
 pub async fn build_registry(ctx: &HostContext, agents: &[AgentDef]) -> Result<AgentRegistry> {
     let mut registry = AgentRegistry::new();
     for def in agents {
-        registry.insert(def.kind.clone(), build_pool(ctx, def).await?);
+        registry.insert(build_pool(ctx, def).await?);
     }
     Ok(registry)
 }
@@ -108,7 +108,7 @@ pub async fn build_pool(ctx: &HostContext, def: &AgentDef) -> Result<AgentPool> 
 }
 
 /// Snapshot a session from the guest and persist it to the database.
-pub async fn snapshot_session(db: &Arc<Db>, instance: &AgentInstance, session_id: u64) {
+pub async fn snapshot_session(db: &Arc<Db>, instance: &AgentInstance, session_id: &str) {
     let mut store = instance.store.lock().await;
     let guest = instance.agent.carson_agent_agent();
     let result = guest
@@ -119,10 +119,11 @@ pub async fn snapshot_session(db: &Arc<Db>, instance: &AgentInstance, session_id
     let Ok((Ok(state),)) = result else {
         return;
     };
-    let messages: Vec<StoredMessage> = state.messages.iter().map(StoredMessage::from).collect();
+    let messages: Vec<StoredBlock> = state.blocks.iter().map(StoredBlock::from).collect();
     let persisted = PersistedSession {
-        id: session_id,
-        kind: instance.kind.clone(),
+        id: session_id.to_string(),
+        agent_name: instance.agent_name.clone(),
+        agent_version_id: instance.agent_version.clone(),
         summary: state.summary,
         usage: Usage {
             input_tokens: state.usage.input_tokens,
@@ -138,18 +139,17 @@ pub async fn snapshot_session(db: &Arc<Db>, instance: &AgentInstance, session_id
 /// Restore a persisted session into an agent instance.
 pub async fn restore_session(
     instance: &AgentInstance,
-    session_id: u64,
+    session_id: &str,
     persisted: &PersistedSession,
     config: &crate::bindings::exports::carson::agent::agent::SessionConfig,
 ) -> Result<()> {
     let mut store = instance.store.lock().await;
     let guest = instance.agent.carson_agent_agent();
     let state = crate::bindings::exports::carson::agent::agent::State {
-        messages: persisted
+        blocks: persisted
             .messages
             .iter()
-            .cloned()
-            .map(crate::bindings::carson::agent::llm::Message::from)
+            .map(crate::bindings::exports::carson::agent::agent::Block::from)
             .collect(),
         summary: persisted.summary.clone(),
         usage: crate::bindings::carson::agent::llm::Usage {
@@ -190,7 +190,8 @@ pub async fn build_instance(ctx: &HostContext, def: &AgentDef) -> Result<AgentIn
     let agent = AgentWorld::instantiate_async(&mut store, &ctx.component, &linker).await?;
     let stop = store.data().stop.clone();
     Ok(AgentInstance {
-        kind: def.kind.clone(),
+        agent_name: def.name.clone(),
+        agent_version: def.id.clone(),
         store: tokio::sync::Mutex::new(store),
         agent,
         stop,

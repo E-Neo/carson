@@ -9,33 +9,41 @@ use serde_json::{Value, json};
 
 #[derive(Params, PartialEq, Debug, Clone)]
 struct ChatParams {
-    id: Option<u64>,
+    id: Option<String>,
 }
 
+/// One rendered conversation block, in chronological order. Streaming appends
+/// new blocks as they arrive so thinking, text and tool cards interleave
+/// exactly like the persisted log.
 #[derive(Clone)]
-enum UiMsg {
-    User {
-        content: String,
-    },
-    Assistant {
-        content: RwSignal<String>,
-        thinking: RwSignal<String>,
-        tools: RwSignal<Vec<ToolCard>>,
-    },
+enum UiBlock {
+    User { content: String },
+    Thinking { text: RwSignal<String> },
+    Text { text: RwSignal<String> },
+    ToolUse { card: RwSignal<ToolCard> },
 }
 
 #[derive(Clone)]
 struct MsgEntry {
-    msg: UiMsg,
+    block: UiBlock,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct ToolCard {
     id: String,
     name: String,
     arguments: String,
     result: Option<String>,
     is_error: bool,
+}
+
+/// True while the last block in the log is still being streamed into.
+fn last_is_kind(messages: &RwSignal<Vec<MsgEntry>>, kind_is_text: bool) -> bool {
+    messages.with(|m| match m.last().map(|e| &e.block) {
+        Some(UiBlock::Text { .. }) => kind_is_text,
+        Some(UiBlock::Thinking { .. }) => !kind_is_text,
+        _ => false,
+    })
 }
 
 fn fmt_usage(u: &Value) -> String {
@@ -56,104 +64,108 @@ fn truncate(s: &str, limit: usize) -> String {
     if s.len() <= limit {
         s.to_string()
     } else {
-        format!("{}...(truncated {})", &s[..limit], s.len())
+        format!("{}…", &s[..s.floor_char_boundary(limit)])
     }
 }
 
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// Rebuild the block list from the session API's ordered block log.
 fn build_history(v: &Value) -> Vec<MsgEntry> {
-    let mut out = Vec::new();
-    let mut last_assistant: Option<(RwSignal<String>, RwSignal<Vec<ToolCard>>)> = None;
-    if let Some(arr) = v.get("messages").and_then(|x| x.as_array()) {
-        for m in arr {
-            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
-            match role {
-                "user" => {
-                    out.push(MsgEntry {
-                        msg: UiMsg::User {
-                            content: m
-                                .get("content")
-                                .and_then(|c| c.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                        },
-                    });
-                    last_assistant = None;
-                }
-                "assistant" => {
-                    let content = RwSignal::new(
-                        m.get("content")
+    let mut out: Vec<MsgEntry> = Vec::new();
+    let Some(arr) = v.get("messages").and_then(|x| x.as_array()) else {
+        return out;
+    };
+    for m in arr {
+        let kind = m.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+        match kind {
+            "user" => out.push(MsgEntry {
+                block: UiBlock::User {
+                    content: m
+                        .get("text")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                },
+            }),
+            "thinking" => out.push(MsgEntry {
+                block: UiBlock::Thinking {
+                    text: RwSignal::new(
+                        m.get("text")
                             .and_then(|c| c.as_str())
                             .unwrap_or("")
                             .to_string(),
-                    );
-                    let thinking = RwSignal::new(String::new());
-                    let mut cards = Vec::new();
-                    if let Some(calls) = m.get("tool_calls").and_then(|c| c.as_array()) {
-                        for tc in calls {
-                            cards.push(ToolCard {
-                                id: tc
-                                    .get("id")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                name: tc
-                                    .get("name")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                arguments: tc
-                                    .get("arguments")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                result: None,
-                                is_error: false,
-                            });
-                        }
-                    }
-                    let tools = RwSignal::new(cards);
-                    out.push(MsgEntry {
-                        msg: UiMsg::Assistant {
-                            content,
-                            thinking,
-                            tools,
-                        },
-                    });
-                    last_assistant = Some((content, tools));
-                }
-                "tool" => {
-                    if let Some((_, tools)) = &last_assistant {
-                        let tid = m
+                    ),
+                },
+            }),
+            "text" => out.push(MsgEntry {
+                block: UiBlock::Text {
+                    text: RwSignal::new(
+                        m.get("text")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    ),
+                },
+            }),
+            "tool-use" => out.push(MsgEntry {
+                block: UiBlock::ToolUse {
+                    card: RwSignal::new(ToolCard {
+                        id: m
                             .get("tool_call_id")
                             .and_then(|x| x.as_str())
                             .unwrap_or("")
-                            .to_string();
-                        let result = m
-                            .get("content")
-                            .and_then(|c| c.as_str())
+                            .to_string(),
+                        name: m
+                            .get("tool_name")
+                            .and_then(|x| x.as_str())
                             .unwrap_or("")
-                            .to_string();
-                        let preview = truncate(&result, 500);
-                        tools.update(|t| {
-                            for card in t.iter_mut() {
-                                if card.id == tid {
-                                    card.result = Some(preview.clone());
-                                }
-                            }
+                            .to_string(),
+                        arguments: m
+                            .get("arguments")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        result: None,
+                        is_error: false,
+                    }),
+                },
+            }),
+            "tool-result" => {
+                let tid = m
+                    .get("tool_call_id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let result = m.get("text").and_then(|c| c.as_str()).unwrap_or("");
+                let preview = truncate(result, 500);
+                let is_error = m.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
+                for e in out.iter_mut().rev() {
+                    if let UiBlock::ToolUse { card } = &e.block
+                        && card.get_untracked().id == tid
+                    {
+                        card.update(|c| {
+                            c.result = Some(preview.clone());
+                            c.is_error = is_error;
                         });
+                        break;
                     }
                 }
-                _ => {}
             }
+            _ => {}
         }
     }
     out
 }
 
 async fn load_history(
-    id: u64,
+    id: &str,
     messages: &RwSignal<Vec<MsgEntry>>,
     error: &RwSignal<Option<String>>,
+    scroll_tick: &RwSignal<u64>,
+    at_bottom: &RwSignal<bool>,
 ) {
     if let Ok((status, v)) = api::get(&format!("/api/sessions/{id}")).await {
         if status == 200 {
@@ -167,36 +179,35 @@ async fn load_history(
             ));
         }
     }
+    // Fresh content lands at the bottom; resume auto-scroll there.
+    at_bottom.set(true);
+    scroll_tick.update(|t| *t += 1);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send(
-    session_id: u64,
+    session_id: String,
     input: RwSignal<String>,
     messages: RwSignal<Vec<MsgEntry>>,
     running: RwSignal<bool>,
     usage: RwSignal<Option<String>>,
     error: RwSignal<Option<String>>,
     status_line: RwSignal<Option<String>>,
+    scroll_tick: RwSignal<u64>,
 ) {
     let text = input.get().trim().to_string();
     if text.is_empty() || running.get() {
         return;
     }
     let content = RwSignal::new(String::new());
-    let thinking = RwSignal::new(String::new());
-    let tools = RwSignal::new(Vec::new());
     messages.update(|m| {
         m.push(MsgEntry {
-            msg: UiMsg::User {
+            block: UiBlock::User {
                 content: text.clone(),
             },
         });
         m.push(MsgEntry {
-            msg: UiMsg::Assistant {
-                content,
-                thinking,
-                tools,
-            },
+            block: UiBlock::Text { text: content },
         });
     });
     input.set(String::new());
@@ -204,94 +215,112 @@ fn send(
     usage.set(None);
     error.set(None);
     status_line.set(None);
+    scroll_tick.update(|t| *t += 1);
 
     let path = format!("/api/sessions/{session_id}/stream");
     let body = json!({ "content": text });
     spawn_local(async move {
-        let result = sse::stream_post(&path, &body, move |ev| match ev.event.as_str() {
-            "chunk" => {
-                let text =
-                    serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
-                content.update(|s| s.push_str(&text));
-            }
-            "thinking" => {
-                let text =
-                    serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
-                thinking.update(|s| s.push_str(&text));
-            }
-            "tool_use" => {
-                if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
-                    tools.update(|t| {
-                        t.push(ToolCard {
-                            id: v
-                                .get("id")
-                                .and_then(|x| x.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            name: v
-                                .get("name")
-                                .and_then(|x| x.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            arguments: v
-                                .get("arguments")
-                                .and_then(|x| x.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            result: None,
-                            is_error: false,
+        let result = sse::stream_post(&path, &body, move |ev| {
+            scroll_tick.update(|t| *t += 1);
+            match ev.event.as_str() {
+                "chunk" => {
+                    let text = serde_json::from_str::<String>(&ev.data)
+                        .unwrap_or_else(|_| ev.data.clone());
+                    ensure_text_block(&messages);
+                    append_last_text(&messages, &text);
+                }
+                "thinking" => {
+                    let text = serde_json::from_str::<String>(&ev.data)
+                        .unwrap_or_else(|_| ev.data.clone());
+                    ensure_thinking_block(&messages);
+                    append_last_thinking(&messages, &text);
+                }
+                "tool_use" => {
+                    if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
+                        messages.update(|m| {
+                            m.push(MsgEntry {
+                                block: UiBlock::ToolUse {
+                                    card: RwSignal::new(ToolCard {
+                                        id: v
+                                            .get("id")
+                                            .and_then(|x| x.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        name: v
+                                            .get("name")
+                                            .and_then(|x| x.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        ..Default::default()
+                                    }),
+                                },
+                            });
                         });
-                    });
+                    }
                 }
-            }
-            "tool_result" => {
-                if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
-                    let tid = v
-                        .get("id")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let preview = v
-                        .get("result_preview")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let is_error = v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
-                    tools.update(|t| {
-                        for card in t.iter_mut() {
-                            if card.id == tid {
-                                card.result = Some(preview.clone());
-                                card.is_error = is_error;
-                            }
-                        }
-                    });
+                "tool_args" => {
+                    if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
+                        let tid = v
+                            .get("id")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let args = v
+                            .get("arguments")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        for_each_card(&messages, &tid, &|card| {
+                            card.arguments = args.clone();
+                        });
+                    }
                 }
-            }
-            "status" => {
-                let text =
-                    serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
-                status_line.set(Some(text));
-            }
-            "error" => {
-                let msg = serde_json::from_str::<Value>(&ev.data)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("message")
-                            .and_then(|m| m.as_str())
-                            .map(|m| m.to_string())
-                    })
-                    .unwrap_or_else(|| ev.data.clone());
-                error.set(Some(msg));
-            }
-            "done" => {
-                if let Ok(v) = serde_json::from_str::<Value>(&ev.data)
-                    && let Some(u) = v.get("usage")
-                {
-                    usage.set(Some(fmt_usage(u)));
+                "tool_result" => {
+                    if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
+                        let tid = v
+                            .get("id")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let preview = truncate(
+                            v.get("result_preview")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or(""),
+                            500,
+                        );
+                        let is_error = v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
+                        for_each_card(&messages, &tid, &|card| {
+                            card.result = Some(preview.clone());
+                            card.is_error = is_error;
+                        });
+                    }
                 }
-                running.set(false);
+                "status" => {
+                    let text = serde_json::from_str::<String>(&ev.data)
+                        .unwrap_or_else(|_| ev.data.clone());
+                    status_line.set(Some(text));
+                }
+                "error" => {
+                    let msg = serde_json::from_str::<Value>(&ev.data)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("message")
+                                .and_then(|m| m.as_str())
+                                .map(|m| m.to_string())
+                        })
+                        .unwrap_or_else(|| ev.data.clone());
+                    error.set(Some(msg));
+                }
+                "done" => {
+                    if let Ok(v) = serde_json::from_str::<Value>(&ev.data)
+                        && let Some(u) = v.get("usage")
+                    {
+                        usage.set(Some(fmt_usage(u)));
+                    }
+                    running.set(false);
+                }
+                _ => {}
             }
-            _ => {}
         })
         .await;
         running.set(false);
@@ -300,40 +329,111 @@ fn send(
         }
     });
 }
-fn render_msg(msg: UiMsg) -> AnyView {
-    match msg {
-        UiMsg::User { content } => view! { <div class="msg user">{content}</div> }.into_any(),
-        UiMsg::Assistant {
-            content,
-            thinking,
-            tools,
-        } => view! {
-                <div class="msg assistant">
+
+fn ensure_text_block(messages: &RwSignal<Vec<MsgEntry>>) {
+    if !last_is_kind(messages, true) {
+        messages.update(|m| {
+            m.push(MsgEntry {
+                block: UiBlock::Text {
+                    text: RwSignal::new(String::new()),
+                },
+            });
+        });
+    }
+}
+
+fn ensure_thinking_block(messages: &RwSignal<Vec<MsgEntry>>) {
+    let empty = messages.get_untracked().last().map(|e| &e.block).is_none();
+    if last_is_kind(messages, true) || empty {
+        messages.update(|m| {
+            m.push(MsgEntry {
+                block: UiBlock::Thinking {
+                    text: RwSignal::new(String::new()),
+                },
+            });
+        });
+    }
+}
+
+fn append_last_text(messages: &RwSignal<Vec<MsgEntry>>, text: &str) {
+    messages.update(|m| {
+        if let Some(UiBlock::Text { text: buf }) = m.last_mut().map(|e| &mut e.block) {
+            buf.update(|s| s.push_str(text));
+        }
+    });
+}
+
+fn append_last_thinking(messages: &RwSignal<Vec<MsgEntry>>, text: &str) {
+    messages.update(|m| {
+        if let Some(UiBlock::Thinking { text: buf }) = m.last_mut().map(|e| &mut e.block) {
+            buf.update(|s| s.push_str(text));
+        }
+    });
+}
+
+fn for_each_card(messages: &RwSignal<Vec<MsgEntry>>, id: &str, f: &impl Fn(&mut ToolCard)) {
+    messages.update(|m| {
+        for e in m.iter().rev() {
+            if let UiBlock::ToolUse { card } = &e.block {
+                let mut hit = false;
+                card.update(|c| {
+                    if c.id == id {
+                        f(c);
+                        hit = true;
+                    }
+                });
+                if hit {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn block_child(block: &UiBlock) -> AnyView {
+    match block {
+        UiBlock::Thinking { text } => {
+            let t = *text;
+            view! { <div class="thinking">{move || (!t.get().is_empty()).then(|| t.get())}</div> }
+                .into_any()
+        }
+        UiBlock::Text { text } => view! { <MarkdownText text=*text/> }.into_any(),
+        UiBlock::ToolUse { card } => {
+            let c = *card;
+            let name = move || c.get().name.clone();
+            let args = move || {
+                let a = c.get().arguments.clone();
+                (!a.is_empty()).then_some(a)
+            };
+            let result = move || {
+                let state = c.get();
+                state.result.map(|r| (r, state.is_error))
+            };
+            view! {
+                <div class="tool-card-inline">
+                    <div class="tc-name">{name}</div>
+                    {move || args().map(|a| view! { <div class="tc-args">{a}</div> })}
                     {move || {
-                        let t = thinking.get();
-                        (!t.is_empty()).then(|| view! { <div class="thinking">{t}</div> })
+                        result().map(|(r, is_err)| {
+                            let cls = if is_err { "tc-result tc-error" } else { "tc-result" };
+                            view! { <div class=cls>{r}</div> }
+                        })
                     }}
-                    <MarkdownText text=content/>
-                    <For
-                        each=move || tools.get()
-                        key=|card: &ToolCard| card.id.clone()
-                        children=move |card: ToolCard| {
-                            view! {
-                                <div class="tool-card-inline">
-                                    <div class="tc-name">{card.name}</div>
-                                    <div class="tc-args">{card.arguments}</div>
-                                    {move || card.result.as_ref().map(|r| {
-                                        let cls = if card.is_error { "tc-result tc-error" } else { "tc-result" };
-                                        view! { <div class=cls>{r.clone()}</div> }
-                                    })}
-                                </div>
-                            }
-                        }
-                    />
                 </div>
             }
-            .into_any(),
+            .into_any()
+        }
+        UiBlock::User { content } => {
+            view! { <div class="msg user">{content.clone()}</div> }.into_any()
+        }
     }
+}
+
+/// Consecutive assistant-side blocks share one chat bubble, keeping the
+/// original order (thinking → text → tool cards → more text …).
+fn assistant_group(run: Vec<MsgEntry>) -> AnyView {
+    let children: Vec<AnyView> = run.iter().map(|e| block_child(&e.block)).collect();
+    view! { <div class="msg assistant">{children}</div> }.into_any()
 }
 
 #[component]
@@ -387,20 +487,27 @@ pub fn ChatPage() -> impl IntoView {
     let usage = RwSignal::new(None::<String>);
     let error = RwSignal::new(None::<String>);
     let status_line = RwSignal::new(None::<String>);
-    let active = RwSignal::new(None::<u64>);
+    let active = RwSignal::new(None::<String>);
     let selected_agent = RwSignal::new(String::new());
 
-    spawn_local(async move {
-        if let Ok((_, v)) = api::get("/api/sessions").await
-            && let Some(list) = v.get("sessions").and_then(|x| x.as_array())
-        {
-            sessions.set(
-                list.iter()
-                    .filter_map(|s| serde_json::from_value::<SessionSummary>(s.clone()).ok())
-                    .collect(),
-            );
+    // Auto-scroll bookkeeping: follow the stream only while the user is at
+    // (or near) the bottom of the buffer.
+    let messages_el = NodeRef::<leptos::html::Div>::new();
+    let at_bottom = RwSignal::new(true);
+    let scroll_tick = RwSignal::new(0u64);
+
+    Effect::new(move |_| {
+        scroll_tick.get();
+        messages.get();
+        if !at_bottom.get() {
+            return;
+        }
+        if let Some(el) = messages_el.get() {
+            el.set_scroll_top(el.scroll_height());
         }
     });
+
+    spawn_local(refresh_sessions_async(sessions));
     spawn_local(async move {
         if let Ok((_, v)) = api::get("/api/agents").await
             && let Some(list) = v.get("agents").and_then(|x| x.as_array())
@@ -411,14 +518,18 @@ pub fn ChatPage() -> impl IntoView {
 
     Effect::new(move |_| {
         if let Some(id) = session_id.get() {
-            active.set(Some(id));
+            active.set(Some(id.clone()));
             running.set(false);
             usage.set(None);
             error.set(None);
             status_line.set(None);
             messages.set(Vec::new());
+            let messages = messages;
+            let error = error;
+            let scroll_tick = scroll_tick;
+            let at_bottom = at_bottom;
             spawn_local(async move {
-                load_history(id, &messages, &error).await;
+                load_history(&id, &messages, &error, &scroll_tick, &at_bottom).await;
             });
         } else {
             active.set(None);
@@ -433,9 +544,9 @@ pub fn ChatPage() -> impl IntoView {
         let agents = agents.get();
         if !agents.is_empty()
             && selected_agent.get().is_empty()
-            && let Some(kind) = agents.first().and_then(|a| a["kind"].as_str())
+            && let Some(name) = agents.first().and_then(|a| a["name"].as_str())
         {
-            selected_agent.set(kind.to_string());
+            selected_agent.set(name.to_string());
         }
     });
 
@@ -449,7 +560,16 @@ pub fn ChatPage() -> impl IntoView {
 
     let do_send = move || {
         if let Some(id) = active.get() {
-            send(id, input, messages, running, usage, error, status_line);
+            send(
+                id,
+                input,
+                messages,
+                running,
+                usage,
+                error,
+                status_line,
+                scroll_tick,
+            );
         }
     };
 
@@ -461,33 +581,25 @@ pub fn ChatPage() -> impl IntoView {
         spawn_local(async move {
             if let Ok((status, v)) = api::post("/api/sessions", &json!({ "agent": agent })).await
                 && status == 201
-                && let Some(id) = v.get("session_id").and_then(|x| x.as_u64())
+                && let Some(id) = v.get("session_id").and_then(|x| x.as_str())
             {
                 go_to.set(Some(format!("/chat/{id}")));
             }
         });
     };
 
-    let delete_session = move |id: u64| {
+    let delete_session = move |id: String| {
         let active = active.get();
         spawn_local(async move {
             let _ = api::delete(&format!("/api/sessions/{id}")).await;
-            if let Ok((_, v)) = api::get("/api/sessions").await
-                && let Some(list) = v.get("sessions").and_then(|x| x.as_array())
-            {
-                sessions.set(
-                    list.iter()
-                        .filter_map(|s| serde_json::from_value::<SessionSummary>(s.clone()).ok())
-                        .collect(),
-                );
-            }
-            if Some(id) == active {
+            refresh_sessions_async(sessions).await;
+            if Some(&id) == active.as_ref() {
                 go_to.set(Some("/chat".to_string()));
             }
         });
     };
 
-    let select_session = move |id: u64| go_to.set(Some(format!("/chat/{id}")));
+    let select_session = move |id: String| go_to.set(Some(format!("/chat/{id}")));
 
     let stop_session = move || {
         if let Some(id) = active.get() {
@@ -501,9 +613,11 @@ pub fn ChatPage() -> impl IntoView {
         if let Some(id) = active.get() {
             let messages = messages;
             let error = error;
+            let scroll_tick = scroll_tick;
+            let at_bottom = at_bottom;
             spawn_local(async move {
                 let _ = api::post(&format!("/api/sessions/{id}/reset"), &json!({})).await;
-                load_history(id, &messages, &error).await;
+                load_history(&id, &messages, &error, &scroll_tick, &at_bottom).await;
             });
         }
     };
@@ -512,9 +626,30 @@ pub fn ChatPage() -> impl IntoView {
         if let Some(id) = active.get() {
             let messages = messages;
             let error = error;
+            let scroll_tick = scroll_tick;
+            let at_bottom = at_bottom;
             spawn_local(async move {
                 let _ = api::post(&format!("/api/sessions/{id}/compact"), &json!({})).await;
-                load_history(id, &messages, &error).await;
+                load_history(&id, &messages, &error, &scroll_tick, &at_bottom).await;
+            });
+        }
+    };
+
+    let migrate_session = move || {
+        if let Some(id) = active.get() {
+            let messages = messages;
+            let error = error;
+            let scroll_tick = scroll_tick;
+            let at_bottom = at_bottom;
+            spawn_local(async move {
+                let (_, v) = api::post(&format!("/api/sessions/{id}/migrate"), &json!({}))
+                    .await
+                    .unwrap_or((0, Value::Null));
+                if v.get("error").is_some() {
+                    error.set(v.get("error").and_then(|e| e.as_str()).map(String::from));
+                }
+                refresh_sessions_async(sessions).await;
+                load_history(&id, &messages, &error, &scroll_tick, &at_bottom).await;
             });
         }
     };
@@ -525,40 +660,45 @@ pub fn ChatPage() -> impl IntoView {
         sessions
             .get()
             .iter()
-            .find(|s| Some(s.id) == active.get())
+            .find(|s| Some(&s.id) == active.get().as_ref())
             .map(|s| s.agent.clone())
             .unwrap_or_default()
     });
+    let _ = &session_id;
 
     view! {
         <div class="app">
             <aside class="sidebar">
                 <div class="brand-row">
                     <h1>"Carson"</h1>
-                    <div class="sub">"wasm agent host"</div>
+                    <div class="sub">"Chat"</div>
                 </div>
                 <button class="btn primary" on:click=move |_| new_chat()>"+ New chat"</button>
                 <div class="session-list">
                     <For
                         each=move || sessions.get()
-                        key=|s: &SessionSummary| s.id
+                        key=|s: &SessionSummary| s.id.clone()
                         children=move |session: SessionSummary| {
+                            let sid = session.id.clone();
                             let active_class = move || {
-                                if active.get() == Some(session.id) {
+                                if active.get().as_ref() == Some(&sid) {
                                     "session-item active"
                                 } else {
                                     "session-item"
                                 }
                             };
+                            let label = format!("{} · {}", short_id(&session.id), session.agent);
+                            let id_del = session.id.clone();
+                            let id_sel = session.id.clone();
                             view! {
                                 <div class=active_class>
-                                    <button class="name" on:click=move |_| select_session(session.id)>
-                                        {format!("#{} · {}", session.id, session.agent)}
+                                    <button class="name" on:click=move |_| select_session(id_sel.clone())>
+                                        {label}
                                     </button>
                                     <button
                                         class="del"
                                         title="Delete session"
-                                        on:click=move |_| delete_session(session.id)
+                                        on:click=move |_| delete_session(id_del.clone())
                                     >
                                         "x"
                                     </button>
@@ -577,10 +717,11 @@ pub fn ChatPage() -> impl IntoView {
                             <div class="toolbar">
                                 <div class="title">
                                     {move || {
+                                        let id = active.get().map(|i| short_id(&i)).unwrap_or_default();
                                         if active_agent.get().is_empty() {
-                                            format!("Session #{}", active.get().unwrap_or(0))
+                                            format!("Session {id}")
                                         } else {
-                                            format!("Session #{} · {}", active.get().unwrap_or(0), active_agent.get())
+                                            format!("Session {id} · {}", active_agent.get())
                                         }
                                     }}
                                 </div>
@@ -589,20 +730,44 @@ pub fn ChatPage() -> impl IntoView {
                                 </button>
                                 <button class="btn" on:click=move |_| reset_session()>"Reset"</button>
                                 <button class="btn" on:click=move |_| compact_session()>"Compact"</button>
+                                <button class="btn" title="Move this session onto the agent's current version"
+                                    on:click=move |_| migrate_session()>"Migrate"</button>
                                 <button class="btn danger" on:click=move |_| {
                                     if let Some(id) = active.get() {
                                         delete_session(id);
                                     }
                                 }>"Delete"</button>
                             </div>
-                            <div class="messages">
+                            <div
+                                class="messages"
+                                node_ref=messages_el
+                                on:scroll=move |_| {
+                                    if let Some(el) = messages_el.get() {
+                                        let near = el.scroll_top() + el.client_height()
+                                            >= el.scroll_height() - 48;
+                                        at_bottom.set(near);
+                                    }
+                                }
+                            >
                                 {move || {
                                     let entries = messages.get();
-                                    let mut views = Vec::new();
+                                    let mut out: Vec<AnyView> = Vec::new();
+                                    let mut run: Vec<MsgEntry> = Vec::new();
                                     for e in entries {
-                                        views.push(render_msg(e.msg).into_any());
+                                        match e.block {
+                                            UiBlock::User { .. } => {
+                                                if !run.is_empty() {
+                                                    out.push(assistant_group(std::mem::take(&mut run)));
+                                                }
+                                                out.push(block_child(&e.block));
+                                            }
+                                            _ => run.push(e),
+                                        }
                                     }
-                                    views
+                                    if !run.is_empty() {
+                                        out.push(assistant_group(run));
+                                    }
+                                    out
                                 }}
                             </div>
                             <div class="composer">
@@ -622,6 +787,11 @@ pub fn ChatPage() -> impl IntoView {
                                     "Send"
                                 </button>
                             </div>
+                            <div class="statusbar">
+                                {move || status_line.get().map(|s| view! { <span class="status-line">{s}</span> })}
+                                {move || error.get().map(|e| view! { <span class="error-line">{e}</span> })}
+                                {move || usage.get().map(|u| view! { <span class="usage-line">{u}</span> })}
+                            </div>
                         }
                             .into_any()
                     } else {
@@ -640,20 +810,20 @@ pub fn ChatPage() -> impl IntoView {
                                                     on:change=move |ev| selected_agent.set(event_target_value(&ev))
                                                 >
                                                     {move || {
-                                                        let kinds: Vec<String> = agents
+                                                        let names: Vec<String> = agents
                                                             .get()
                                                             .iter()
                                                             .filter_map(|a| {
-                                                                a.get("kind")
+                                                                a.get("name")
                                                                     .and_then(|k| k.as_str())
                                                                     .map(|k| k.to_string())
                                                             })
                                                             .collect();
-                                                        kinds
+                                                        names
                                                             .into_iter()
-                                                            .map(|kind| {
-                                                                let v = kind.clone();
-                                                                view! { <option value=v>{kind}</option> }
+                                                            .map(|name| {
+                                                                let v = name.clone();
+                                                                view! { <option value=v>{name}</option> }
                                                             })
                                                             .collect::<Vec<_>>()
                                                     }}
@@ -673,5 +843,17 @@ pub fn ChatPage() -> impl IntoView {
                 }}
             </main>
         </div>
+    }
+}
+
+async fn refresh_sessions_async(sessions: RwSignal<Vec<SessionSummary>>) {
+    if let Ok((_, v)) = api::get("/api/sessions").await
+        && let Some(list) = v.get("sessions").and_then(|x| x.as_array())
+    {
+        sessions.set(
+            list.iter()
+                .filter_map(|s| serde_json::from_value::<SessionSummary>(s.clone()).ok())
+                .collect(),
+        );
     }
 }

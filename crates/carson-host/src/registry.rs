@@ -9,10 +9,17 @@ use wasmtime::Store;
 use crate::bindings::AgentWorld;
 use crate::state::State;
 
-/// A persisted agent definition (DB is the single source of truth).
+/// One immutable version of an agent definition.
+///
+/// Every edit creates a new version identified by `id` (a uuid); the human
+/// name is just a pointer to the current version (`agent_names` in the DB).
+/// Sessions pin the version they were created with, so old rows must never
+/// be mutated or deleted while sessions reference them.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AgentDef {
-    pub kind: String,
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
     #[serde(default)]
     pub system_prompt: String,
     pub model: String,
@@ -78,21 +85,17 @@ fn default_parameters() -> serde_json::Value {
 }
 
 pub struct AgentInstance {
-    pub kind: String,
+    pub agent_name: String,
+    pub agent_version: String,
     pub store: Mutex<Store<State>>,
     pub agent: AgentWorld,
     pub stop: Arc<AtomicBool>,
 }
 
 pub struct AgentPool {
-    pub kind: String,
-    pub system_prompt: String,
-    pub model: String,
-    pub max_history: u32,
-    pub context_window: u32,
-    pub compaction_ratio: f32,
-    pub auto_compact: bool,
-    pub caps: Vec<String>,
+    pub version_id: String,
+    pub agent_name: String,
+    pub def: AgentDef,
     pub instances: Vec<Arc<AgentInstance>>,
     pub next: AtomicUsize,
 }
@@ -100,16 +103,24 @@ pub struct AgentPool {
 impl AgentPool {
     pub fn from_def(def: &AgentDef, instances: Vec<Arc<AgentInstance>>) -> Self {
         Self {
-            kind: def.kind.clone(),
-            system_prompt: def.system_prompt.clone(),
-            model: def.model.clone(),
-            max_history: def.max_history as u32,
-            context_window: def.context_window as u32,
-            compaction_ratio: def.compaction_ratio,
-            auto_compact: def.auto_compact,
-            caps: def.capabilities.clone(),
+            version_id: def.id.clone(),
+            agent_name: def.name.clone(),
+            def: def.clone(),
             instances,
             next: AtomicUsize::new(0),
+        }
+    }
+
+    /// The guest session config derived from this pool's agent definition.
+    pub fn config(&self) -> crate::bindings::exports::carson::agent::agent::SessionConfig {
+        crate::bindings::exports::carson::agent::agent::SessionConfig {
+            system_prompt: self.def.system_prompt.clone(),
+            model: self.def.model.clone(),
+            capabilities_json: serde_json::json!(self.def.capabilities).to_string(),
+            max_history: self.def.max_history as u32,
+            context_window: self.def.context_window as u32,
+            compaction_ratio: self.def.compaction_ratio,
+            auto_compact: self.def.auto_compact,
         }
     }
 
@@ -124,14 +135,11 @@ impl AgentPool {
     }
 }
 
+/// Pools keyed by agent version id. Versions pinned by live sessions stay
+/// loaded even after the name pointer moves elsewhere.
+#[derive(Default)]
 pub struct AgentRegistry {
     pools: HashMap<String, Arc<AgentPool>>,
-}
-
-impl Default for AgentRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl AgentRegistry {
@@ -141,19 +149,34 @@ impl AgentRegistry {
         }
     }
 
-    pub fn insert(&mut self, kind: String, pool: AgentPool) {
-        self.pools.insert(kind, Arc::new(pool));
+    pub fn insert(&mut self, pool: AgentPool) {
+        self.pools.insert(pool.version_id.clone(), Arc::new(pool));
     }
 
-    pub fn remove(&mut self, kind: &str) -> Option<Arc<AgentPool>> {
-        self.pools.remove(kind)
+    pub fn insert_arc(&mut self, pool: Arc<AgentPool>) {
+        self.pools.insert(pool.version_id.clone(), pool);
     }
 
-    pub fn get(&self, kind: &str) -> Option<Arc<AgentPool>> {
-        self.pools.get(kind).cloned()
+    pub fn get(&self, version_id: &str) -> Option<Arc<AgentPool>> {
+        self.pools.get(version_id).cloned()
     }
 
     pub fn pools(&self) -> impl Iterator<Item = (&String, &Arc<AgentPool>)> {
         self.pools.iter()
     }
+}
+
+/// Locking helper: returns the cached pool for `def`, building and caching it
+/// on first use so callers never instantiate wasm twice for one version.
+pub async fn get_or_build_pool(
+    ctx: &crate::host::HostContext,
+    registry: &Mutex<AgentRegistry>,
+    def: &AgentDef,
+) -> anyhow::Result<Arc<AgentPool>> {
+    if let Some(pool) = registry.lock().await.get(&def.id) {
+        return Ok(pool);
+    }
+    let pool = Arc::new(crate::host::build_pool(ctx, def).await?);
+    registry.lock().await.insert_arc(pool.clone());
+    Ok(pool)
 }

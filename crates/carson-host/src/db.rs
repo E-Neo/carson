@@ -7,9 +7,12 @@ use rusqlite::{Connection, params};
 use crate::drivers::Usage;
 use crate::registry::{AgentDef, ProviderDef, ToolDef};
 
+const SCHEMA_VERSION: i32 = 2;
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS agents (
-    kind TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
     system_prompt TEXT NOT NULL,
     model TEXT NOT NULL,
     instances INTEGER NOT NULL DEFAULT 1,
@@ -18,8 +21,12 @@ CREATE TABLE IF NOT EXISTS agents (
     compaction_ratio REAL NOT NULL DEFAULT 0.8,
     auto_compact INTEGER NOT NULL DEFAULT 1,
     capabilities_json TEXT NOT NULL DEFAULT '[]',
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agents_name ON agents(name);
+CREATE TABLE IF NOT EXISTS agent_names (
+    name TEXT PRIMARY KEY,
+    current_id TEXT NOT NULL REFERENCES agents(id)
 );
 CREATE TABLE IF NOT EXISTS providers (
     name TEXT PRIMARY KEY,
@@ -38,8 +45,9 @@ CREATE TABLE IF NOT EXISTS tools (
     updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
-    id INTEGER PRIMARY KEY,
-    kind TEXT NOT NULL,
+    id TEXT PRIMARY KEY,
+    agent_name TEXT NOT NULL,
+    agent_version_id TEXT NOT NULL,
     summary TEXT,
     input_tokens INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
@@ -49,12 +57,21 @@ CREATE TABLE IF NOT EXISTS sessions (
     updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS messages (
-    session_id INTEGER NOT NULL,
+    session_id TEXT NOT NULL,
     seq INTEGER NOT NULL,
-    role TEXT NOT NULL,
+    agent_version_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
     content TEXT,
-    tool_calls_json TEXT,
     tool_call_id TEXT,
+    tool_name TEXT,
+    arguments_json TEXT,
+    is_error INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    finished_at INTEGER,
     PRIMARY KEY (session_id, seq)
 );
 "#;
@@ -67,7 +84,14 @@ fn now_ms() -> i64 {
 }
 
 /// Apply additive schema changes to databases created by older binaries.
+///
+/// Version 2 rewrote sessions/messages completely (uuid ids plus a typed
+/// block log), so those tables are recreated and chat history is discarded.
+/// Agent definitions are preserved: legacy `kind` rows become named versions
+/// with freshly generated ids.
 fn migrate(conn: &Connection) -> Result<()> {
+    // Idempotent: creates missing tables, leaves existing ones untouched.
+    conn.execute_batch(SCHEMA)?;
     let has_column = |table: &str, column: &str| -> Result<bool> {
         let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
         let mut rows = stmt.query([])?;
@@ -83,65 +107,127 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("ALTER TABLE providers ADD COLUMN api_key TEXT", [])
             .context("migrate providers.api_key")?;
     }
-    // Drop the legacy env-var column when the sqlite version supports it.
-    if has_column("providers", "api_key_env")? {
-        let _ = conn.execute("ALTER TABLE providers DROP COLUMN api_key_env", []);
+
+    let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= SCHEMA_VERSION {
+        return Ok(());
     }
+
+    // Legacy agents table (keyed by `kind`) is carried forward as versions.
+    if !has_column("agents", "id")? && has_column("agents", "kind")? {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("ALTER TABLE agents RENAME TO agents_legacy", [])?;
+        tx.commit()?;
+        conn.execute_batch(SCHEMA)?;
+        let tx = conn.unchecked_transaction()?;
+        let mut stmt = tx.prepare(
+            "SELECT kind, system_prompt, model, instances, max_history, context_window, \
+             compaction_ratio, auto_compact, capabilities_json FROM agents_legacy",
+        )?;
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(String, String, String, i64, i64, i64, f64, i64, String)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(stmt);
+        for (kind, prompt, model, instances, history, window, ratio, auto, caps) in rows {
+            let id = uuid::Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO agents (id, name, system_prompt, model, instances, max_history, \
+                 context_window, compaction_ratio, auto_compact, capabilities_json, created_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![
+                    id,
+                    kind,
+                    prompt,
+                    model,
+                    instances,
+                    history,
+                    window,
+                    ratio,
+                    auto,
+                    caps,
+                    now_ms()
+                ],
+            )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO agent_names (name, current_id) VALUES (?1, ?2)",
+                params![kind, id],
+            )?;
+        }
+        tx.execute("DROP TABLE agents_legacy", [])?;
+        tx.execute("DELETE FROM sessions", [])?;
+        tx.execute("DELETE FROM messages", [])?;
+        tx.commit()?;
+    } else {
+        conn.execute_batch(SCHEMA)?;
+    }
+    conn.execute(&format!("PRAGMA user_version = {SCHEMA_VERSION}"), [])?;
     Ok(())
 }
 
-/// A serializable conversation message (mirrors the WIT `message` record).
+/// One entry of the persisted conversation block log (mirrors the WIT `block`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct StoredMessage {
-    pub role: String,
-    pub content: Option<String>,
-    pub tool_calls: Option<Vec<StoredToolCall>>,
+pub struct StoredBlock {
+    pub kind: String,
+    pub text: Option<String>,
     pub tool_call_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub arguments_json: Option<String>,
+    pub is_error: bool,
+    pub input_tokens: u32,
+    pub cache_read_tokens: u32,
+    pub cache_creation_tokens: u32,
+    pub output_tokens: u32,
+    pub created_at_ms: u64,
+    pub finished_at_ms: u64,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct StoredToolCall {
-    pub id: String,
-    pub name: String,
-    pub arguments: String,
-}
-
-impl From<&crate::bindings::carson::agent::llm::Message> for StoredMessage {
-    fn from(m: &crate::bindings::carson::agent::llm::Message) -> Self {
+impl From<&crate::bindings::exports::carson::agent::agent::Block> for StoredBlock {
+    fn from(b: &crate::bindings::exports::carson::agent::agent::Block) -> Self {
         Self {
-            role: m.role.clone(),
-            content: m.content.clone(),
-            tool_calls: m.tool_calls.as_ref().map(|calls| {
-                calls
-                    .iter()
-                    .map(|tc| StoredToolCall {
-                        id: tc.id.clone(),
-                        name: tc.name.clone(),
-                        arguments: tc.arguments_json.clone(),
-                    })
-                    .collect()
-            }),
-            tool_call_id: m.tool_call_id.clone(),
+            kind: b.kind.clone(),
+            text: b.text.clone(),
+            tool_call_id: b.tool_call_id.clone(),
+            tool_name: b.tool_name.clone(),
+            arguments_json: b.arguments_json.clone(),
+            is_error: b.is_error,
+            input_tokens: b.input_tokens,
+            cache_read_tokens: b.cache_read_tokens,
+            cache_creation_tokens: b.cache_creation_tokens,
+            output_tokens: b.output_tokens,
+            created_at_ms: b.created_at_ms,
+            finished_at_ms: b.finished_at_ms,
         }
     }
 }
 
-impl From<StoredMessage> for crate::bindings::carson::agent::llm::Message {
-    fn from(m: StoredMessage) -> Self {
+impl From<&StoredBlock> for crate::bindings::exports::carson::agent::agent::Block {
+    fn from(b: &StoredBlock) -> Self {
         Self {
-            role: m.role,
-            content: m.content,
-            tool_calls: m.tool_calls.map(|calls| {
-                calls
-                    .into_iter()
-                    .map(|tc| crate::bindings::carson::agent::llm::ToolCall {
-                        id: tc.id,
-                        name: tc.name,
-                        arguments_json: tc.arguments,
-                    })
-                    .collect()
-            }),
-            tool_call_id: m.tool_call_id,
+            kind: b.kind.clone(),
+            text: b.text.clone(),
+            tool_call_id: b.tool_call_id.clone(),
+            tool_name: b.tool_name.clone(),
+            arguments_json: b.arguments_json.clone(),
+            is_error: b.is_error,
+            input_tokens: b.input_tokens,
+            cache_read_tokens: b.cache_read_tokens,
+            cache_creation_tokens: b.cache_creation_tokens,
+            output_tokens: b.output_tokens,
+            created_at_ms: b.created_at_ms,
+            finished_at_ms: b.finished_at_ms,
         }
     }
 }
@@ -149,12 +235,35 @@ impl From<StoredMessage> for crate::bindings::carson::agent::llm::Message {
 /// A persisted session snapshot (used to restore an agent session on boot).
 #[derive(Debug, Clone)]
 pub struct PersistedSession {
-    pub id: u64,
-    pub kind: String,
+    pub id: String,
+    pub agent_name: String,
+    pub agent_version_id: String,
     pub summary: Option<String>,
     pub usage: Usage,
-    pub messages: Vec<StoredMessage>,
+    pub messages: Vec<StoredBlock>,
 }
+
+/// Columns of one message row, kept together for the load query.
+struct MessageRow(StoredBlock);
+
+fn def_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentDef> {
+    let caps: String = row.get(9)?;
+    Ok(AgentDef {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        system_prompt: row.get(2)?,
+        model: row.get(3)?,
+        instances: row.get::<_, i64>(4)? as usize,
+        max_history: row.get::<_, i64>(5)? as usize,
+        context_window: row.get::<_, i64>(6)? as usize,
+        compaction_ratio: row.get(7)?,
+        auto_compact: row.get::<_, i64>(8)? != 0,
+        capabilities: serde_json::from_str(&caps).unwrap_or_default(),
+    })
+}
+
+const AGENT_COLUMNS: &str = "a.id, a.name, a.system_prompt, a.model, a.instances, a.max_history, a.context_window, \
+     a.compaction_ratio, a.auto_compact, a.capabilities_json";
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -164,58 +273,78 @@ impl Db {
     pub fn open(path: &Path) -> Result<Arc<Self>> {
         let conn =
             Connection::open(path).with_context(|| format!("open database {}", path.display()))?;
-        conn.execute_batch(SCHEMA)
-            .with_context(|| format!("initialize schema in {}", path.display()))?;
-        migrate(&conn)?;
+        migrate(&conn).with_context(|| format!("migrate {}", path.display()))?;
         Ok(Arc::new(Self {
             conn: Mutex::new(conn),
         }))
     }
 
+    /// In-memory database; used by tests across the workspace.
+    #[doc(hidden)]
     pub fn open_in_memory() -> Result<Arc<Self>> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
         Ok(Arc::new(Self {
             conn: Mutex::new(conn),
         }))
     }
 
+    /// Current version of every named agent.
     pub fn list_agents(&self) -> Result<Vec<AgentDef>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT kind, system_prompt, model, instances, max_history, context_window, \
-             compaction_ratio, auto_compact, capabilities_json FROM agents ORDER BY kind",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            let caps: String = row.get(8)?;
-            Ok(AgentDef {
-                kind: row.get(0)?,
-                system_prompt: row.get(1)?,
-                model: row.get(2)?,
-                instances: row.get::<_, i64>(3)? as usize,
-                max_history: row.get::<_, i64>(4)? as usize,
-                context_window: row.get::<_, i64>(5)? as usize,
-                compaction_ratio: row.get(6)?,
-                auto_compact: row.get::<_, i64>(7)? != 0,
-                capabilities: serde_json::from_str(&caps).unwrap_or_default(),
-            })
-        })?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {AGENT_COLUMNS} FROM agents a \
+             JOIN agent_names n ON n.current_id = a.id ORDER BY a.name"
+        ))?;
+        let rows = stmt.query_map([], def_from_row)?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    pub fn insert_agent(&self, def: &AgentDef) -> Result<()> {
-        let now = now_ms();
+    /// Every version of an agent, oldest first.
+    pub fn list_agent_versions(&self, name: &str) -> Result<Vec<AgentDef>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {AGENT_COLUMNS} FROM agents a WHERE a.name = ?1 ORDER BY a.rowid"
+        ))?;
+        let rows = stmt.query_map(params![name], def_from_row)?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn get_agent_version(&self, id: &str) -> Result<Option<AgentDef>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {AGENT_COLUMNS} FROM agents a WHERE a.id = ?1"
+        ))?;
+        let mut rows = stmt.query(params![id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(def_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn current_agent(&self, name: &str) -> Result<Option<AgentDef>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {AGENT_COLUMNS} FROM agents a JOIN agent_names n ON n.current_id = a.id \
+             WHERE n.name = ?1"
+        ))?;
+        let mut rows = stmt.query(params![name])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(def_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Insert an immutable agent version row. The caller supplies `def.id`.
+    pub fn insert_agent_version(&self, def: &AgentDef) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO agents (kind, system_prompt, model, instances, max_history, context_window, \
-             compaction_ratio, auto_compact, capabilities_json, created_at, updated_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10) \
-             ON CONFLICT(kind) DO UPDATE SET system_prompt=?2, model=?3, instances=?4, \
-             max_history=?5, context_window=?6, compaction_ratio=?7, auto_compact=?8, \
-             capabilities_json=?9, updated_at=?10",
+            "INSERT INTO agents (id, name, system_prompt, model, instances, max_history, \
+             context_window, compaction_ratio, auto_compact, capabilities_json, created_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
-                def.kind,
+                def.id,
+                def.name,
                 def.system_prompt,
                 def.model,
                 def.instances as i64,
@@ -224,24 +353,28 @@ impl Db {
                 def.compaction_ratio,
                 def.auto_compact as i64,
                 serde_json::to_string(&def.capabilities)?,
-                now,
+                now_ms()
             ],
         )?;
         Ok(())
     }
 
-    /// Delete an agent kind and cascade-delete its sessions (and their messages).
-    pub fn delete_agent(&self, kind: &str) -> Result<usize> {
+    /// Point `name` at `version_id` (which must already exist).
+    pub fn set_current_agent(&self, name: &str, version_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE kind = ?1)",
-            params![kind],
+        conn.execute(
+            "INSERT INTO agent_names (name, current_id) VALUES (?1, ?2) \
+             ON CONFLICT(name) DO UPDATE SET current_id = ?2",
+            params![name, version_id],
         )?;
-        let removed = tx.execute("DELETE FROM sessions WHERE kind = ?1", params![kind])?;
-        tx.execute("DELETE FROM agents WHERE kind = ?1", params![kind])?;
-        tx.commit()?;
-        Ok(removed)
+        Ok(())
+    }
+
+    /// Remove only the name pointer; versions and their pinned sessions stay.
+    pub fn delete_agent_pointer(&self, name: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM agent_names WHERE name = ?1", params![name])?;
+        Ok(())
     }
 
     pub fn list_providers(&self) -> Result<Vec<ProviderDef>> {
@@ -281,12 +414,12 @@ impl Db {
             "SELECT name, description, parameters_json, env_json FROM tools ORDER BY name",
         )?;
         let rows = stmt.query_map([], |row| {
-            let params: String = row.get(2)?;
+            let parameters: String = row.get(2)?;
             let env: String = row.get(3)?;
             Ok(ToolDef {
                 name: row.get(0)?,
                 description: row.get(1)?,
-                parameters: serde_json::from_str(&params).unwrap_or_default(),
+                parameters: serde_json::from_str(&parameters).unwrap_or_default(),
                 env: serde_json::from_str(&env).unwrap_or_default(),
             })
         })?;
@@ -311,12 +444,12 @@ impl Db {
         let mut rows = stmt.query(params![name])?;
         match rows.next()? {
             Some(row) => {
-                let params: String = row.get(2)?;
+                let parameters: String = row.get(2)?;
                 let env: String = row.get(3)?;
                 Ok(Some(ToolDef {
                     name: row.get(0)?,
                     description: row.get(1)?,
-                    parameters: serde_json::from_str(&params).unwrap_or_default(),
+                    parameters: serde_json::from_str(&parameters).unwrap_or_default(),
                     env: serde_json::from_str(&env).unwrap_or_default(),
                 }))
             }
@@ -338,7 +471,7 @@ impl Db {
                 serde_json::to_string(&def.parameters)?,
                 serde_json::to_string(&def.env)?,
                 wasm,
-                now,
+                now
             ],
         )?;
         Ok(())
@@ -354,40 +487,50 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO sessions (id, kind, summary, input_tokens, cache_read_tokens, \
-             cache_creation_tokens, output_tokens, created_at, updated_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8) \
-             ON CONFLICT(id) DO UPDATE SET kind=?2, summary=?3, input_tokens=?4, \
-             cache_read_tokens=?5, cache_creation_tokens=?6, output_tokens=?7, updated_at=?8",
+            "INSERT INTO sessions (id, agent_name, agent_version_id, summary, input_tokens, \
+             cache_read_tokens, cache_creation_tokens, output_tokens, created_at, updated_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9) \
+             ON CONFLICT(id) DO UPDATE SET agent_name=?2, agent_version_id=?3, summary=?4, \
+             input_tokens=?5, cache_read_tokens=?6, cache_creation_tokens=?7, output_tokens=?8, \
+             updated_at=?9",
             params![
-                session.id as i64,
-                session.kind,
+                session.id,
+                session.agent_name,
+                session.agent_version_id,
                 session.summary,
                 session.usage.input_tokens,
                 session.usage.cache_read_tokens,
                 session.usage.cache_creation_tokens,
                 session.usage.output_tokens,
-                now,
+                now
             ],
         )?;
         tx.execute(
             "DELETE FROM messages WHERE session_id = ?1",
-            params![session.id as i64],
+            params![session.id],
         )?;
-        for (seq, message) in session.messages.iter().enumerate() {
+        for (seq, block) in session.messages.iter().enumerate() {
             tx.execute(
-                "INSERT INTO messages (session_id, seq, role, content, tool_calls_json, tool_call_id) \
-                 VALUES (?1,?2,?3,?4,?5,?6)",
+                "INSERT INTO messages (session_id, seq, agent_version_id, kind, content, \
+                 tool_call_id, tool_name, arguments_json, is_error, input_tokens, \
+                 cache_read_tokens, cache_creation_tokens, output_tokens, created_at, finished_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                 params![
-                    session.id as i64,
+                    session.id,
                     seq as i64,
-                    message.role,
-                    message.content,
-                    message
-                        .tool_calls
-                        .as_ref()
-                        .map(|calls| serde_json::to_string(calls).unwrap_or_else(|_| "[]".into())),
-                    message.tool_call_id,
+                    session.agent_version_id,
+                    block.kind,
+                    block.text,
+                    block.tool_call_id,
+                    block.tool_name,
+                    block.arguments_json,
+                    block.is_error as i64,
+                    block.input_tokens,
+                    block.cache_read_tokens,
+                    block.cache_creation_tokens,
+                    block.output_tokens,
+                    block.created_at_ms as i64,
+                    block.finished_at_ms as i64,
                 ],
             )?;
         }
@@ -398,70 +541,68 @@ impl Db {
     pub fn load_sessions(&self) -> Result<Vec<PersistedSession>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT s.id, s.kind, s.summary, s.input_tokens, s.cache_read_tokens, \
-             s.cache_creation_tokens, s.output_tokens, m.seq, m.role, m.content, \
-             m.tool_calls_json, m.tool_call_id \
+            "SELECT s.id, s.agent_name, s.agent_version_id, s.summary, s.input_tokens, \
+             s.cache_read_tokens, s.cache_creation_tokens, s.output_tokens, \
+             m.seq, m.kind, m.content, m.tool_call_id, m.tool_name, m.arguments_json, \
+             m.is_error, m.input_tokens, m.cache_read_tokens, m.cache_creation_tokens, \
+             m.output_tokens, m.created_at, m.finished_at \
              FROM sessions s LEFT JOIN messages m ON m.session_id = s.id \
-             ORDER BY s.id, m.seq",
+             ORDER BY s.rowid, m.seq",
         )?;
         let rows = stmt.query_map([], |row| {
+            let block = if row.get::<_, Option<i64>>(8)?.is_some() {
+                Some(MessageRow(StoredBlock {
+                    kind: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                    text: row.get(10)?,
+                    tool_call_id: row.get(11)?,
+                    tool_name: row.get(12)?,
+                    arguments_json: row.get(13)?,
+                    is_error: row.get::<_, i64>(14)? != 0,
+                    input_tokens: row.get::<_, i64>(15)? as u32,
+                    cache_read_tokens: row.get::<_, i64>(16)? as u32,
+                    cache_creation_tokens: row.get::<_, i64>(17)? as u32,
+                    output_tokens: row.get::<_, i64>(18)? as u32,
+                    created_at_ms: row.get::<_, Option<i64>>(19)?.unwrap_or(0) as u64,
+                    finished_at_ms: row.get::<_, Option<i64>>(20)?.unwrap_or(0) as u64,
+                }))
+            } else {
+                None
+            };
             Ok((
-                row.get::<_, i64>(0)? as u64,
+                row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, i64>(3)? as u32,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
                 row.get::<_, i64>(4)? as u32,
                 row.get::<_, i64>(5)? as u32,
                 row.get::<_, i64>(6)? as u32,
-                row.get::<_, Option<i64>>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                row.get::<_, Option<String>>(9)?,
-                row.get::<_, Option<String>>(10)?,
-                row.get::<_, Option<String>>(11)?,
+                row.get::<_, i64>(7)? as u32,
+                block,
             ))
         })?;
 
         let mut sessions: Vec<PersistedSession> = Vec::new();
+        let mut index_of: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         for row in rows {
             let (
                 id,
-                kind,
+                agent_name,
+                agent_version_id,
                 summary,
                 input,
                 cache_read,
                 cache_creation,
                 output,
-                seq,
-                role,
-                content,
-                tool_calls,
-                tool_call_id,
+                block,
             ) = row?;
-            let messages = &mut sessions.iter_mut().find(|s| s.id == id);
-            match messages {
-                Some(session) => {
-                    if let Some(seq) = seq {
-                        session.messages.resize(
-                            seq as usize + 1,
-                            StoredMessage {
-                                role: String::new(),
-                                content: None,
-                                tool_calls: None,
-                                tool_call_id: None,
-                            },
-                        );
-                        session.messages[seq as usize] = StoredMessage {
-                            role: role.unwrap_or_default(),
-                            content,
-                            tool_calls: tool_calls.and_then(|j| serde_json::from_str(&j).ok()),
-                            tool_call_id,
-                        };
-                    }
-                }
+            let idx = match index_of.get(&id) {
+                Some(idx) => *idx,
                 None => {
-                    let mut session = PersistedSession {
-                        id,
-                        kind,
+                    sessions.push(PersistedSession {
+                        id: id.clone(),
+                        agent_name,
+                        agent_version_id,
                         summary,
                         usage: Usage {
                             input_tokens: input,
@@ -470,39 +611,23 @@ impl Db {
                             output_tokens: output,
                         },
                         messages: Vec::new(),
-                    };
-                    if let Some(seq) = seq {
-                        session.messages.resize(
-                            seq as usize + 1,
-                            StoredMessage {
-                                role: String::new(),
-                                content: None,
-                                tool_calls: None,
-                                tool_call_id: None,
-                            },
-                        );
-                        session.messages[seq as usize] = StoredMessage {
-                            role: role.unwrap_or_default(),
-                            content,
-                            tool_calls: tool_calls.and_then(|j| serde_json::from_str(&j).ok()),
-                            tool_call_id,
-                        };
-                    }
-                    sessions.push(session);
+                    });
+                    index_of.insert(id, sessions.len() - 1);
+                    sessions.len() - 1
                 }
+            };
+            if let Some(MessageRow(block)) = block {
+                sessions[idx].messages.push(block);
             }
         }
         Ok(sessions)
     }
 
-    pub fn delete_session(&self, id: u64) -> Result<()> {
+    pub fn delete_session(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM messages WHERE session_id = ?1",
-            params![id as i64],
-        )?;
-        tx.execute("DELETE FROM sessions WHERE id = ?1", params![id as i64])?;
+        tx.execute("DELETE FROM messages WHERE session_id = ?1", params![id])?;
+        tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
         tx.commit()?;
         Ok(())
     }
@@ -512,9 +637,10 @@ impl Db {
 mod tests {
     use super::*;
 
-    fn def(kind: &str) -> AgentDef {
+    fn def(name: &str) -> AgentDef {
         AgentDef {
-            kind: kind.into(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.into(),
             system_prompt: "sys".into(),
             model: "mock".into(),
             instances: 1,
@@ -522,23 +648,37 @@ mod tests {
             context_window: 128_000,
             compaction_ratio: 0.8,
             auto_compact: true,
-            capabilities: vec!["time".into()],
+            capabilities: vec!["core/time".into()],
         }
     }
 
-    fn msg(role: &str, content: &str) -> StoredMessage {
-        StoredMessage {
-            role: role.into(),
-            content: Some(content.into()),
-            tool_calls: None,
-            tool_call_id: None,
-        }
-    }
-
-    fn session(id: u64, kind: &str, messages: Vec<StoredMessage>) -> PersistedSession {
-        PersistedSession {
-            id,
+    fn block(kind: &str, text: &str) -> StoredBlock {
+        StoredBlock {
             kind: kind.into(),
+            text: Some(text.into()),
+            tool_call_id: None,
+            tool_name: None,
+            arguments_json: None,
+            is_error: false,
+            input_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            output_tokens: 0,
+            created_at_ms: 1_000,
+            finished_at_ms: 2_000,
+        }
+    }
+
+    fn session(
+        id: &str,
+        agent_name: &str,
+        version: &str,
+        blocks: Vec<StoredBlock>,
+    ) -> PersistedSession {
+        PersistedSession {
+            id: id.into(),
+            agent_name: agent_name.into(),
+            agent_version_id: version.into(),
             summary: Some("summary".into()),
             usage: Usage {
                 input_tokens: 10,
@@ -546,54 +686,100 @@ mod tests {
                 cache_creation_tokens: 1,
                 output_tokens: 5,
             },
-            messages,
+            messages: blocks,
         }
     }
 
-    #[test]
-    fn agent_upsert_and_list() {
-        let db = Db::open_in_memory().unwrap();
-        db.insert_agent(&def("coder")).unwrap();
-        let mut changed = def("coder");
-        changed.system_prompt = "changed".into();
-        db.insert_agent(&changed).unwrap();
-        let agents = db.list_agents().unwrap();
-        assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].system_prompt, "changed");
-        assert_eq!(agents[0].capabilities, vec!["time"]);
+    fn create_agent(db: &Db, name: &str) -> AgentDef {
+        let d = def(name);
+        db.insert_agent_version(&d).unwrap();
+        db.set_current_agent(name, &d.id).unwrap();
+        d
     }
 
     #[test]
-    fn session_roundtrip() {
+    fn agent_versions_and_pointers() {
         let db = Db::open_in_memory().unwrap();
+        let v1 = create_agent(&db, "coder");
+        let mut v2 = def("coder");
+        v2.system_prompt = "changed".into();
+        db.insert_agent_version(&v2).unwrap();
+        db.set_current_agent("coder", &v2.id).unwrap();
+
+        let current = db.list_agents().unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].id, v2.id);
+        assert_eq!(current[0].system_prompt, "changed");
+
+        let versions = db.list_agent_versions("coder").unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].id, v1.id);
+        assert_eq!(db.current_agent("coder").unwrap().unwrap().id, v2.id);
+        assert!(db.current_agent("nope").unwrap().is_none());
+
+        // Deleting the pointer keeps both version rows.
+        db.delete_agent_pointer("coder").unwrap();
+        assert!(db.list_agents().unwrap().is_empty());
+        assert_eq!(db.list_agent_versions("coder").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn session_block_roundtrip() {
+        let db = Db::open_in_memory().unwrap();
+        let agent = create_agent(&db, "coder");
+        let mut thinking = block("thinking", "let me reason");
+        thinking.input_tokens = 7;
+        thinking.output_tokens = 3;
+        let mut call = block("tool-use", "");
+        call.tool_call_id = Some("c1".into());
+        call.tool_name = Some("core/time".into());
+        call.arguments_json = Some("{}".into());
+        let mut result = block("tool-result", "{\"unix_ms\":1}");
+        result.tool_call_id = Some("c1".into());
+        result.is_error = false;
+
         let persisted = session(
-            1,
+            "sess-1",
             "coder",
-            vec![msg("user", "hi"), msg("assistant", "hello")],
+            &agent.id,
+            vec![
+                block("user", "hi"),
+                thinking,
+                block("text", "hello"),
+                call,
+                result,
+            ],
         );
         db.upsert_session(&persisted).unwrap();
+
         let loaded = db.load_sessions().unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].id, 1);
-        assert_eq!(loaded[0].summary.as_deref(), Some("summary"));
-        assert_eq!(loaded[0].messages.len(), 2);
-        assert_eq!(loaded[0].messages[0].role, "user");
-        assert_eq!(loaded[0].messages[0].content.as_deref(), Some("hi"));
-        assert_eq!(loaded[0].messages[1].role, "assistant");
-        assert_eq!(loaded[0].usage.input_tokens, 10);
-        assert_eq!(loaded[0].usage.cache_read_tokens, 2);
-        assert_eq!(loaded[0].usage.cache_creation_tokens, 1);
+        let s = &loaded[0];
+        assert_eq!(s.id, "sess-1");
+        assert_eq!(s.agent_name, "coder");
+        assert_eq!(s.agent_version_id, agent.id);
+        assert_eq!(s.summary.as_deref(), Some("summary"));
+        assert_eq!(s.messages.len(), 5);
+        assert_eq!(s.messages[0].kind, "user");
+        assert_eq!(s.messages[0].text.as_deref(), Some("hi"));
+        assert_eq!(s.messages[1].kind, "thinking");
+        assert_eq!(s.messages[1].input_tokens, 7);
+        assert_eq!(s.messages[3].tool_name.as_deref(), Some("core/time"));
+        assert!(!s.messages[4].is_error);
+        assert_eq!(s.usage.input_tokens, 10);
     }
 
     #[test]
-    fn upsert_session_replaces_messages() {
+    fn upsert_session_replaces_blocks() {
         let db = Db::open_in_memory().unwrap();
-        db.upsert_session(&session(1, "coder", vec![msg("user", "a")]))
+        let agent = create_agent(&db, "coder");
+        db.upsert_session(&session("s", "coder", &agent.id, vec![block("user", "a")]))
             .unwrap();
         db.upsert_session(&session(
-            1,
+            "s",
             "coder",
-            vec![msg("user", "a"), msg("user", "b")],
+            &agent.id,
+            vec![block("user", "a"), block("user", "b")],
         ))
         .unwrap();
         let loaded = db.load_sessions().unwrap();
@@ -602,33 +788,27 @@ mod tests {
     }
 
     #[test]
-    fn delete_agent_cascades_sessions() {
+    fn delete_session_removes_rows() {
         let db = Db::open_in_memory().unwrap();
-        db.insert_agent(&def("coder")).unwrap();
-        db.upsert_session(&session(1, "coder", vec![msg("user", "x")]))
+        let agent = create_agent(&db, "coder");
+        db.upsert_session(&session("s", "coder", &agent.id, vec![block("user", "x")]))
             .unwrap();
-        db.upsert_session(&session(2, "coder", vec![])).unwrap();
-        let removed = db.delete_agent("coder").unwrap();
-        assert_eq!(removed, 2);
+        db.delete_session("s").unwrap();
         assert!(db.load_sessions().unwrap().is_empty());
-        assert!(db.list_agents().unwrap().is_empty());
     }
 
     #[test]
-    fn delete_agent_keeps_other_kinds() {
+    fn delete_pointer_keeps_pinned_sessions() {
         let db = Db::open_in_memory().unwrap();
-        db.insert_agent(&def("coder")).unwrap();
-        db.insert_agent(&def("researcher")).unwrap();
-        db.upsert_session(&session(1, "coder", vec![])).unwrap();
-        db.upsert_session(&session(2, "researcher", vec![]))
+        let agent = create_agent(&db, "coder");
+        db.upsert_session(&session("s", "coder", &agent.id, vec![]))
             .unwrap();
-        db.delete_agent("coder").unwrap();
-        let agents = db.list_agents().unwrap();
-        assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].kind, "researcher");
-        let sessions = db.load_sessions().unwrap();
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].kind, "researcher");
+        db.delete_agent_pointer("coder").unwrap();
+        let loaded = db.load_sessions().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].agent_name, "coder");
+        // The version row still resolves for restore.
+        assert!(db.get_agent_version(&agent.id).unwrap().is_some());
     }
 
     #[test]

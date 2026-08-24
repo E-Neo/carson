@@ -10,8 +10,12 @@ interface events {
         closed,
     }
 
-    emit-event: func(session-id: u64, part: part) -> result<_, event-error>;
-    cancelled: func(session-id: u64) -> bool;
+    emit-event: func(session-id: string, part: part) -> result<_, event-error>;
+    cancelled: func(session-id: string) -> bool;
+
+    /// Host wall-clock time in milliseconds since the unix epoch. The sandbox
+    /// has no clock of its own, so blocks stamp their timestamps through this.
+    now-ms: func() -> u64;
 }
 
 interface llm {
@@ -35,7 +39,7 @@ interface llm {
     }
 
     record request {
-        session-id: u64,
+        session-id: string,
         model: string,
         messages: list<message>,
         system-prompt: option<string>,
@@ -55,7 +59,6 @@ interface llm {
         text: option<string>,
         thinking: option<string>,
         tool-call-start: option<tool-call>,
-        tool-input-delta: option<string>,
         tool-call-end: option<tool-call>,
     }
 
@@ -100,8 +103,28 @@ interface agent {
         auto-compact: bool,
     }
 
+    /// One entry of the ordered conversation log.
+    ///
+    /// `kind` is one of "user", "thinking", "text", "tool-use", "tool-result"
+    /// or "system". Token counters carry the usage of the LLM call that
+    /// produced the block (zero for user/tool-result entries).
+    record block {
+        kind: string,
+        text: option<string>,
+        tool-call-id: option<string>,
+        tool-name: option<string>,
+        arguments-json: option<string>,
+        is-error: bool,
+        input-tokens: u32,
+        cache-read-tokens: u32,
+        cache-creation-tokens: u32,
+        output-tokens: u32,
+        created-at-ms: u64,
+        finished-at-ms: u64,
+    }
+
     record state {
-        messages: list<message>,
+        blocks: list<block>,
         summary: option<string>,
         usage: usage,
     }
@@ -112,15 +135,15 @@ interface agent {
         internal,
     }
 
-    create-session: func(session-id: u64, config: session-config) -> result<_, error>;
-    restore-session: func(session-id: u64, config: session-config, state: state) -> result<_, error>;
-    session-history: func(session-id: u64) -> result<list<message>, error>;
-    session-usage: func(session-id: u64) -> result<usage, error>;
-    session-state: func(session-id: u64) -> result<state, error>;
-    compact-session: func(session-id: u64) -> result<_, error>;
-    reset-session: func(session-id: u64) -> result<_, error>;
-    handle-message: func(session-id: u64, message: string) -> result<_, error>;
-    destroy-session: func(session-id: u64) -> result<_, error>;
+    create-session: func(session-id: string, config: session-config) -> result<_, error>;
+    restore-session: func(session-id: string, config: session-config, state: state) -> result<_, error>;
+    session-history: func(session-id: string) -> result<list<block>, error>;
+    session-usage: func(session-id: string) -> result<usage, error>;
+    session-state: func(session-id: string) -> result<state, error>;
+    compact-session: func(session-id: string) -> result<_, error>;
+    reset-session: func(session-id: string) -> result<_, error>;
+    handle-message: func(session-id: string, message: string) -> result<_, error>;
+    destroy-session: func(session-id: string) -> result<_, error>;
 }
 
 world agent-world {

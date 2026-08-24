@@ -48,43 +48,55 @@ pub struct ToolReq {
 #[derive(TypedPath, Deserialize)]
 #[typed_path("/api/sessions/{id}")]
 pub(crate) struct SessionPath {
-    id: u64,
+    id: String,
 }
 
 #[derive(TypedPath, Deserialize)]
 #[typed_path("/api/sessions/{id}/message")]
 pub(crate) struct MessagePath {
-    id: u64,
+    id: String,
 }
 
 #[derive(TypedPath, Deserialize)]
 #[typed_path("/api/sessions/{id}/stream")]
 pub(crate) struct StreamPath {
-    id: u64,
+    id: String,
 }
 
 #[derive(TypedPath, Deserialize)]
 #[typed_path("/api/sessions/{id}/stop")]
 pub(crate) struct StopPath {
-    id: u64,
+    id: String,
 }
 
 #[derive(TypedPath, Deserialize)]
 #[typed_path("/api/sessions/{id}/reset")]
 pub(crate) struct ResetPath {
-    id: u64,
+    id: String,
 }
 
 #[derive(TypedPath, Deserialize)]
 #[typed_path("/api/sessions/{id}/compact")]
 pub(crate) struct CompactPath {
-    id: u64,
+    id: String,
 }
 
 #[derive(TypedPath, Deserialize)]
-#[typed_path("/api/agents/{kind}")]
-pub(crate) struct AgentKindPath {
-    kind: String,
+#[typed_path("/api/sessions/{id}/migrate")]
+pub(crate) struct MigratePath {
+    id: String,
+}
+
+#[derive(TypedPath, Deserialize)]
+#[typed_path("/api/agents/{name}")]
+pub(crate) struct AgentNamePath {
+    name: String,
+}
+
+#[derive(TypedPath, Deserialize)]
+#[typed_path("/api/agents/{name}/versions")]
+pub(crate) struct AgentVersionsPath {
+    name: String,
 }
 
 #[derive(TypedPath, Deserialize)]
@@ -153,8 +165,7 @@ pub(crate) struct ToolNamePath {
         SessionSummary,
         SessionListResponse,
         SessionCreateResponse,
-        ToolCallInfo,
-        MessageInfo,
+        BlockInfo,
         SessionResponse,
         SessionCommandResponse,
         MessageResponse,
@@ -240,24 +251,24 @@ pub struct AgentListResponse {
 }
 
 #[derive(ToSchema)]
-#[schema(example = json!({"kind": "assistant", "status": "created"}))]
+#[schema(example = json!({"name": "assistant", "version_id": "<uuid>", "status": "created"}))]
 pub struct AgentCommandResponse {
-    pub kind: String,
+    pub name: String,
+    pub version_id: String,
     pub status: String,
 }
 
 #[derive(ToSchema)]
-#[schema(example = json!({"kind": "assistant", "status": "deleted", "sessions_deleted": 0}))]
+#[schema(example = json!({"name": "assistant", "status": "deleted"}))]
 pub struct AgentDeleteResponse {
-    pub kind: String,
+    pub name: String,
     pub status: String,
-    pub sessions_deleted: usize,
 }
 
 #[derive(ToSchema)]
-#[schema(example = json!({"id": 1, "agent": "assistant"}))]
+#[schema(example = json!({"id": "<uuid>", "agent": "assistant"}))]
 pub struct SessionSummary {
-    pub id: u64,
+    pub id: String,
     pub agent: String,
 }
 
@@ -269,52 +280,76 @@ pub struct SessionListResponse {
 }
 
 #[derive(ToSchema)]
-#[schema(example = json!({"session_id": 1, "agent": "assistant"}))]
+#[schema(example = json!({"session_id": "<uuid>", "agent": "assistant", "agent_version_id": "<uuid>"}))]
 pub struct SessionCreateResponse {
-    pub session_id: u64,
+    pub session_id: String,
     pub agent: String,
+    pub agent_version_id: String,
 }
 
-#[derive(ToSchema)]
-pub struct ToolCallInfo {
-    pub id: String,
-    pub name: String,
-    pub arguments: String,
+/// Request body for migrating a session onto another agent version.
+#[derive(Deserialize, ToSchema, Default)]
+pub struct MigrateReq {
+    /// Target agent version id. Omit to migrate to the current version of the
+    /// session's agent name.
+    #[serde(default)]
+    pub agent_version: Option<String>,
 }
 
+/// One entry of the conversation block log.
 #[derive(ToSchema)]
 #[schema(example = json!({
-    "role": "user",
-    "content": "hello",
-    "tool_calls": null,
-    "tool_call_id": null
+    "kind": "text",
+    "text": "hello",
+    "tool_call_id": null,
+    "tool_name": null,
+    "arguments": null,
+    "is_error": false,
+    "input_tokens": 10,
+    "cache_read_tokens": 0,
+    "cache_creation_tokens": 0,
+    "output_tokens": 5,
+    "created_at_ms": 1755000000000u64,
+    "finished_at_ms": 1755000000500u64
 }))]
-pub struct MessageInfo {
-    pub role: String,
-    pub content: String,
-    pub tool_calls: Option<Vec<ToolCallInfo>>,
+pub struct BlockInfo {
+    pub kind: String,
+    pub text: Option<String>,
     pub tool_call_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub arguments: Option<String>,
+    pub is_error: bool,
+    pub input_tokens: u32,
+    pub cache_read_tokens: u32,
+    pub cache_creation_tokens: u32,
+    pub output_tokens: u32,
+    pub created_at_ms: u64,
+    pub finished_at_ms: u64,
 }
 
 #[derive(ToSchema)]
 #[schema(example = json!({
-    "session_id": 1,
+    "session_id": "<uuid>",
     "agent": "assistant",
+    "agent_version_id": "<uuid>",
+    "model": "groq/llama-3",
     "message_count": 1,
-    "messages": [{"role": "user", "content": "hello", "tool_calls": null, "tool_call_id": null}]
+    "messages": [{"kind": "user", "text": "hello"}]
 }))]
 pub struct SessionResponse {
-    pub session_id: u64,
+    pub session_id: String,
     pub agent: String,
+    pub agent_version_id: String,
+    pub model: Option<String>,
     pub message_count: usize,
-    pub messages: Vec<MessageInfo>,
+    pub messages: Vec<BlockInfo>,
 }
 
 #[derive(ToSchema)]
-#[schema(example = json!({"status": "deleted", "session_id": 1}))]
+#[schema(example = json!({"status": "deleted", "session_id": "<uuid>"}))]
 pub struct SessionCommandResponse {
     pub status: String,
-    pub session_id: u64,
+    pub session_id: String,
 }
 
 #[derive(ToSchema)]
@@ -344,7 +379,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/status", get(status))
         .route("/api/config", get(config_info))
         .route("/api/agents", get(list_agents).post(create_agent))
-        .route(AgentKindPath::PATH, put(update_agent).delete(delete_agent))
+        .route(AgentNamePath::PATH, put(update_agent).delete(delete_agent))
+        .route(AgentVersionsPath::PATH, get(list_agent_versions))
         .route("/api/providers", get(list_providers).post(create_provider))
         .route(
             ProviderNamePath::PATH,
@@ -360,6 +396,7 @@ pub fn router(state: AppState) -> Router {
         .route(StopPath::PATH, post(stop_session))
         .route(ResetPath::PATH, post(reset_session))
         .route(CompactPath::PATH, post(compact_session))
+        .route(MigratePath::PATH, post(migrate_session))
         .layer(middleware::from_fn(security))
         .with_state(state);
 
@@ -456,7 +493,8 @@ pub(crate) async fn config_info(State(st): State<AppState>) -> Response {
 
 fn agent_json(def: &AgentDef) -> Value {
     json!({
-        "kind": def.kind,
+        "id": def.id,
+        "name": def.name,
         "system_prompt": def.system_prompt,
         "model": def.model,
         "instances": def.instances,
@@ -468,7 +506,7 @@ fn agent_json(def: &AgentDef) -> Value {
     })
 }
 
-/// List registered agents.
+/// List the current version of every named agent.
 #[utoipa::path(
     get,
     path = "/api/agents",
@@ -477,27 +515,52 @@ fn agent_json(def: &AgentDef) -> Value {
     )
 )]
 pub(crate) async fn list_agents(State(st): State<AppState>) -> Response {
-    let registry = st.registry.lock().await;
-    let agents: Vec<Value> = registry
-        .pools()
-        .map(|(kind, pool)| {
-            agent_json(&AgentDef {
-                kind: kind.clone(),
-                system_prompt: pool.system_prompt.clone(),
-                model: pool.model.clone(),
-                instances: pool.instances().len(),
-                max_history: pool.max_history as usize,
-                context_window: pool.context_window as usize,
-                compaction_ratio: pool.compaction_ratio,
-                auto_compact: pool.auto_compact,
-                capabilities: pool.caps.clone(),
-            })
-        })
-        .collect();
+    let agents = match st.db.list_agents() {
+        Ok(agents) => agents,
+        Err(err) => {
+            return json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("db error: {err}"),
+            );
+        }
+    };
+    let agents: Vec<Value> = agents.iter().map(agent_json).collect();
     json_ok(json!({"agents": agents, "total": agents.len()}))
 }
 
-/// Create a new agent from an `AgentDef`.
+/// Every version of one agent, oldest first.
+#[utoipa::path(
+    get,
+    path = "/api/agents/{name}/versions",
+    params(
+        ("name" = String, Path, description = "Agent name")
+    ),
+    responses(
+        (status = 200, description = "Version history"),
+        (status = 404, description = "Unknown agent name", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn list_agent_versions(
+    State(st): State<AppState>,
+    path: AgentVersionsPath,
+) -> Response {
+    let versions = match st.db.list_agent_versions(&path.name) {
+        Ok(v) => v,
+        Err(err) => {
+            return json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("db error: {err}"),
+            );
+        }
+    };
+    if versions.is_empty() {
+        return json_err(StatusCode::NOT_FOUND, "unknown agent name");
+    }
+    let versions: Vec<Value> = versions.iter().map(agent_json).collect();
+    json_ok(json!({"versions": versions, "total": versions.len()}))
+}
+
+/// Create a new named agent (its first version).
 #[utoipa::path(
     post,
     path = "/api/agents",
@@ -510,23 +573,41 @@ pub(crate) async fn list_agents(State(st): State<AppState>) -> Response {
 )]
 pub(crate) async fn create_agent(
     State(st): State<AppState>,
-    Json(def): Json<AgentDef>,
+    Json(mut def): Json<AgentDef>,
 ) -> Response {
+    if def.name.is_empty() {
+        return json_err(StatusCode::BAD_REQUEST, "agent name is required");
+    }
+    if st
+        .db
+        .current_agent(&def.name)
+        .map(|c| c.is_some())
+        .unwrap_or(false)
+    {
+        return json_err(StatusCode::CONFLICT, "agent name already exists");
+    }
     if let Some(err) = validate_agent_model(&st, &def) {
         return json_err(StatusCode::BAD_REQUEST, err);
     }
-    if let Err(err) = st.db.insert_agent(&def) {
+    def.id = uuid::Uuid::new_v4().to_string();
+    let version_id = def.id.clone();
+    let name = def.name.clone();
+    if let Err(err) = st.db.insert_agent_version(&def) {
         return json_err(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("db error: {err}"),
         );
     }
-    let pool = match host::build_pool(&st.ctx, &def).await {
-        Ok(pool) => pool,
-        Err(err) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
-    };
-    st.registry.lock().await.insert(def.kind.clone(), pool);
-    json_created(json!({"kind": def.kind, "status": "created"}))
+    if let Err(err) = st.db.set_current_agent(&name, &version_id) {
+        return json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("db error: {err}"),
+        );
+    }
+    match carson_host::registry::get_or_build_pool(&st.ctx, &st.registry, &def).await {
+        Ok(_) => json_created(json!({"name": name, "version_id": version_id, "status": "created"})),
+        Err(err) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
+    }
 }
 
 /// Validate that the agent's model is `provider/model` and the provider is registered.
@@ -541,72 +622,83 @@ fn validate_agent_model(st: &AppState, def: &AgentDef) -> Option<&'static str> {
     None
 }
 
-/// Update an existing agent definition.
+/// Update an agent: inserts a new immutable version and repoints the name.
+/// Existing sessions stay pinned to the version they were created with.
 #[utoipa::path(
     put,
-    path = "/api/agents/{kind}",
+    path = "/api/agents/{name}",
     params(
-        ("kind" = String, Path, description = "Agent kind")
+        ("name" = String, Path, description = "Agent name")
     ),
     request_body = AgentDef,
     responses(
-        (status = 200, description = "Agent updated", body = AgentCommandResponse),
-        (status = 400, description = "Kind in body does not match path", body = ErrorResponse)
+        (status = 200, description = "New version created and pointer moved", body = AgentCommandResponse),
+        (status = 400, description = "Name mismatch or invalid model", body = ErrorResponse),
+        (status = 404, description = "Unknown agent name", body = ErrorResponse)
     )
 )]
 pub(crate) async fn update_agent(
     State(st): State<AppState>,
-    path: AgentKindPath,
-    Json(def): Json<AgentDef>,
+    path: AgentNamePath,
+    Json(mut def): Json<AgentDef>,
 ) -> Response {
-    if def.kind != path.kind {
-        return json_err(StatusCode::BAD_REQUEST, "kind in body must match path");
+    if def.name != path.name {
+        return json_err(StatusCode::BAD_REQUEST, "name in body must match path");
+    }
+    if st
+        .db
+        .current_agent(&path.name)
+        .map(|c| c.is_none())
+        .unwrap_or(true)
+    {
+        return json_err(StatusCode::NOT_FOUND, "unknown agent name");
     }
     if let Some(err) = validate_agent_model(&st, &def) {
         return json_err(StatusCode::BAD_REQUEST, err);
     }
-    if let Err(err) = st.db.insert_agent(&def) {
+    def.id = uuid::Uuid::new_v4().to_string();
+    let version_id = def.id.clone();
+    let name = def.name.clone();
+    if let Err(err) = st.db.insert_agent_version(&def) {
         return json_err(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("db error: {err}"),
         );
     }
-    let pool = match host::build_pool(&st.ctx, &def).await {
-        Ok(pool) => pool,
-        Err(err) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
-    };
-    st.registry.lock().await.insert(def.kind.clone(), pool);
-    json_ok(json!({"kind": def.kind, "status": "updated"}))
+    if let Err(err) = st.db.set_current_agent(&name, &version_id) {
+        return json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("db error: {err}"),
+        );
+    }
+    match carson_host::registry::get_or_build_pool(&st.ctx, &st.registry, &def).await {
+        Ok(_) => json_ok(json!({"name": name, "version_id": version_id, "status": "updated"})),
+        Err(err) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
+    }
 }
 
-/// Delete an agent and its sessions.
+/// Delete an agent name pointer. Version rows and their pinned sessions are
+/// kept; sessions of this name keep working against their pinned version.
 #[utoipa::path(
     delete,
-    path = "/api/agents/{kind}",
+    path = "/api/agents/{name}",
     params(
-        ("kind" = String, Path, description = "Agent kind")
+        ("name" = String, Path, description = "Agent name")
     ),
     responses(
-        (status = 200, description = "Agent deleted", body = AgentDeleteResponse),
+        (status = 200, description = "Pointer removed", body = AgentDeleteResponse),
+        (status = 404, description = "Unknown agent name", body = ErrorResponse),
         (status = 500, description = "Db failure", body = ErrorResponse)
     )
 )]
-pub(crate) async fn delete_agent(State(st): State<AppState>, path: AgentKindPath) -> Response {
-    let sessions_deleted = match st.db.delete_agent(&path.kind) {
-        Ok(n) => n,
-        Err(err) => {
-            return json_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("db error: {err}"),
-            );
-        }
-    };
-    st.registry.lock().await.remove(&path.kind);
-    st.sessions
-        .lock()
-        .await
-        .retain(|_, entry| entry.kind != path.kind);
-    json_ok(json!({"kind": path.kind, "status": "deleted", "sessions_deleted": sessions_deleted}))
+pub(crate) async fn delete_agent(State(st): State<AppState>, path: AgentNamePath) -> Response {
+    match st.db.delete_agent_pointer(&path.name) {
+        Ok(()) => json_ok(json!({"name": path.name, "status": "deleted"})),
+        Err(err) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("db error: {err}"),
+        ),
+    }
 }
 
 /// List registered providers.
@@ -901,60 +993,61 @@ pub(crate) async fn list_sessions(State(st): State<AppState>) -> Response {
         .lock()
         .await
         .iter()
-        .map(|(id, entry)| json!({"id": id, "agent": entry.kind}))
+        .map(|(id, entry)| json!({"id": id, "agent": entry.agent_name}))
         .collect();
     json_ok(json!({"sessions": sessions, "total": sessions.len()}))
 }
 
-/// Create a new session for an agent kind.
+/// Create a new session pinned to the current version of an agent.
 #[utoipa::path(
     post,
     path = "/api/sessions",
     request_body = CreateSessionReq,
     responses(
         (status = 201, description = "Session created", body = SessionCreateResponse),
-        (status = 404, description = "Unknown agent kind", body = ErrorResponse)
+        (status = 404, description = "Unknown agent name", body = ErrorResponse)
     )
 )]
 pub(crate) async fn create_session(
     State(st): State<AppState>,
     Json(req): Json<CreateSessionReq>,
 ) -> Response {
-    let Some(pool) = st.registry.lock().await.get(&req.agent) else {
-        return json_err(StatusCode::NOT_FOUND, "unknown agent kind");
+    let Some(def) = st.db.current_agent(&req.agent).ok().flatten() else {
+        return json_err(StatusCode::NOT_FOUND, "unknown agent name");
+    };
+    let pool = match carson_host::registry::get_or_build_pool(&st.ctx, &st.registry, &def).await {
+        Ok(pool) => pool,
+        Err(err) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
     };
     let instance = pool.next();
-    let session_id = st.next_session_id.fetch_add(1, Ordering::SeqCst) + 1;
-    let config = carson_host::bindings::exports::carson::agent::agent::SessionConfig {
-        system_prompt: pool.system_prompt.clone(),
-        model: pool.model.clone(),
-        capabilities_json: json!(pool.caps).to_string(),
-        max_history: pool.max_history,
-        context_window: pool.context_window,
-        compaction_ratio: pool.compaction_ratio,
-        auto_compact: pool.auto_compact,
-    };
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let config = pool.config();
 
     instance.stop.store(false, Ordering::SeqCst);
     let mut store = instance.store.lock().await;
     let guest = instance.agent.carson_agent_agent();
     let result = guest
         .func_create_session()
-        .call_async(&mut *store, (session_id, &config))
+        .call_async(&mut *store, (&session_id, &config))
         .await;
     drop(store);
 
     match result {
         Ok((Ok(()),)) => {
             st.sessions.lock().await.insert(
-                session_id,
+                session_id.clone(),
                 SessionEntry {
-                    kind: pool.kind.clone(),
+                    agent_name: def.name.clone(),
+                    agent_version_id: def.id.clone(),
                     instance: instance.clone(),
                 },
             );
-            host::snapshot_session(&st.db, &instance, session_id).await;
-            json_created(json!({"session_id": session_id, "agent": pool.kind}))
+            host::snapshot_session(&st.db, &instance, &session_id).await;
+            json_created(json!({
+                "session_id": session_id,
+                "agent": def.name,
+                "agent_version_id": def.id,
+            }))
         }
         Ok((Err(err),)) => json_err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -967,12 +1060,12 @@ pub(crate) async fn create_session(
     }
 }
 
-/// Get a session's message history.
+/// Get a session's block log.
 #[utoipa::path(
     get,
     path = "/api/sessions/{id}",
     params(
-        ("id" = u64, Path, description = "Session id")
+        ("id" = String, Path, description = "Session id")
     ),
     responses(
         (status = 200, description = "Session history", body = SessionResponse),
@@ -988,33 +1081,47 @@ pub(crate) async fn get_session(State(st): State<AppState>, path: SessionPath) -
     let guest = entry.instance.agent.carson_agent_agent();
     let result = guest
         .func_session_history()
-        .call_async(&mut *store, (id,))
+        .call_async(&mut *store, (&id,))
         .await;
     drop(store);
-    let messages = match result {
-        Ok((Ok(messages),)) => messages,
+    let blocks = match result {
+        Ok((Ok(blocks),)) => blocks,
         _ => return json_err(StatusCode::NOT_FOUND, "session not found"),
     };
-    let messages: Vec<Value> = messages
+    // Model metadata derives from the pinned agent version, never stored per block.
+    let model = st
+        .db
+        .get_agent_version(&entry.agent_version_id)
+        .ok()
+        .flatten()
+        .map(|def| def.model);
+    let messages: Vec<Value> = blocks
         .iter()
-        .map(|m| {
-            let tool_calls = m.tool_calls.as_ref().map(|calls| {
-                calls
-                    .iter()
-                    .map(|tc| json!({"id": tc.id, "name": tc.name, "arguments": tc.arguments_json}))
-                    .collect::<Vec<_>>()
-            });
+        .map(|b| {
             json!({
-                "role": m.role,
-                "content": m.content,
-                "tool_calls": tool_calls,
-                "tool_call_id": m.tool_call_id,
+                "kind": b.kind,
+                "text": b.text,
+                "tool_call_id": b.tool_call_id,
+                "tool_name": b.tool_name,
+                "arguments": b.arguments_json,
+                "is_error": b.is_error,
+                "input_tokens": b.input_tokens,
+                "cache_read_tokens": b.cache_read_tokens,
+                "cache_creation_tokens": b.cache_creation_tokens,
+                "output_tokens": b.output_tokens,
+                "created_at_ms": b.created_at_ms,
+                "finished_at_ms": b.finished_at_ms,
             })
         })
         .collect();
-    json_ok(
-        json!({"session_id": id, "agent": entry.kind, "message_count": messages.len(), "messages": messages}),
-    )
+    json_ok(json!({
+        "session_id": id,
+        "agent": entry.agent_name,
+        "agent_version_id": entry.agent_version_id,
+        "model": model,
+        "message_count": messages.len(),
+        "messages": messages,
+    }))
 }
 
 /// Destroy a session.
@@ -1022,7 +1129,7 @@ pub(crate) async fn get_session(State(st): State<AppState>, path: SessionPath) -
     delete,
     path = "/api/sessions/{id}",
     params(
-        ("id" = u64, Path, description = "Session id")
+        ("id" = String, Path, description = "Session id")
     ),
     responses(
         (status = 200, description = "Session deleted", body = SessionCommandResponse),
@@ -1038,10 +1145,10 @@ pub(crate) async fn destroy_session(State(st): State<AppState>, path: SessionPat
     let guest = entry.instance.agent.carson_agent_agent();
     let _ = guest
         .func_destroy_session()
-        .call_async(&mut *store, (id,))
+        .call_async(&mut *store, (&id,))
         .await;
     drop(store);
-    let _ = st.db.delete_session(id);
+    let _ = st.db.delete_session(&id);
     json_ok(json!({"status": "deleted", "session_id": id}))
 }
 
@@ -1050,7 +1157,7 @@ pub(crate) async fn destroy_session(State(st): State<AppState>, path: SessionPat
     post,
     path = "/api/sessions/{id}/reset",
     params(
-        ("id" = u64, Path, description = "Session id")
+        ("id" = String, Path, description = "Session id")
     ),
     responses(
         (status = 200, description = "Session reset", body = SessionCommandResponse),
@@ -1066,12 +1173,12 @@ pub(crate) async fn reset_session(State(st): State<AppState>, path: ResetPath) -
     let guest = entry.instance.agent.carson_agent_agent();
     let result = guest
         .func_reset_session()
-        .call_async(&mut *store, (id,))
+        .call_async(&mut *store, (&id,))
         .await;
     drop(store);
     match result {
         Ok((Ok(()),)) => {
-            host::snapshot_session(&st.db, &entry.instance, id).await;
+            host::snapshot_session(&st.db, &entry.instance, &id).await;
             json_ok(json!({"status": "reset", "session_id": id}))
         }
         _ => json_err(StatusCode::NOT_FOUND, "session not found"),
@@ -1083,7 +1190,7 @@ pub(crate) async fn reset_session(State(st): State<AppState>, path: ResetPath) -
     post,
     path = "/api/sessions/{id}/stop",
     params(
-        ("id" = u64, Path, description = "Session id")
+        ("id" = String, Path, description = "Session id")
     ),
     responses(
         (status = 200, description = "Session stopped", body = SessionCommandResponse),
@@ -1104,7 +1211,7 @@ pub(crate) async fn stop_session(State(st): State<AppState>, path: StopPath) -> 
     post,
     path = "/api/sessions/{id}/compact",
     params(
-        ("id" = u64, Path, description = "Session id")
+        ("id" = String, Path, description = "Session id")
     ),
     responses(
         (status = 200, description = "Session compacted", body = SessionCommandResponse),
@@ -1121,12 +1228,12 @@ pub(crate) async fn compact_session(State(st): State<AppState>, path: CompactPat
     let guest = entry.instance.agent.carson_agent_agent();
     let result = guest
         .func_compact_session()
-        .call_async(&mut *store, (id,))
+        .call_async(&mut *store, (&id,))
         .await;
     drop(store);
     match result {
         Ok((Ok(()),)) => {
-            host::snapshot_session(&st.db, &entry.instance, id).await;
+            host::snapshot_session(&st.db, &entry.instance, &id).await;
             json_ok(json!({"status": "compacted", "session_id": id}))
         }
         Ok((Err(carson_host::bindings::exports::carson::agent::agent::Error::NotFound),)) => {
@@ -1136,9 +1243,84 @@ pub(crate) async fn compact_session(State(st): State<AppState>, path: CompactPat
     }
 }
 
+/// Migrate a session onto another agent version (default: the current version
+/// of its agent name).
+#[utoipa::path(
+    post,
+    path = "/api/sessions/{id}/migrate",
+    params(
+        ("id" = String, Path, description = "Session id")
+    ),
+    request_body = MigrateReq,
+    responses(
+        (status = 200, description = "Session migrated"),
+        (status = 400, description = "Unknown target version", body = ErrorResponse),
+        (status = 404, description = "Session not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn migrate_session(
+    State(st): State<AppState>,
+    path: MigratePath,
+    Json(req): Json<MigrateReq>,
+) -> Response {
+    let id = path.id;
+    let Some(entry) = st.sessions.lock().await.get(&id).cloned() else {
+        return json_err(StatusCode::NOT_FOUND, "session not found");
+    };
+
+    let def = match &req.agent_version {
+        Some(version_id) => st.db.get_agent_version(version_id).ok().flatten(),
+        None => st.db.current_agent(&entry.agent_name).ok().flatten(),
+    };
+    let Some(def) = def else {
+        return json_err(StatusCode::BAD_REQUEST, "unknown target agent version");
+    };
+
+    let pool = match carson_host::registry::get_or_build_pool(&st.ctx, &st.registry, &def).await {
+        Ok(pool) => pool,
+        Err(err) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
+    };
+
+    host::snapshot_session(&st.db, &entry.instance, &id).await;
+    let persisted = match st.db.load_sessions() {
+        Ok(sessions) => sessions.into_iter().find(|p| p.id == id),
+        Err(err) => {
+            return json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("db error: {err}"),
+            );
+        }
+    };
+    let Some(persisted) = persisted else {
+        return json_err(StatusCode::NOT_FOUND, "session not found");
+    };
+
+    let instance = pool.next();
+    instance.stop.store(false, Ordering::SeqCst);
+    if let Err(err) = host::restore_session(&instance, &id, &persisted, &pool.config()).await {
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}"));
+    }
+
+    st.sessions.lock().await.insert(
+        id.clone(),
+        SessionEntry {
+            agent_name: def.name.clone(),
+            agent_version_id: def.id.clone(),
+            instance: instance.clone(),
+        },
+    );
+    host::snapshot_session(&st.db, &instance, &id).await;
+    json_ok(json!({
+        "session_id": id,
+        "agent": def.name,
+        "agent_version_id": def.id,
+        "status": "migrated",
+    }))
+}
+
 async fn run_message_blocking(
     instance: Arc<AgentInstance>,
-    session_id: u64,
+    session_id: String,
     content: String,
 ) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || {
@@ -1146,7 +1328,7 @@ async fn run_message_blocking(
             .enable_all()
             .build()
             .expect("build blocking runtime");
-        rt.block_on(run_message(&instance, session_id, &content))
+        rt.block_on(run_message(&instance, &session_id, &content))
     })
     .await
     .unwrap_or_else(|err| Err(anyhow::anyhow!("agent task join failed: {err}")))
@@ -1154,7 +1336,7 @@ async fn run_message_blocking(
 
 async fn run_message(
     instance: &AgentInstance,
-    session_id: u64,
+    session_id: &str,
     content: &str,
 ) -> anyhow::Result<()> {
     let mut store = instance.store.lock().await;
@@ -1166,7 +1348,7 @@ async fn run_message(
     result.map_err(|err| anyhow::anyhow!("agent error: {err:?}"))
 }
 
-async fn session_usage(instance: &AgentInstance, session_id: u64) -> Usage {
+async fn session_usage(instance: &AgentInstance, session_id: &str) -> Usage {
     let mut store = instance.store.lock().await;
     let guest = instance.agent.carson_agent_agent();
     match guest
@@ -1189,7 +1371,7 @@ async fn session_usage(instance: &AgentInstance, session_id: u64) -> Usage {
     post,
     path = "/api/sessions/{id}/stream",
     params(
-        ("id" = u64, Path, description = "Session id")
+        ("id" = String, Path, description = "Session id")
     ),
     request_body = MessageReq,
     responses(
@@ -1207,19 +1389,21 @@ pub(crate) async fn send_stream(
         return json_err(StatusCode::NOT_FOUND, "session not found");
     };
     let (tx, rx) = mpsc::unbounded_channel::<SseItem>();
-    st.hub.register(id, tx.clone());
+    st.hub.register(&id, tx.clone());
     let hub = st.hub.clone();
     let db = st.db.clone();
     let instance = entry.instance.clone();
+    let task_id = id.clone();
 
     tokio::spawn(async move {
         instance.stop.store(false, Ordering::SeqCst);
-        let result = run_message_blocking(instance.clone(), id, req.content.clone()).await;
-        host::snapshot_session(&db, &instance, id).await;
-        let usage = session_usage(&instance, id).await;
+        let result =
+            run_message_blocking(instance.clone(), task_id.clone(), req.content.clone()).await;
+        host::snapshot_session(&db, &instance, &task_id).await;
+        let usage = session_usage(&instance, &task_id).await;
         if result.is_err() {
             let _ = hub.send(
-                id,
+                &task_id,
                 SseItem {
                     event: "error".into(),
                     data: json!({"message": "agent run failed"}),
@@ -1227,13 +1411,13 @@ pub(crate) async fn send_stream(
             );
         }
         let _ = hub.send(
-            id,
+            &task_id,
             SseItem {
                 event: "done".into(),
                 data: json!({"done": true, "usage": usage}),
             },
         );
-        hub.unregister(id, &tx);
+        hub.unregister(&task_id, &tx);
         drop(tx);
     });
 
@@ -1255,7 +1439,7 @@ pub(crate) async fn send_stream(
     post,
     path = "/api/sessions/{id}/message",
     params(
-        ("id" = u64, Path, description = "Session id")
+        ("id" = String, Path, description = "Session id")
     ),
     request_body = MessageReq,
     responses(
@@ -1273,19 +1457,21 @@ pub(crate) async fn send_message(
         return json_err(StatusCode::NOT_FOUND, "session not found");
     };
     let (tx, mut rx) = mpsc::unbounded_channel::<SseItem>();
-    st.hub.register(id, tx.clone());
+    st.hub.register(&id, tx.clone());
     let hub = st.hub.clone();
     let db = st.db.clone();
     let instance = entry.instance.clone();
+    let task_id = id.clone();
 
     let task = tokio::spawn(async move {
         instance.stop.store(false, Ordering::SeqCst);
-        let result = run_message_blocking(instance.clone(), id, req.content.clone()).await;
-        host::snapshot_session(&db, &instance, id).await;
-        let usage = session_usage(&instance, id).await;
+        let result =
+            run_message_blocking(instance.clone(), task_id.clone(), req.content.clone()).await;
+        host::snapshot_session(&db, &instance, &task_id).await;
+        let usage = session_usage(&instance, &task_id).await;
         if result.is_err() {
             let _ = hub.send(
-                id,
+                &task_id,
                 SseItem {
                     event: "error".into(),
                     data: json!({"message": "agent run failed"}),
@@ -1293,13 +1479,13 @@ pub(crate) async fn send_message(
             );
         }
         let _ = hub.send(
-            id,
+            &task_id,
             SseItem {
                 event: "done".into(),
                 data: json!({"done": true, "usage": usage}),
             },
         );
-        hub.unregister(id, &tx);
+        hub.unregister(&task_id, &tx);
         drop(tx);
         usage
     });
@@ -1341,7 +1527,6 @@ mod tests {
     use http_body_util::BodyExt;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
     use tokio::sync::Mutex;
     use tower::ServiceExt;
 
@@ -1360,7 +1545,6 @@ mod tests {
             db,
             hub: Hub::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            next_session_id: Arc::new(AtomicU64::new(0)),
             cfg: Arc::new(config()),
         }
     }

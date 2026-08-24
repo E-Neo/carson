@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::mpsc;
 
 use async_trait::async_trait;
@@ -42,7 +41,6 @@ pub enum DriverEvent {
     Text(String),
     Thinking(String),
     ToolCallStart(DriverToolCall),
-    ToolInputDelta(String),
     ToolCallEnd(DriverToolCall),
     Failed(DriverError),
 }
@@ -86,17 +84,21 @@ pub enum SseEventBatch {
 /// Decodes an OpenAI-compatible streaming `data:` payload into driver events.
 ///
 /// Tool-call state and usage are accumulated across payloads, so one decoder
-/// instance must process a single response stream in order.
+/// instance must process a single response stream in order. A `ToolCallStart`
+/// is only announced once the call's id and name are both known, so consumers
+/// never see an identity-less tool call.
 #[derive(Debug, Default)]
 pub struct SseDecoder {
-    tool_state: HashMap<usize, DriverToolCall>,
+    tool_state: std::collections::BTreeMap<usize, DriverToolCall>,
+    announced: std::collections::HashSet<usize>,
     usage: Usage,
 }
 
 impl SseDecoder {
     pub fn new() -> Self {
         Self {
-            tool_state: HashMap::new(),
+            tool_state: std::collections::BTreeMap::new(),
+            announced: std::collections::HashSet::new(),
             usage: Usage::default(),
         }
     }
@@ -107,9 +109,9 @@ impl SseDecoder {
 
     /// Emits a `ToolCallEnd` for every tool call that never completed.
     pub fn finish(&mut self) -> Vec<DriverEvent> {
-        self.tool_state
-            .drain()
-            .map(|(_, tc)| DriverEvent::ToolCallEnd(tc))
+        std::mem::take(&mut self.tool_state)
+            .into_values()
+            .map(DriverEvent::ToolCallEnd)
             .collect()
     }
 
@@ -153,15 +155,14 @@ impl SseDecoder {
         if let Some(calls) = delta.get("tool_calls").and_then(|c| c.as_array()) {
             for call in calls {
                 let index = call["index"].as_u64().unwrap_or(0) as usize;
-                let entry = self.tool_state.entry(index).or_insert_with(|| {
-                    let tc = DriverToolCall {
+                let entry = self
+                    .tool_state
+                    .entry(index)
+                    .or_insert_with(|| DriverToolCall {
                         id: call["id"].as_str().unwrap_or("").to_string(),
                         name: call["function"]["name"].as_str().unwrap_or("").to_string(),
                         arguments: String::new(),
-                    };
-                    events.push(DriverEvent::ToolCallStart(tc.clone()));
-                    tc
-                });
+                    });
                 if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
                     entry.id = id.to_string();
                 }
@@ -172,6 +173,13 @@ impl SseDecoder {
                 {
                     entry.name = name.to_string();
                 }
+                if !self.announced.contains(&index)
+                    && !entry.id.is_empty()
+                    && !entry.name.is_empty()
+                {
+                    self.announced.insert(index);
+                    events.push(DriverEvent::ToolCallStart(entry.clone()));
+                }
                 if let Some(arg) = call
                     .get("function")
                     .and_then(|f| f.get("arguments"))
@@ -179,7 +187,6 @@ impl SseDecoder {
                     && !arg.is_empty()
                 {
                     entry.arguments.push_str(arg);
-                    events.push(DriverEvent::ToolInputDelta(arg.to_string()));
                 }
             }
         }
@@ -553,10 +560,7 @@ mod tests {
                 r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"x\":"}}]}}]}"#,
             ))
             .unwrap();
-        assert_eq!(
-            delta,
-            SseEventBatch::Events(vec![DriverEvent::ToolInputDelta("{\"x\":".into())])
-        );
+        assert_eq!(delta, SseEventBatch::Events(vec![]));
         let _ = decoder
             .decode(&data(
                 r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}"#,
@@ -604,13 +608,11 @@ mod tests {
                     name: "f1".into(),
                     arguments: String::new(),
                 }),
-                DriverEvent::ToolInputDelta("{}".into()),
                 DriverEvent::ToolCallStart(DriverToolCall {
                     id: "b".into(),
                     name: "f2".into(),
                     arguments: String::new(),
                 }),
-                DriverEvent::ToolInputDelta("{}".into()),
             ]
         );
     }
@@ -711,7 +713,6 @@ mod tests {
                 arguments: String::new(),
             })
         );
-        assert_eq!(rx.recv().unwrap(), DriverEvent::ToolInputDelta("{}".into()));
         assert_eq!(
             rx.recv().unwrap(),
             DriverEvent::ToolCallEnd(DriverToolCall {

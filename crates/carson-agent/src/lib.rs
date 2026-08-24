@@ -6,7 +6,7 @@ use serde_json::json;
 use crate::wit::carson::agent::events::{self, Part};
 use crate::wit::carson::agent::llm::{self, Message, Request, ToolCall, Usage};
 use crate::wit::carson::agent::tools;
-use crate::wit::exports::carson::agent::agent::{Error, Guest, SessionConfig, State};
+use crate::wit::exports::carson::agent::agent::{Block, Error, Guest, SessionConfig, State};
 
 mod wit {
     wit_bindgen::generate!({
@@ -29,11 +29,33 @@ struct TurnUsage {
     output: u64,
 }
 
+impl TurnUsage {
+    fn add(&mut self, usage: &Usage) {
+        self.input = self.input.saturating_add(usage.input_tokens as u64);
+        self.cache_read = self
+            .cache_read
+            .saturating_add(usage.cache_read_tokens as u64);
+        self.cache_creation = self
+            .cache_creation
+            .saturating_add(usage.cache_creation_tokens as u64);
+        self.output = self.output.saturating_add(usage.output_tokens as u64);
+    }
+
+    fn to_wit(&self) -> Usage {
+        Usage {
+            input_tokens: self.input.min(u32::MAX as u64) as u32,
+            cache_read_tokens: self.cache_read.min(u32::MAX as u64) as u32,
+            cache_creation_tokens: self.cache_creation.min(u32::MAX as u64) as u32,
+            output_tokens: self.output.min(u32::MAX as u64) as u32,
+        }
+    }
+}
+
 struct Session {
-    id: u64,
+    id: String,
     system_prompt: String,
     model: String,
-    messages: Vec<Message>,
+    blocks: Vec<Block>,
     max_history: usize,
     context_window: usize,
     compaction_ratio: f32,
@@ -44,26 +66,113 @@ struct Session {
     last_input_tokens: u64,
 }
 
-fn sessions() -> &'static Mutex<HashMap<u64, Session>> {
-    static SESSIONS: OnceLock<Mutex<HashMap<u64, Session>>> = OnceLock::new();
+fn sessions() -> &'static Mutex<HashMap<String, Session>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<String, Session>>> = OnceLock::new();
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn now_ms() -> u64 {
+    events::now_ms()
+}
+
+fn user_block(text: String) -> Block {
+    let now = now_ms();
+    Block {
+        kind: "user".into(),
+        text: Some(text),
+        tool_call_id: None,
+        tool_name: None,
+        arguments_json: None,
+        is_error: false,
+        input_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+        output_tokens: 0,
+        created_at_ms: now,
+        finished_at_ms: now,
+    }
+}
+
+/// Convert the ordered block log into role-based chat messages for an LLM
+/// request. Consecutive assistant-side blocks (thinking/text/tool-use) merge
+/// into one assistant message; thinking is excluded from the request.
+fn blocks_to_chat(blocks: &[Block]) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::new();
+    let mut content = String::new();
+    let mut calls: Vec<ToolCall> = Vec::new();
+
+    fn flush(out: &mut Vec<Message>, content: &mut String, calls: &mut Vec<ToolCall>) {
+        if content.is_empty() && calls.is_empty() {
+            return;
+        }
+        out.push(Message {
+            role: "assistant".into(),
+            content: if content.is_empty() {
+                None
+            } else {
+                Some(std::mem::take(content))
+            },
+            tool_calls: if calls.is_empty() {
+                None
+            } else {
+                Some(std::mem::take(calls))
+            },
+            tool_call_id: None,
+        });
+    }
+
+    for b in blocks {
+        match b.kind.as_str() {
+            "user" | "system" => {
+                flush(&mut out, &mut content, &mut calls);
+                out.push(Message {
+                    role: b.kind.clone(),
+                    content: b.text.clone(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+            "text" => {
+                if let Some(t) = &b.text {
+                    content.push_str(t);
+                }
+            }
+            "tool-use" => calls.push(ToolCall {
+                id: b.tool_call_id.clone().unwrap_or_default(),
+                name: b.tool_name.clone().unwrap_or_default(),
+                arguments_json: b.arguments_json.clone().unwrap_or_default(),
+            }),
+            "tool-result" => {
+                flush(&mut out, &mut content, &mut calls);
+                out.push(Message {
+                    role: "tool".into(),
+                    content: b.text.clone(),
+                    tool_calls: None,
+                    tool_call_id: b.tool_call_id.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+    flush(&mut out, &mut content, &mut calls);
+    out
 }
 
 struct CarsonAgent;
 
 impl Guest for CarsonAgent {
-    fn create_session(session_id: u64, config: SessionConfig) -> Result<(), Error> {
+    fn create_session(session_id: String, config: SessionConfig) -> Result<(), Error> {
         let mut sessions = sessions().lock().unwrap();
         if sessions.contains_key(&session_id) {
             return Err(Error::Busy);
         }
         sessions.insert(
-            session_id,
+            session_id.clone(),
             Session {
                 id: session_id,
                 system_prompt: config.system_prompt,
                 model: config.model,
-                messages: Vec::new(),
+                blocks: Vec::new(),
                 max_history: config.max_history.max(1) as usize,
                 context_window: config.context_window.max(1) as usize,
                 compaction_ratio: config.compaction_ratio.clamp(0.0, 1.0),
@@ -77,16 +186,20 @@ impl Guest for CarsonAgent {
         Ok(())
     }
 
-    fn restore_session(session_id: u64, config: SessionConfig, state: State) -> Result<(), Error> {
+    fn restore_session(
+        session_id: String,
+        config: SessionConfig,
+        state: State,
+    ) -> Result<(), Error> {
         let mut sessions = sessions().lock().unwrap();
         let usage = state.usage;
         sessions.insert(
-            session_id,
+            session_id.clone(),
             Session {
                 id: session_id,
                 system_prompt: config.system_prompt,
                 model: config.model,
-                messages: state.messages,
+                blocks: state.blocks,
                 max_history: config.max_history.max(1) as usize,
                 context_window: config.context_window.max(1) as usize,
                 compaction_ratio: config.compaction_ratio.clamp(0.0, 1.0),
@@ -105,88 +218,60 @@ impl Guest for CarsonAgent {
         Ok(())
     }
 
-    fn session_state(session_id: u64) -> Result<State, Error> {
+    fn session_state(session_id: String) -> Result<State, Error> {
         let sessions = sessions().lock().unwrap();
         let session = sessions.get(&session_id).ok_or(Error::NotFound)?;
         Ok(State {
-            messages: session.messages.clone(),
+            blocks: session.blocks.clone(),
             summary: session.summary.clone(),
-            usage: Usage {
-                input_tokens: session.total_usage.input.min(u32::MAX as u64) as u32,
-                cache_read_tokens: session.total_usage.cache_read.min(u32::MAX as u64) as u32,
-                cache_creation_tokens: session.total_usage.cache_creation.min(u32::MAX as u64)
-                    as u32,
-                output_tokens: session.total_usage.output.min(u32::MAX as u64) as u32,
-            },
+            usage: session.total_usage.to_wit(),
         })
     }
 
-    fn session_history(session_id: u64) -> Result<Vec<Message>, Error> {
+    fn session_history(session_id: String) -> Result<Vec<Block>, Error> {
         sessions()
             .lock()
             .unwrap()
             .get(&session_id)
-            .map(|s| s.messages.clone())
+            .map(|s| s.blocks.clone())
             .ok_or(Error::NotFound)
     }
 
-    fn session_usage(session_id: u64) -> Result<Usage, Error> {
+    fn session_usage(session_id: String) -> Result<Usage, Error> {
         let sessions = sessions().lock().unwrap();
         let session = sessions.get(&session_id).ok_or(Error::NotFound)?;
-        Ok(Usage {
-            input_tokens: session.turn_usage.input.min(u32::MAX as u64) as u32,
-            cache_read_tokens: session.turn_usage.cache_read.min(u32::MAX as u64) as u32,
-            cache_creation_tokens: session.turn_usage.cache_creation.min(u32::MAX as u64) as u32,
-            output_tokens: session.turn_usage.output.min(u32::MAX as u64) as u32,
-        })
+        Ok(session.turn_usage.to_wit())
     }
 
-    fn compact_session(session_id: u64) -> Result<(), Error> {
+    fn compact_session(session_id: String) -> Result<(), Error> {
         let mut sessions = sessions().lock().unwrap();
         let session = sessions.get_mut(&session_id).ok_or(Error::NotFound)?;
         compact(session)
     }
 
-    fn reset_session(session_id: u64) -> Result<(), Error> {
+    fn reset_session(session_id: String) -> Result<(), Error> {
         sessions()
             .lock()
             .unwrap()
             .get_mut(&session_id)
-            .map(|s| s.messages.clear())
+            .map(|s| s.blocks.clear())
             .ok_or(Error::NotFound)
     }
 
-    fn handle_message(session_id: u64, message: String) -> Result<(), Error> {
+    fn handle_message(session_id: String, message: String) -> Result<(), Error> {
         let mut sessions = sessions().lock().unwrap();
         let session = sessions.get_mut(&session_id).ok_or(Error::NotFound)?;
         session.turn_usage = TurnUsage::default();
-        session.messages.push(Message {
-            role: "user".into(),
-            content: Some(message),
-            tool_calls: None,
-            tool_call_id: None,
-        });
+        session.blocks.push(user_block(message));
         let result = run_loop(session);
-        session.total_usage.input = session
-            .total_usage
-            .input
-            .saturating_add(session.turn_usage.input);
-        session.total_usage.cache_read = session
-            .total_usage
-            .cache_read
-            .saturating_add(session.turn_usage.cache_read);
-        session.total_usage.cache_creation = session
-            .total_usage
-            .cache_creation
-            .saturating_add(session.turn_usage.cache_creation);
-        session.total_usage.output = session
-            .total_usage
-            .output
-            .saturating_add(session.turn_usage.output);
+        // Fold the finished turn into the lifetime totals, but keep
+        // `turn_usage` readable for `session-usage` until the next turn.
+        let turn = session.turn_usage.to_wit();
+        session.total_usage.add(&turn);
         result
     }
 
-    fn destroy_session(session_id: u64) -> Result<(), Error> {
+    fn destroy_session(session_id: String) -> Result<(), Error> {
         sessions()
             .lock()
             .unwrap()
@@ -197,13 +282,13 @@ impl Guest for CarsonAgent {
 }
 
 fn trim_history(session: &mut Session) {
-    let overflow = session.messages.len().saturating_sub(session.max_history);
+    let overflow = session.blocks.len().saturating_sub(session.max_history);
     if overflow > 0 {
-        session.messages.drain(..overflow);
+        session.blocks.drain(..overflow);
     }
 }
 
-fn emit(session_id: u64, kind: &str, data: &str) -> Result<(), events::EventError> {
+fn emit(session_id: &str, kind: &str, data: &str) -> Result<(), events::EventError> {
     events::emit_event(
         session_id,
         &Part {
@@ -217,28 +302,237 @@ fn tool_use_json(tc: &ToolCall) -> String {
     json!({"id": tc.id, "name": tc.name, "arguments": tc.arguments_json}).to_string()
 }
 
+fn tool_args_json(id: &str, arguments: &str) -> String {
+    json!({"id": id, "arguments": arguments}).to_string()
+}
+
 fn tool_result_json(tc: &ToolCall, preview: &str, is_error: bool) -> String {
     json!({"id": tc.id, "name": tc.name, "result_preview": preview, "is_error": is_error})
         .to_string()
 }
 
+/// One assistant-side segment accumulated during a single LLM stream.
+enum Seg {
+    Thinking { text: String, started: u64 },
+    Text { text: String, started: u64 },
+    ToolUse(ToolCall),
+}
+
+impl Seg {
+    fn push_text(segs: &mut Vec<Seg>, text: &str, started: u64) {
+        match segs.last_mut() {
+            Some(Seg::Text { text: buf, .. }) => buf.push_str(text),
+            _ => segs.push(Seg::Text {
+                text: text.to_string(),
+                started,
+            }),
+        }
+    }
+
+    fn push_thinking(segs: &mut Vec<Seg>, text: &str, started: u64) {
+        match segs.last_mut() {
+            Some(Seg::Thinking { text: buf, .. }) => buf.push_str(text),
+            _ => segs.push(Seg::Thinking {
+                text: text.to_string(),
+                started,
+            }),
+        }
+    }
+
+    fn into_block(self, finished: u64, usage: &Usage) -> Block {
+        let (kind, text, tool_call_id, tool_name, arguments_json, created) = match self {
+            Seg::Thinking { text, started } => ("thinking", Some(text), None, None, None, started),
+            Seg::Text { text, started } => ("text", Some(text), None, None, None, started),
+            Seg::ToolUse(tc) => (
+                "tool-use",
+                None,
+                Some(tc.id),
+                Some(tc.name),
+                Some(tc.arguments_json),
+                finished,
+            ),
+        };
+        Block {
+            kind: kind.into(),
+            text,
+            tool_call_id,
+            tool_name,
+            arguments_json,
+            is_error: false,
+            input_tokens: usage.input_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
+            output_tokens: usage.output_tokens,
+            created_at_ms: created,
+            finished_at_ms: finished,
+        }
+    }
+}
+
+fn tool_result_block(tc: &ToolCall, result: String, is_error: bool) -> Block {
+    let started = now_ms();
+    Block {
+        kind: "tool-result".into(),
+        text: Some(result),
+        tool_call_id: Some(tc.id.clone()),
+        tool_name: Some(tc.name.clone()),
+        arguments_json: None,
+        is_error,
+        input_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+        output_tokens: 0,
+        created_at_ms: started,
+        finished_at_ms: started,
+    }
+}
+
+fn run_loop(session: &mut Session) -> Result<(), Error> {
+    let mut repeats: HashMap<String, usize> = HashMap::new();
+
+    for _ in 0..MAX_ITERATIONS {
+        if events::cancelled(&session.id) {
+            return Ok(());
+        }
+
+        if session.auto_compact && should_compact(session) && compact(session).is_err() {
+            trim_history(session);
+        }
+
+        let request = Request {
+            session_id: session.id.clone(),
+            model: session.model.clone(),
+            messages: blocks_to_chat(&session.blocks),
+            system_prompt: Some(session.system_prompt.clone()),
+            tools: tools::list_tools().to_vec(),
+            temperature: None,
+            max_tokens: None,
+        };
+
+        let handle = match llm::stream_start(&request) {
+            Ok(handle) => handle,
+            Err(err) => {
+                let _ = emit(&session.id, "error", &format!("llm error: {err:?}"));
+                return Ok(());
+            }
+        };
+
+        let mut segs: Vec<Seg> = Vec::new();
+        let mut failed = false;
+        let mut ended = false;
+        loop {
+            if events::cancelled(&session.id) {
+                let _ = llm::stream_close(handle);
+                return Ok(());
+            }
+            match llm::stream_next(handle) {
+                Ok(Some(chunk)) => {
+                    if let Some(text) = chunk.text {
+                        Seg::push_text(&mut segs, &text, now_ms());
+                        if emit(&session.id, "chunk", &text).is_err() {
+                            let _ = llm::stream_close(handle);
+                            return Ok(());
+                        }
+                    }
+                    if let Some(thinking) = chunk.thinking {
+                        Seg::push_thinking(&mut segs, &thinking, now_ms());
+                        let _ = emit(&session.id, "thinking", &thinking);
+                    }
+                    if let Some(tc) = chunk.tool_call_start {
+                        let _ = emit(&session.id, "tool_use", &tool_use_json(&tc));
+                    }
+                    if let Some(tc) = chunk.tool_call_end {
+                        let _ = emit(
+                            &session.id,
+                            "tool_args",
+                            &tool_args_json(&tc.id, &tc.arguments_json),
+                        );
+                        segs.push(Seg::ToolUse(tc));
+                    }
+                }
+                Ok(None) => {
+                    ended = true;
+                    break;
+                }
+                Err(llm::LlmError::Cancelled) => {
+                    let _ = llm::stream_close(handle);
+                    return Ok(());
+                }
+                Err(err) => {
+                    let _ = emit(&session.id, "error", &format!("llm error: {err:?}"));
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if ended && let Ok(usage) = llm::stream_usage(handle) {
+            record_usage(session, usage);
+        }
+        let _ = llm::stream_close(handle);
+
+        if failed {
+            return Ok(());
+        }
+
+        // Commit this iteration's assistant-side segments to the log in the
+        // order they arrived, stamped with the LLM call's usage.
+        let turn_usage = session.turn_usage.to_wit();
+        let finished = now_ms();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        for seg in std::mem::take(&mut segs) {
+            if let Seg::ToolUse(tc) = &seg {
+                tool_calls.push(tc.clone());
+            }
+            session.blocks.push(seg.into_block(finished, &turn_usage));
+        }
+
+        if tool_calls.is_empty() {
+            return Ok(());
+        }
+
+        for tc in &tool_calls {
+            let count = repeats
+                .entry(format!("{}|{}", tc.name, tc.arguments_json))
+                .or_insert(0);
+            *count += 1;
+            if *count > MAX_TOOL_REPEATS {
+                let _ = emit(&session.id, "error", "tool loop guard triggered");
+                return Ok(());
+            }
+            if events::cancelled(&session.id) {
+                return Ok(());
+            }
+
+            let (result, is_error) = match tools::invoke(&tc.name, &tc.arguments_json) {
+                Ok(output) => (output, false),
+                Err(tools::ToolError::PermissionDenied) => ("permission denied".to_string(), true),
+                Err(tools::ToolError::NotFound) => (format!("tool not found: {}", tc.name), true),
+                Err(tools::ToolError::Failed) => ("tool failed".to_string(), true),
+            };
+            let preview = truncate(&result, 500);
+            let _ = emit(
+                &session.id,
+                "tool_result",
+                &tool_result_json(tc, &preview, is_error),
+            );
+            session.blocks.push(tool_result_block(tc, result, is_error));
+        }
+    }
+    Ok(())
+}
+
+fn truncate(s: &str, limit: usize) -> String {
+    if s.len() <= limit {
+        return s.to_string();
+    }
+    let mut cut = limit;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}\n…", &s[..cut])
+}
 fn record_usage(session: &mut Session, usage: Usage) {
-    session.turn_usage.input = session
-        .turn_usage
-        .input
-        .saturating_add(usage.input_tokens as u64);
-    session.turn_usage.cache_read = session
-        .turn_usage
-        .cache_read
-        .saturating_add(usage.cache_read_tokens as u64);
-    session.turn_usage.cache_creation = session
-        .turn_usage
-        .cache_creation
-        .saturating_add(usage.cache_creation_tokens as u64);
-    session.turn_usage.output = session
-        .turn_usage
-        .output
-        .saturating_add(usage.output_tokens as u64);
+    session.turn_usage.add(&usage);
     session.last_input_tokens = usage.input_tokens as u64;
 }
 
@@ -247,18 +541,18 @@ fn should_compact(session: &Session) -> bool {
         >= (session.context_window as f64 * session.compaction_ratio as f64) as usize
 }
 
-/// Summarize the oldest messages into `session.summary`, keeping the recent window.
+/// Summarize the oldest blocks into `session.summary`, keeping the recent window.
 fn compact(session: &mut Session) -> Result<(), Error> {
     let keep = session.max_history;
-    if session.messages.len() <= keep {
+    if session.blocks.len() <= keep {
         return Ok(());
     }
-    let split = session.messages.len() - keep;
-    let old = session.messages.drain(..split).collect::<Vec<_>>();
+    let split = session.blocks.len() - keep;
+    let old = session.blocks.drain(..split).collect::<Vec<_>>();
     match summarize(&old, session) {
         Ok(summary) => {
             let _ = emit(
-                session.id,
+                &session.id,
                 "status",
                 &format!("compacted: {split} messages summarized, {keep} kept"),
             );
@@ -266,17 +560,17 @@ fn compact(session: &mut Session) -> Result<(), Error> {
             Ok(())
         }
         Err(err) => {
-            session.messages.splice(0..0, old);
+            session.blocks.splice(0..0, old);
             Err(err)
         }
     }
 }
 
-fn summarize(old: &[Message], session: &mut Session) -> Result<String, Error> {
+fn summarize(old: &[Block], session: &mut Session) -> Result<String, Error> {
     let request = Request {
-        session_id: session.id,
+        session_id: session.id.clone(),
         model: session.model.clone(),
-        messages: old.to_vec(),
+        messages: blocks_to_chat(old),
         system_prompt: Some(SUMMARY_SYSTEM_PROMPT.to_string()),
         tools: Vec::new(),
         temperature: None,
@@ -303,169 +597,6 @@ fn summarize(old: &[Message], session: &mut Session) -> Result<String, Error> {
     }
     let _ = llm::stream_close(handle);
     Ok(text)
-}
-
-fn run_loop(session: &mut Session) -> Result<(), Error> {
-    let mut repeats: HashMap<String, usize> = HashMap::new();
-
-    for _ in 0..MAX_ITERATIONS {
-        if events::cancelled(session.id) {
-            return Ok(());
-        }
-
-        if session.auto_compact && should_compact(session) && compact(session).is_err() {
-            trim_history(session);
-        }
-
-        let mut messages = session.messages.clone();
-        if let Some(summary) = &session.summary {
-            messages.insert(
-                0,
-                Message {
-                    role: "system".into(),
-                    content: Some(summary.clone()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                },
-            );
-        }
-
-        let request = Request {
-            session_id: session.id,
-            model: session.model.clone(),
-            messages,
-            system_prompt: Some(session.system_prompt.clone()),
-            tools: tools::list_tools().to_vec(),
-            temperature: None,
-            max_tokens: None,
-        };
-
-        let handle = match llm::stream_start(&request) {
-            Ok(handle) => handle,
-            Err(err) => {
-                let _ = emit(session.id, "error", &format!("llm error: {err:?}"));
-                return Ok(());
-            }
-        };
-
-        let mut assistant_text = String::new();
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut failed = false;
-        let mut ended = false;
-        loop {
-            if events::cancelled(session.id) {
-                let _ = llm::stream_close(handle);
-                return Ok(());
-            }
-            match llm::stream_next(handle) {
-                Ok(Some(chunk)) => {
-                    if let Some(text) = chunk.text {
-                        assistant_text.push_str(&text);
-                        if emit(session.id, "chunk", &text).is_err() {
-                            let _ = llm::stream_close(handle);
-                            return Ok(());
-                        }
-                    }
-                    if let Some(thinking) = chunk.thinking {
-                        let _ = emit(session.id, "thinking", &thinking);
-                    }
-                    if let Some(tc) = chunk.tool_call_start {
-                        let _ = emit(session.id, "tool_use", &tool_use_json(&tc));
-                    }
-                    if let Some(tc) = chunk.tool_call_end {
-                        tool_calls.push(tc);
-                    }
-                    let _ = chunk.tool_input_delta;
-                }
-                Ok(None) => {
-                    ended = true;
-                    break;
-                }
-                Err(llm::LlmError::Cancelled) => {
-                    let _ = llm::stream_close(handle);
-                    return Ok(());
-                }
-                Err(err) => {
-                    let _ = emit(session.id, "error", &format!("llm error: {err:?}"));
-                    failed = true;
-                    break;
-                }
-            }
-        }
-        if ended && let Ok(usage) = llm::stream_usage(handle) {
-            record_usage(session, usage);
-        }
-        let _ = llm::stream_close(handle);
-
-        if failed {
-            return Ok(());
-        }
-
-        if tool_calls.is_empty() {
-            if !assistant_text.is_empty() {
-                session.messages.push(Message {
-                    role: "assistant".into(),
-                    content: Some(assistant_text),
-                    tool_calls: None,
-                    tool_call_id: None,
-                });
-            }
-            return Ok(());
-        }
-
-        session.messages.push(Message {
-            role: "assistant".into(),
-            content: if assistant_text.is_empty() {
-                None
-            } else {
-                Some(assistant_text)
-            },
-            tool_calls: Some(tool_calls.clone()),
-            tool_call_id: None,
-        });
-
-        for tc in &tool_calls {
-            let count = repeats
-                .entry(format!("{}|{}", tc.name, tc.arguments_json))
-                .or_insert(0);
-            *count += 1;
-            if *count > MAX_TOOL_REPEATS {
-                let _ = emit(session.id, "error", "tool loop guard triggered");
-                return Ok(());
-            }
-            if events::cancelled(session.id) {
-                return Ok(());
-            }
-
-            let (result, is_error) = match tools::invoke(&tc.name, &tc.arguments_json) {
-                Ok(output) => (output, false),
-                Err(tools::ToolError::PermissionDenied) => ("permission denied".to_string(), true),
-                Err(tools::ToolError::NotFound) => (format!("tool not found: {}", tc.name), true),
-                Err(tools::ToolError::Failed) => ("tool failed".to_string(), true),
-            };
-            let preview = truncate(&result, 500);
-            let _ = emit(
-                session.id,
-                "tool_result",
-                &tool_result_json(tc, &preview, is_error),
-            );
-            session.messages.push(Message {
-                role: "tool".into(),
-                content: Some(result),
-                tool_calls: None,
-                tool_call_id: Some(tc.id.clone()),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn truncate(s: &str, limit: usize) -> String {
-    if s.len() <= limit {
-        s.to_string()
-    } else {
-        format!("{}...(truncated {})", &s[..limit], s.len())
-    }
 }
 
 crate::wit::export!(CarsonAgent with_types_in wit);

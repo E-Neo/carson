@@ -8,7 +8,8 @@ use carson_host::registry::{AgentDef, AgentInstance, AgentRegistry, ToolDef};
 
 fn coder_def() -> AgentDef {
     AgentDef {
-        kind: "coder".into(),
+        id: uuid::Uuid::new_v4().to_string(),
+        name: "coder".into(),
         system_prompt: "You are a coding agent.".into(),
         model: "mock/mock".into(),
         instances: 1,
@@ -44,14 +45,15 @@ async fn setup() -> (Arc<Hub>, Arc<AgentRegistry>, Arc<AgentInstance>) {
 }
 
 async fn setup_with(agents: &[AgentDef]) -> (Arc<Hub>, Arc<AgentRegistry>, Arc<AgentInstance>) {
+    let coder = &agents[0];
     let ctx = ctx_with_fake();
     let registry = build_registry(&ctx, agents).await.unwrap();
-    let pool = registry.get("coder").expect("coder pool");
+    let pool = registry.get(&coder.id).expect("coder pool");
     let instance = pool.next();
     (ctx.hub.clone(), Arc::new(registry), instance)
 }
 
-async fn create_session_for(instance: &AgentInstance, session_id: u64, agent: &AgentDef) {
+async fn create_session_for(instance: &AgentInstance, session_id: &str, agent: &AgentDef) {
     let config = SessionConfig {
         system_prompt: agent.system_prompt.clone(),
         model: agent.model.clone(),
@@ -71,14 +73,14 @@ async fn create_session_for(instance: &AgentInstance, session_id: u64, agent: &A
     result.unwrap();
 }
 
-async fn create_session(instance: &AgentInstance, session_id: u64) {
+async fn create_session(instance: &AgentInstance, session_id: &str) {
     create_session_for(instance, session_id, &coder_def()).await;
 }
 
 async fn send_message(
     instance: &AgentInstance,
     hub: &Arc<Hub>,
-    session_id: u64,
+    session_id: &str,
     content: &str,
 ) -> Vec<SseItem> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SseItem>();
@@ -112,8 +114,8 @@ fn chunk_text(items: &[SseItem]) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chat_streams_the_echo_reply() {
     let (_hub, _registry, instance) = setup().await;
-    create_session(&instance, 1).await;
-    let items = send_message(&instance, &_hub, 1, "hello").await;
+    create_session(&instance, "1").await;
+    let items = send_message(&instance, &_hub, "1", "hello").await;
     assert_eq!(chunk_text(&items), "Echo: hello");
     assert!(!items.iter().any(|i| i.event == "thinking"));
 }
@@ -121,8 +123,8 @@ async fn chat_streams_the_echo_reply() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_loop_invokes_time_and_continues() {
     let (hub, _registry, instance) = setup().await;
-    create_session(&instance, 2).await;
-    let items = send_message(&instance, &hub, 2, "what time is it?").await;
+    create_session(&instance, "2").await;
+    let items = send_message(&instance, &hub, "2", "what time is it?").await;
 
     let tool_use = items
         .iter()
@@ -144,39 +146,39 @@ async fn tool_loop_invokes_time_and_continues() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn history_records_the_conversation() {
     let (_hub, _registry, instance) = setup().await;
-    create_session(&instance, 3).await;
-    let _ = send_message(&instance, &_hub, 3, "hi").await;
+    create_session(&instance, "3").await;
+    let _ = send_message(&instance, &_hub, "3", "hi").await;
 
     let mut store = instance.store.lock().await;
     let guest = instance.agent.carson_agent_agent();
     let (result,) = guest
         .func_session_history()
-        .call_async(&mut *store, (3,))
+        .call_async(&mut *store, ("3",))
         .await
         .unwrap();
     drop(store);
-    let messages = result.unwrap();
-    let roles: Vec<_> = messages.iter().map(|m| m.role.as_str()).collect();
-    assert_eq!(roles, ["user", "assistant"]);
-    assert_eq!(messages[1].content.as_deref(), Some("Echo: hi"));
+    let blocks = result.unwrap();
+    let kinds: Vec<_> = blocks.iter().map(|b| b.kind.as_str()).collect();
+    assert_eq!(kinds, ["user", "text"]);
+    assert_eq!(blocks[1].text.as_deref(), Some("Echo: hi"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reset_clears_history() {
     let (_hub, _registry, instance) = setup().await;
-    create_session(&instance, 4).await;
-    let _ = send_message(&instance, &_hub, 4, "hi").await;
+    create_session(&instance, "4").await;
+    let _ = send_message(&instance, &_hub, "4", "hi").await;
 
     let mut store = instance.store.lock().await;
     let guest = instance.agent.carson_agent_agent();
     let (result,) = guest
         .func_reset_session()
-        .call_async(&mut *store, (4,))
+        .call_async(&mut *store, ("4",))
         .await
         .unwrap();
     let (history,) = guest
         .func_session_history()
-        .call_async(&mut *store, (4,))
+        .call_async(&mut *store, ("4",))
         .await
         .unwrap();
     drop(store);
@@ -187,19 +189,19 @@ async fn reset_clears_history() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn destroy_removes_the_session() {
     let (_hub, _registry, instance) = setup().await;
-    create_session(&instance, 5).await;
+    create_session(&instance, "5").await;
 
     let mut store = instance.store.lock().await;
     let guest = instance.agent.carson_agent_agent();
     let (destroy,) = guest
         .func_destroy_session()
-        .call_async(&mut *store, (5,))
+        .call_async(&mut *store, ("5",))
         .await
         .unwrap();
     destroy.unwrap();
     let (message,) = guest
         .func_handle_message()
-        .call_async(&mut *store, (5, "hi"))
+        .call_async(&mut *store, ("5", "hi"))
         .await
         .unwrap();
     drop(store);
@@ -209,7 +211,7 @@ async fn destroy_removes_the_session() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_flag_aborts_a_turn() {
     let (_hub, _registry, instance) = setup().await;
-    create_session(&instance, 6).await;
+    create_session(&instance, "6").await;
     let mut store = instance.store.lock().await;
     store
         .data()
@@ -218,7 +220,7 @@ async fn stop_flag_aborts_a_turn() {
     let guest = instance.agent.carson_agent_agent();
     let (result,) = guest
         .func_handle_message()
-        .call_async(&mut *store, (6, "hi"))
+        .call_async(&mut *store, ("6", "hi"))
         .await
         .unwrap();
     drop(store);
@@ -227,7 +229,8 @@ async fn stop_flag_aborts_a_turn() {
 
 fn compaction_def(max_history: usize, context_window: usize, auto_compact: bool) -> AgentDef {
     AgentDef {
-        kind: "coder".into(),
+        id: uuid::Uuid::new_v4().to_string(),
+        name: "coder".into(),
         system_prompt: "You are a coding agent.".into(),
         model: "mock/mock".into(),
         instances: 1,
@@ -239,7 +242,7 @@ fn compaction_def(max_history: usize, context_window: usize, auto_compact: bool)
     }
 }
 
-async fn history_len(instance: &AgentInstance, session_id: u64) -> usize {
+async fn history_len(instance: &AgentInstance, session_id: &str) -> usize {
     let mut store = instance.store.lock().await;
     let guest = instance.agent.carson_agent_agent();
     let (result,) = guest
@@ -255,11 +258,11 @@ async fn history_len(instance: &AgentInstance, session_id: u64) -> usize {
 async fn auto_compaction_trims_history() {
     let def = compaction_def(4, 100, true);
     let (hub, _registry, instance) = setup_with(std::slice::from_ref(&def)).await;
-    create_session_for(&instance, 10, &def).await;
+    create_session_for(&instance, "10", &def).await;
     let long = "lorem ipsum dolor sit amet ".repeat(20);
     let mut saw_compacted = false;
     for _ in 0..6 {
-        let items = send_message(&instance, &hub, 10, &long).await;
+        let items = send_message(&instance, &hub, "10", &long).await;
         if items.iter().any(|i| {
             i.event == "status" && i.data.as_str().is_some_and(|s| s.contains("compacted"))
         }) {
@@ -268,7 +271,7 @@ async fn auto_compaction_trims_history() {
     }
     assert!(saw_compacted, "expected a compacted status event");
     assert!(
-        history_len(&instance, 10).await <= 8,
+        history_len(&instance, "10").await <= 8,
         "history was not bounded by compaction"
     );
 }
@@ -277,35 +280,35 @@ async fn auto_compaction_trims_history() {
 async fn manual_compaction_trims_history() {
     let def = compaction_def(4, 128_000, false);
     let (hub, _registry, instance) = setup_with(std::slice::from_ref(&def)).await;
-    create_session_for(&instance, 11, &def).await;
+    create_session_for(&instance, "11", &def).await;
     for _ in 0..6 {
-        let _ = send_message(&instance, &hub, 11, "short message").await;
+        let _ = send_message(&instance, &hub, "11", "short message").await;
     }
-    let before = history_len(&instance, 11).await;
+    let before = history_len(&instance, "11").await;
     assert!(before > 4, "manual mode should accumulate history");
 
     let mut store = instance.store.lock().await;
     let guest = instance.agent.carson_agent_agent();
     let (result,) = guest
         .func_compact_session()
-        .call_async(&mut *store, (11,))
+        .call_async(&mut *store, ("11",))
         .await
         .unwrap();
     drop(store);
     result.unwrap();
-    assert_eq!(history_len(&instance, 11).await, 4);
+    assert_eq!(history_len(&instance, "11").await, 4);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_usage_reports_real_tokens() {
     let (_hub, _registry, instance) = setup().await;
-    create_session(&instance, 12).await;
-    let _ = send_message(&instance, &_hub, 12, "hello world").await;
+    create_session(&instance, "12").await;
+    let _ = send_message(&instance, &_hub, "12", "hello world").await;
     let mut store = instance.store.lock().await;
     let guest = instance.agent.carson_agent_agent();
     let (usage,) = guest
         .func_session_usage()
-        .call_async(&mut *store, (12,))
+        .call_async(&mut *store, ("12",))
         .await
         .unwrap();
     drop(store);

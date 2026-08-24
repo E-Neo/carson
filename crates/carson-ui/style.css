@@ -258,8 +258,7 @@ body {
 .tool-card .tc-error { color: var(--danger); }
 
 .thinking {
-  align-self: flex-start;
-  width: min(620px, 90%);
+  align-self: stretch;
   color: var(--text-dim);
   font-size: 13px;
   background: var(--bg-input);
@@ -270,6 +269,17 @@ body {
 }
 
 .status-line { align-self: center; color: var(--text-dim); font-size: 13px; }
+
+.usage-line { margin-left: auto; color: var(--text-dim); font-size: 12px; font-family: var(--mono); }
+
+.error-line { color: var(--danger); font-size: 13px; }
+
+.statusbar {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 4px 16px;
+}
 
 .composer {
   display: flex;
