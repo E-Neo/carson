@@ -2,47 +2,116 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
-    let cargo_profile = if profile == "debug" { "dev" } else { &profile };
+    let cargo_profile = if profile == "debug" {
+        "dev"
+    } else {
+        profile.as_str()
+    };
 
-    for path in [
+    // Watched inputs: everything that can change the generated UI bundle.
+    let mut watch_inputs: Vec<PathBuf> = [
         "Cargo.toml",
         "crates/carson-ui/Cargo.toml",
         "crates/carson-ui/src",
         "crates/carson-ui/index.html",
         "crates/carson-ui/index.js",
         "crates/carson-ui/style.css",
-    ] {
-        println!(
-            "cargo:rerun-if-changed={}",
-            manifest_dir.join(path).display()
-        );
+    ]
+    .iter()
+    .map(|path| manifest_dir.join(path))
+    .collect();
+    watch_inputs.push(manifest_dir.join("Cargo.lock"));
+    watch_inputs.push(manifest_dir.join("build.rs"));
+    for path in &watch_inputs {
+        println!("cargo:rerun-if-changed={}", path.display());
     }
 
-    let ui_wasm = build_ui(&manifest_dir, cargo_profile);
-    let dist = manifest_dir.join("target").join("carson-ui-dist");
+    // Per-profile dist: profiles must not overwrite each other's UI bundle.
+    let dist = manifest_dir
+        .join("target")
+        .join("carson-ui-dist")
+        .join(&profile);
     let pkg = dist.join("pkg");
     std::fs::create_dir_all(&pkg).expect("create dist/pkg");
-    run_wasm_bindgen(&ui_wasm, &pkg);
-    std::fs::copy(
-        manifest_dir.join("crates/carson-ui/index.html"),
-        dist.join("index.html"),
-    )
-    .expect("copy index.html");
-    std::fs::copy(
-        manifest_dir.join("crates/carson-ui/index.js"),
-        dist.join("index.js"),
-    )
-    .expect("copy index.js");
-    std::fs::copy(
-        manifest_dir.join("crates/carson-ui/style.css"),
-        dist.join("style.css"),
-    )
-    .expect("copy style.css");
+
+    let inputs_newest = newest_mtime(&watch_inputs);
+    let up_to_date = match inputs_newest {
+        Some(newest) => {
+            stamp_of(&pkg).as_deref() == Some(cargo_profile)
+                && ["carson_ui.js", "carson_ui_bg.wasm"].iter().all(|file| {
+                    let path = pkg.join(file);
+                    file_mtime(&path).is_some_and(|mtime| mtime >= newest)
+                })
+        }
+        None => false,
+    };
+
+    if !up_to_date {
+        let ui_wasm = build_ui(&manifest_dir, cargo_profile);
+        run_wasm_bindgen(&ui_wasm, &pkg);
+        std::fs::write(pkg.join("profile.txt"), cargo_profile).expect("write pkg profile stamp");
+    }
+
+    copy_if_changed(
+        &manifest_dir.join("crates/carson-ui/index.html"),
+        &dist.join("index.html"),
+    );
+    copy_if_changed(
+        &manifest_dir.join("crates/carson-ui/index.js"),
+        &dist.join("index.js"),
+    );
+    copy_if_changed(
+        &manifest_dir.join("crates/carson-ui/style.css"),
+        &dist.join("style.css"),
+    );
+
     println!("cargo:rustc-env=CARSON_UI_DIST={}", dist.display());
+    println!(
+        "cargo:rustc-env=CARSON_UI_DIST_SUM={}",
+        dist_sum(&dist, &pkg)
+    );
+}
+
+/// Hash every embedded file in a fixed order so identical bundles produce
+/// identical output and content changes always dirty the binary.
+fn dist_sum(dist: &Path, pkg: &Path) -> String {
+    let files = [
+        dist.join("index.html"),
+        dist.join("index.js"),
+        dist.join("style.css"),
+        pkg.join("carson_ui.js"),
+        pkg.join("carson_ui_bg.wasm"),
+    ];
+    let mut combined = Vec::new();
+    for file in &files {
+        let bytes = std::fs::read(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        combined.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        combined.extend_from_slice(&bytes);
+    }
+    fnv1a(&combined)
+}
+
+fn stamp_of(pkg: &Path) -> Option<String> {
+    std::fs::read_to_string(pkg.join("profile.txt")).ok()
+}
+
+/// Copy `src` to `dst` only when the destination bytes differ.
+fn copy_if_changed(src: &Path, dst: &Path) {
+    if let (Ok(current), Ok(new)) = (std::fs::read(dst), std::fs::read(src))
+        && current == new
+    {
+        return;
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).expect("create dist dir");
+    }
+    std::fs::copy(src, dst)
+        .unwrap_or_else(|e| panic!("copy {} -> {}: {e}", src.display(), dst.display()));
 }
 
 fn build_ui(workspace_root: &Path, cargo_profile: &str) -> PathBuf {
@@ -171,4 +240,51 @@ fn find_tool(name: &str) -> PathBuf {
         }
     }
     PathBuf::from(name)
+}
+
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Newest mtime across `paths`, recursing into directories. Returns `None` when
+/// any watched path cannot be stat'ed so callers take the rebuild path.
+fn newest_mtime(paths: &[PathBuf]) -> Option<SystemTime> {
+    let mut newest: Option<SystemTime> = None;
+    fn walk(path: &Path, newest: &mut Option<SystemTime>) -> bool {
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return false;
+        };
+        if let Ok(mtime) = meta.modified()
+            && newest.is_none_or(|current| mtime > current)
+        {
+            *newest = Some(mtime);
+        }
+        if !meta.is_dir() {
+            return true;
+        }
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            if !walk(&entry.path(), newest) {
+                return false;
+            }
+        }
+        true
+    }
+    for path in paths {
+        if !walk(path, &mut newest) {
+            return None;
+        }
+    }
+    newest
+}
+
+fn fnv1a(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
