@@ -8,4 +8,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 serde_json.workspace = true
-wit-bindgen = "0.60"
+wit-bindgen = "0.61"

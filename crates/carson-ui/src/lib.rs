@@ -5,6 +5,7 @@ use leptos_router::path;
 pub mod admin;
 pub mod api;
 pub mod chat;
+pub mod shell;
 pub mod sse;
 pub mod types;
 

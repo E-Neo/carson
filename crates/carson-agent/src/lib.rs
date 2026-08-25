@@ -302,6 +302,18 @@ fn tool_use_json(tc: &ToolCall) -> String {
     json!({"id": tc.id, "name": tc.name, "arguments": tc.arguments_json}).to_string()
 }
 
+/// Human-readable explanation for an LLM failure.
+fn describe_llm_error(err: &llm::LlmError) -> String {
+    match err {
+        llm::LlmError::Network => "network error reaching the provider".to_string(),
+        llm::LlmError::Auth => "authentication failed (check the provider API key)".to_string(),
+        llm::LlmError::RateLimited => "rate limited by the provider".to_string(),
+        llm::LlmError::Timeout => "request timed out".to_string(),
+        llm::LlmError::Cancelled => "cancelled".to_string(),
+        llm::LlmError::Internal(msg) => msg.clone(),
+    }
+}
+
 fn tool_args_json(id: &str, arguments: &str) -> String {
     json!({"id": id, "arguments": arguments}).to_string()
 }
@@ -412,7 +424,7 @@ fn run_loop(session: &mut Session) -> Result<(), Error> {
         let handle = match llm::stream_start(&request) {
             Ok(handle) => handle,
             Err(err) => {
-                let _ = emit(&session.id, "error", &format!("llm error: {err:?}"));
+                let _ = emit(&session.id, "error", &describe_llm_error(&err));
                 return Ok(());
             }
         };
@@ -459,7 +471,7 @@ fn run_loop(session: &mut Session) -> Result<(), Error> {
                     return Ok(());
                 }
                 Err(err) => {
-                    let _ = emit(&session.id, "error", &format!("llm error: {err:?}"));
+                    let _ = emit(&session.id, "error", &describe_llm_error(&err));
                     failed = true;
                     break;
                 }

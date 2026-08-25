@@ -104,7 +104,10 @@ async fn main() -> Result<()> {
     }
     // Built-in tools are compiled into the binary; make them always available.
     for (name, description) in [
-        ("core/time", "Return the current unix time in milliseconds"),
+        (
+            "core/time",
+            "Return the current UTC time in ISO 8601 format",
+        ),
         ("core/echo", "Echo the given text back to the caller"),
     ] {
         let Some(wasm) = host::embedded_tool(name.strip_prefix("core/").unwrap_or(name)) else {

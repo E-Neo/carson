@@ -57,13 +57,14 @@ fn default_true() -> bool {
     true
 }
 
-/// A persisted LLM provider (always OpenAI-compatible). The API key is stored in the DB and is
-/// never serialized back out to clients.
+/// A persisted LLM provider (always OpenAI-compatible). The API key is stored
+/// in the DB and echoed back to the admin UI so edits can round-trip it
+/// without retyping; this host is local-only with no auth by design.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ProviderDef {
     pub name: String,
     pub base_url: String,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub api_key: Option<String>,
 }
 

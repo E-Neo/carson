@@ -120,6 +120,7 @@ async fn chat_streams_the_echo_reply() {
     assert!(!items.iter().any(|i| i.event == "thinking"));
 }
 
+#[allow(clippy::needless_borrow)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_loop_invokes_time_and_continues() {
     let (hub, _registry, instance) = setup().await;
@@ -139,7 +140,17 @@ async fn tool_loop_invokes_time_and_continues() {
     assert_eq!(tool_use.len(), 1);
     assert!(tool_use[0].contains("\"name\":\"core/time\""));
     assert_eq!(tool_result.len(), 1);
-    assert!(tool_result[0].contains("unix_ms"));
+    let payload: serde_json::Value =
+        serde_json::from_str::<serde_json::Value>(&tool_result[0]).expect("tool_result json");
+    let preview = payload["result_preview"].as_str().expect("preview");
+    let parsed: serde_json::Value =
+        serde_json::from_str(preview).expect("preview carries the tool's JSON output");
+    assert!(
+        parsed["time"]
+            .as_str()
+            .is_some_and(|t| t.len() == 24 && t.ends_with('Z')),
+        "expected ISO 8601 time in {preview}"
+    );
     assert_eq!(chunk_text(&items), "Echo: what time is it?");
 }
 

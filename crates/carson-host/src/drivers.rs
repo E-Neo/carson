@@ -325,7 +325,10 @@ impl LlmDriver for OpenAiCompatDriver {
         if !self.api_key.is_empty() {
             builder = builder.bearer_auth(&self.api_key);
         }
-        let resp = builder.send().await.map_err(|_| DriverError::Network)?;
+        let resp = builder
+            .send()
+            .await
+            .map_err(|err| DriverError::Internal(format!("request to provider failed: {err}")))?;
         if !resp.status().is_success() {
             let status = resp.status();
             return Err(if status == reqwest::StatusCode::UNAUTHORIZED {
@@ -342,7 +345,8 @@ impl LlmDriver for OpenAiCompatDriver {
         let mut buffer: Vec<u8> = Vec::new();
 
         while let Some(chunk) = chunks.next().await {
-            let chunk = chunk.map_err(|_| DriverError::Network)?;
+            let chunk =
+                chunk.map_err(|err| DriverError::Internal(format!("stream read failed: {err}")))?;
             buffer.extend_from_slice(&chunk);
 
             while let Some(line) = pop_line(&mut buffer) {
@@ -448,7 +452,7 @@ mod tests {
         };
         let tool_message = DriverMessage {
             role: "tool".into(),
-            content: Some("{\"unix_ms\":1}".into()),
+            content: Some("{\"time\":\"2026-01-01T00:00:00.000Z\"}".into()),
             tool_calls: vec![],
             tool_call_id: Some("call_time".into()),
         };

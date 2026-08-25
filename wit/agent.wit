@@ -62,13 +62,14 @@ interface llm {
         tool-call-end: option<tool-call>,
     }
 
-    enum llm-error {
+    variant llm-error {
         network,
         auth,
         rate-limited,
         timeout,
         cancelled,
-        internal,
+        /// Carries a human-readable explanation of the failure.
+        internal(string),
     }
 
     stream-start: func(request: request) -> result<u64, llm-error>;

@@ -23,20 +23,16 @@ fn runner() -> ToolRunner {
 }
 
 #[test]
-fn sandboxed_time_tool_returns_unix_ms() {
+fn sandboxed_time_tool_returns_iso8601() {
     let runner = runner();
-    let before = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
     let out = runner.run("core/time", "{}").unwrap().unwrap();
-    let after = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
-    let unix_ms = value["unix_ms"].as_u64().unwrap();
-    assert!((before..=after).contains(&(unix_ms as u128)));
+    let time = value["time"].as_str().expect("time field");
+    // 2026-08-24T09:01:24.123Z
+    assert_eq!(time.len(), 24, "ISO 8601 with millis: {time}");
+    assert_eq!(&time[4..5], "-");
+    assert_eq!(&time[10..11], "T");
+    assert!(time.ends_with('Z'), "{time}");
 }
 
 #[test]

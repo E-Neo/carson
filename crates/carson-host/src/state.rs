@@ -9,7 +9,8 @@ use crate::bindings::carson::agent::events::{EventError, Part};
 use crate::bindings::carson::agent::llm::{Chunk, LlmError, Request, ToolCall, ToolDefinition};
 use crate::bindings::carson::agent::tools::ToolError;
 use crate::drivers::{
-    DriverEvent, DriverMessage, DriverToolCall, DriverToolDef, LlmDriver, LlmRequest, Usage,
+    DriverError, DriverEvent, DriverMessage, DriverToolCall, DriverToolDef, LlmDriver, LlmRequest,
+    Usage,
 };
 use crate::hub::Hub;
 use crate::tools::{Capabilities, ToolRunner};
@@ -57,6 +58,19 @@ fn to_wit_tool_call(tc: DriverToolCall) -> ToolCall {
     }
 }
 
+/// Preserve the driver's explanation instead of collapsing every failure
+/// into a bare `Internal`.
+fn to_llm_error(err: DriverError) -> LlmError {
+    match err {
+        DriverError::Network => LlmError::Network,
+        DriverError::Auth => LlmError::Auth,
+        DriverError::RateLimited => LlmError::RateLimited,
+        DriverError::Timeout => LlmError::Timeout,
+        DriverError::Cancelled => LlmError::Cancelled,
+        DriverError::Internal(msg) => LlmError::Internal(msg),
+    }
+}
+
 fn chunk() -> Chunk {
     Chunk {
         text: None,
@@ -97,14 +111,21 @@ impl crate::bindings::carson::agent::events::Host for State {
 
 impl crate::bindings::carson::agent::llm::Host for State {
     fn stream_start(&mut self, request: Request) -> Result<u64, LlmError> {
-        let (provider, model) = resolve_model(&request.model).ok_or(LlmError::Internal)?;
+        let (provider, model) = resolve_model(&request.model).ok_or_else(|| {
+            LlmError::Internal(format!(
+                "model '{}' must be in 'provider/model' form",
+                request.model
+            ))
+        })?;
         let driver = self
             .drivers
             .read()
             .unwrap()
             .get(&provider)
             .cloned()
-            .ok_or(LlmError::Internal)?;
+            .ok_or_else(|| {
+                LlmError::Internal(format!("provider '{provider}' is not configured"))
+            })?;
 
         let handle = self.next_stream_id;
         self.next_stream_id += 1;
@@ -182,7 +203,7 @@ impl crate::bindings::carson::agent::llm::Host for State {
 
     fn stream_next(&mut self, handle: u64) -> Result<Option<Chunk>, LlmError> {
         let Some(stream) = self.streams.get_mut(&handle) else {
-            return Err(LlmError::Internal);
+            return Err(LlmError::Internal("unknown stream handle".into()));
         };
         match stream.rx.recv() {
             Ok(DriverEvent::Text(text)) => Ok(Some(Chunk {
@@ -201,7 +222,7 @@ impl crate::bindings::carson::agent::llm::Host for State {
                 tool_call_end: Some(to_wit_tool_call(tc)),
                 ..chunk()
             })),
-            Ok(DriverEvent::Failed(_)) => Err(LlmError::Internal),
+            Ok(DriverEvent::Failed(err)) => Err(to_llm_error(err)),
             Err(_) => Ok(None),
         }
     }
@@ -211,7 +232,7 @@ impl crate::bindings::carson::agent::llm::Host for State {
         handle: u64,
     ) -> Result<crate::bindings::carson::agent::llm::Usage, LlmError> {
         let Some(stream) = self.streams.get(&handle) else {
-            return Err(LlmError::Internal);
+            return Err(LlmError::Internal("unknown stream handle".into()));
         };
         let usage = stream.usage.lock().unwrap().clone().unwrap_or_default();
         Ok(crate::bindings::carson::agent::llm::Usage {
@@ -431,6 +452,6 @@ mod tests {
     #[test]
     fn stream_next_unknown_handle_errors() {
         let mut state = test_state(&[]);
-        assert!(matches!(state.stream_next(999), Err(LlmError::Internal)));
+        assert!(matches!(state.stream_next(999), Err(LlmError::Internal(_))));
     }
 }

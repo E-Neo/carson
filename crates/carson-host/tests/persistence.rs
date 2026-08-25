@@ -233,7 +233,7 @@ async fn tool_turn_persists_ordered_blocks() {
             .text
             .as_deref()
             .unwrap_or_default()
-            .contains("unix_ms")
+            .contains("\"time\"")
     );
     // Assistant-side blocks carry the LLM usage of their turn.
     assert!(call.input_tokens > 0 || call.output_tokens > 0);

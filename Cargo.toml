@@ -51,5 +51,5 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
-wasmtime = "47"
-wasmtime-wasi = "47"
+wasmtime = "48"
+wasmtime-wasi = "48"

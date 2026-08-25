@@ -13,4 +13,4 @@ path = "src/bin/echo.rs"
 
 [dependencies]
 serde_json.workspace = true
-wit-bindgen = "0.60"
+wit-bindgen = "0.61"

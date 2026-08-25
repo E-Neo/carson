@@ -1,4 +1,5 @@
 use crate::api;
+use crate::shell::{DragRail, DrawerBackdrop, MenuButton, sidebar_width};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use serde_json::{Value, json};
@@ -116,6 +117,12 @@ fn show_notice(notice: &RwSignal<Option<String>>, ok: bool, msg: String) {
 #[component]
 pub fn AdminPage() -> impl IntoView {
     let tab = RwSignal::new("status".to_string());
+    let drawer_open = RwSignal::new(false);
+    let sidebar_w = sidebar_width();
+    let pick_tab = move |name: &'static str| {
+        drawer_open.set(false);
+        tab.set(name.to_string());
+    };
     let tab_class = move |name: &'static str| {
         move || {
             if tab.get() == name {
@@ -128,17 +135,25 @@ pub fn AdminPage() -> impl IntoView {
 
     view! {
         <div class="app">
-            <aside class="sidebar">
+            <aside
+                class="sidebar"
+                class:open=drawer_open
+                style:width=move || format!("{}px", sidebar_w.get())
+            >
                 <div class="brand-row">
                     <h1>"Carson"</h1>
                     <div class="sub">"Admin"</div>
                 </div>
-                <button class=tab_class("status") on:click=move |_| tab.set("status".to_string())>"Status"</button>
-                <button class=tab_class("providers") on:click=move |_| tab.set("providers".to_string())>"Providers"</button>
-                <button class=tab_class("agents") on:click=move |_| tab.set("agents".to_string())>"Agents"</button>
-                <button class=tab_class("tools") on:click=move |_| tab.set("tools".to_string())>"Tools"</button>
+                <button class=tab_class("status") on:click=move |_| pick_tab("status")>"Status"</button>
+                <button class=tab_class("providers") on:click=move |_| pick_tab("providers")>"Providers"</button>
+                <button class=tab_class("agents") on:click=move |_| pick_tab("agents")>"Agents"</button>
+                <button class=tab_class("tools") on:click=move |_| pick_tab("tools")>"Tools"</button>
                 <a class="admin-link" href="/chat">"Back to chat"</a>
             </aside>
+
+            <DragRail width=sidebar_w/>
+            <MenuButton open=drawer_open/>
+
             <main class="main">
                 {move || match tab.get().as_str() {
                     "providers" => view! { <ProvidersPanel/> }.into_any(),
@@ -147,6 +162,7 @@ pub fn AdminPage() -> impl IntoView {
                     _ => view! { <StatusPanel/> }.into_any(),
                 }}
             </main>
+            <DrawerBackdrop open=drawer_open/>
         </div>
     }
 }
@@ -262,7 +278,14 @@ fn ProvidersPanel() -> impl IntoView {
                 .unwrap_or("")
                 .to_string(),
         );
-        edit_api_key.set(String::new());
+        // Round-trip the stored key so editing the base_url keeps it; blanking
+        // the field and confirming clears it intentionally.
+        edit_api_key.set(
+            item.get("api_key")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string(),
+        );
         editing.set(Some(item));
     };
 

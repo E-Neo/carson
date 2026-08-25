@@ -82,12 +82,6 @@ pub(crate) struct CompactPath {
 }
 
 #[derive(TypedPath, Deserialize)]
-#[typed_path("/api/sessions/{id}/migrate")]
-pub(crate) struct MigratePath {
-    id: String,
-}
-
-#[derive(TypedPath, Deserialize)]
 #[typed_path("/api/agents/{name}")]
 pub(crate) struct AgentNamePath {
     name: String,
@@ -210,7 +204,7 @@ pub struct ProviderListResponse {
 
 #[derive(ToSchema)]
 #[schema(example = json!({
-    "tools": [{"name": "core/time", "description": "Return the current unix time in milliseconds", "parameters": {}}],
+    "tools": [{"name": "core/time", "description": "Return the current UTC time in ISO 8601 format", "parameters": {}}],
     "total": 1
 }))]
 pub struct ToolListResponse {
@@ -285,15 +279,6 @@ pub struct SessionCreateResponse {
     pub session_id: String,
     pub agent: String,
     pub agent_version_id: String,
-}
-
-/// Request body for migrating a session onto another agent version.
-#[derive(Deserialize, ToSchema, Default)]
-pub struct MigrateReq {
-    /// Target agent version id. Omit to migrate to the current version of the
-    /// session's agent name.
-    #[serde(default)]
-    pub agent_version: Option<String>,
 }
 
 /// One entry of the conversation block log.
@@ -396,7 +381,6 @@ pub fn router(state: AppState) -> Router {
         .route(StopPath::PATH, post(stop_session))
         .route(ResetPath::PATH, post(reset_session))
         .route(CompactPath::PATH, post(compact_session))
-        .route(MigratePath::PATH, post(migrate_session))
         .layer(middleware::from_fn(security))
         .with_state(state);
 
@@ -612,7 +596,9 @@ pub(crate) async fn create_agent(
 
 /// Validate that the agent's model is `provider/model` and the provider is registered.
 fn validate_agent_model(st: &AppState, def: &AgentDef) -> Option<&'static str> {
-    let (provider, model) = def.model.split_once('/')?;
+    let Some((provider, model)) = def.model.split_once('/') else {
+        return Some("model must be in 'provider/model' form");
+    };
     if provider.is_empty() || model.is_empty() {
         return Some("model must be in 'provider/model' form");
     }
@@ -1221,9 +1207,10 @@ pub(crate) async fn stop_session(State(st): State<AppState>, path: StopPath) -> 
 )]
 pub(crate) async fn compact_session(State(st): State<AppState>, path: CompactPath) -> Response {
     let id = path.id;
-    let Some(entry) = st.sessions.lock().await.get(&id).cloned() else {
+    let Some(pinned) = st.sessions.lock().await.get(&id).cloned() else {
         return json_err(StatusCode::NOT_FOUND, "session not found");
     };
+    let entry = sync_session_agent(&st, &id, &pinned).await;
     let mut store = entry.instance.store.lock().await;
     let guest = entry.instance.agent.carson_agent_agent();
     let result = guest
@@ -1243,79 +1230,63 @@ pub(crate) async fn compact_session(State(st): State<AppState>, path: CompactPat
     }
 }
 
-/// Migrate a session onto another agent version (default: the current version
-/// of its agent name).
-#[utoipa::path(
-    post,
-    path = "/api/sessions/{id}/migrate",
-    params(
-        ("id" = String, Path, description = "Session id")
-    ),
-    request_body = MigrateReq,
-    responses(
-        (status = 200, description = "Session migrated"),
-        (status = 400, description = "Unknown target version", body = ErrorResponse),
-        (status = 404, description = "Session not found", body = ErrorResponse)
-    )
-)]
-pub(crate) async fn migrate_session(
-    State(st): State<AppState>,
-    path: MigratePath,
-    Json(req): Json<MigrateReq>,
-) -> Response {
-    let id = path.id;
-    let Some(entry) = st.sessions.lock().await.get(&id).cloned() else {
-        return json_err(StatusCode::NOT_FOUND, "session not found");
+/// Bring a session onto the current version of its agent name before a turn.
+///
+/// The session's `agent_name` resolves through the name pointer on every
+/// message; if the pointer moved since the session was created, the block log
+/// is snapshotted and restored onto an instance built from the new version's
+/// config. When the pointer is gone (agent deleted), the pinned version keeps
+/// serving so orphaned sessions still work.
+async fn sync_session_agent(st: &AppState, id: &str, entry: &SessionEntry) -> SessionEntry {
+    let Some(def) = st.db.current_agent(&entry.agent_name).ok().flatten() else {
+        return entry.clone();
+    };
+    if def.id == entry.agent_version_id {
+        return entry.clone();
+    }
+    let Ok(pool) = carson_host::registry::get_or_build_pool(&st.ctx, &st.registry, &def).await
+    else {
+        tracing::warn!(
+            session = %id,
+            version = %def.id,
+            "failed to build agent pool; staying on pinned version"
+        );
+        return entry.clone();
     };
 
-    let def = match &req.agent_version {
-        Some(version_id) => st.db.get_agent_version(version_id).ok().flatten(),
-        None => st.db.current_agent(&entry.agent_name).ok().flatten(),
-    };
-    let Some(def) = def else {
-        return json_err(StatusCode::BAD_REQUEST, "unknown target agent version");
-    };
-
-    let pool = match carson_host::registry::get_or_build_pool(&st.ctx, &st.registry, &def).await {
-        Ok(pool) => pool,
-        Err(err) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
-    };
-
-    host::snapshot_session(&st.db, &entry.instance, &id).await;
-    let persisted = match st.db.load_sessions() {
-        Ok(sessions) => sessions.into_iter().find(|p| p.id == id),
-        Err(err) => {
-            return json_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("db error: {err}"),
-            );
-        }
-    };
+    host::snapshot_session(&st.db, &entry.instance, id).await;
+    let persisted = st
+        .db
+        .load_sessions()
+        .ok()
+        .and_then(|sessions| sessions.into_iter().find(|p| p.id == id));
     let Some(persisted) = persisted else {
-        return json_err(StatusCode::NOT_FOUND, "session not found");
+        return entry.clone();
     };
 
     let instance = pool.next();
     instance.stop.store(false, Ordering::SeqCst);
-    if let Err(err) = host::restore_session(&instance, &id, &persisted, &pool.config()).await {
-        return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}"));
+    if let Err(err) = host::restore_session(&instance, id, &persisted, &pool.config()).await {
+        tracing::warn!(session = %id, error = %err, "agent sync failed; staying on pinned version");
+        return entry.clone();
     }
 
-    st.sessions.lock().await.insert(
-        id.clone(),
-        SessionEntry {
-            agent_name: def.name.clone(),
-            agent_version_id: def.id.clone(),
-            instance: instance.clone(),
-        },
+    let updated = SessionEntry {
+        agent_name: def.name.clone(),
+        agent_version_id: def.id.clone(),
+        instance,
+    };
+    st.sessions
+        .lock()
+        .await
+        .insert(id.to_string(), updated.clone());
+    tracing::info!(
+        session = %id,
+        agent = %def.name,
+        version = %def.id,
+        "session migrated to current agent version"
     );
-    host::snapshot_session(&st.db, &instance, &id).await;
-    json_ok(json!({
-        "session_id": id,
-        "agent": def.name,
-        "agent_version_id": def.id,
-        "status": "migrated",
-    }))
+    updated
 }
 
 async fn run_message_blocking(
@@ -1385,9 +1356,10 @@ pub(crate) async fn send_stream(
     Json(req): Json<MessageReq>,
 ) -> Response {
     let id = path.id;
-    let Some(entry) = st.sessions.lock().await.get(&id).cloned() else {
+    let Some(pinned) = st.sessions.lock().await.get(&id).cloned() else {
         return json_err(StatusCode::NOT_FOUND, "session not found");
     };
+    let entry = sync_session_agent(&st, &id, &pinned).await;
     let (tx, rx) = mpsc::unbounded_channel::<SseItem>();
     st.hub.register(&id, tx.clone());
     let hub = st.hub.clone();
@@ -1401,12 +1373,12 @@ pub(crate) async fn send_stream(
             run_message_blocking(instance.clone(), task_id.clone(), req.content.clone()).await;
         host::snapshot_session(&db, &instance, &task_id).await;
         let usage = session_usage(&instance, &task_id).await;
-        if result.is_err() {
+        if let Err(err) = result {
             let _ = hub.send(
                 &task_id,
                 SseItem {
                     event: "error".into(),
-                    data: json!({"message": "agent run failed"}),
+                    data: json!({"message": format!("agent run failed: {err:#}")}),
                 },
             );
         }
@@ -1453,9 +1425,10 @@ pub(crate) async fn send_message(
     Json(req): Json<MessageReq>,
 ) -> Response {
     let id = path.id;
-    let Some(entry) = st.sessions.lock().await.get(&id).cloned() else {
+    let Some(pinned) = st.sessions.lock().await.get(&id).cloned() else {
         return json_err(StatusCode::NOT_FOUND, "session not found");
     };
+    let entry = sync_session_agent(&st, &id, &pinned).await;
     let (tx, mut rx) = mpsc::unbounded_channel::<SseItem>();
     st.hub.register(&id, tx.clone());
     let hub = st.hub.clone();
@@ -1469,12 +1442,12 @@ pub(crate) async fn send_message(
             run_message_blocking(instance.clone(), task_id.clone(), req.content.clone()).await;
         host::snapshot_session(&db, &instance, &task_id).await;
         let usage = session_usage(&instance, &task_id).await;
-        if result.is_err() {
+        if let Err(err) = result {
             let _ = hub.send(
                 &task_id,
                 SseItem {
                     event: "error".into(),
-                    data: json!({"message": "agent run failed"}),
+                    data: json!({"message": format!("agent run failed: {err:#}")}),
                 },
             );
         }
@@ -1686,10 +1659,30 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("groq"), "{body}");
         assert!(
-            !body.contains("gsk-secret"),
-            "api key must not be exposed: {body}"
+            body.contains("gsk-secret"),
+            "api key is echoed back so edits round-trip: {body}"
         );
-        let (status, _, body) = read(
+
+        // Updating only the base URL keeps the stored key.
+        let (status, _, _) = read(
+            put(
+                &app,
+                "/api/providers/groq",
+                r#"{"name":"groq","base_url":"https://changed.example","api_key":"gsk-secret"}"#,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, _, body) = read(response(app.clone(), "/api/providers").await).await;
+        assert!(body.contains("changed.example"), "{body}");
+        assert!(
+            body.contains("gsk-secret"),
+            "key survives base_url edit: {body}"
+        );
+
+        // Explicitly blanking the key clears it.
+        let (status, _, _) = read(
             put(
                 &app,
                 "/api/providers/groq",
@@ -1698,7 +1691,9 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(status, StatusCode::OK);
+        let (_, _, body) = read(response(app.clone(), "/api/providers").await).await;
+        assert!(!body.contains("gsk-secret"), "{body}");
         let (status, _, _) = read(delete(&app, "/api/providers/groq").await).await;
         assert_eq!(status, StatusCode::OK);
     }

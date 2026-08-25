@@ -734,7 +734,7 @@ mod tests {
         call.tool_call_id = Some("c1".into());
         call.tool_name = Some("core/time".into());
         call.arguments_json = Some("{}".into());
-        let mut result = block("tool-result", "{\"unix_ms\":1}");
+        let mut result = block("tool-result", "{\"time\":\"2026-01-01T00:00:00.000Z\"}");
         result.tool_call_id = Some("c1".into());
         result.is_error = false;
 

@@ -1,4 +1,5 @@
 use crate::api;
+use crate::shell::{DragRail, DrawerBackdrop, MenuButton, sidebar_width};
 use crate::sse;
 use crate::types::SessionSummary;
 use leptos::prelude::*;
@@ -25,7 +26,26 @@ enum UiBlock {
 
 #[derive(Clone)]
 struct MsgEntry {
+    id: u64,
     block: UiBlock,
+}
+
+/// A maximal run of consecutive assistant-side blocks sharing one bubble.
+/// `id` is the first entry's id, so a group stays mounted while its turn
+/// streams more blocks into it.
+#[derive(Clone)]
+struct Group {
+    id: u64,
+    entries: Vec<MsgEntry>,
+}
+
+impl Group {
+    fn starts_user(&self) -> bool {
+        matches!(
+            self.entries.first().map(|e| &e.block),
+            Some(UiBlock::User { .. })
+        )
+    }
 }
 
 #[derive(Clone, Default)]
@@ -37,13 +57,13 @@ struct ToolCard {
     is_error: bool,
 }
 
-/// True while the last block in the log is still being streamed into.
-fn last_is_kind(messages: &RwSignal<Vec<MsgEntry>>, kind_is_text: bool) -> bool {
-    messages.with(|m| match m.last().map(|e| &e.block) {
-        Some(UiBlock::Text { .. }) => kind_is_text,
-        Some(UiBlock::Thinking { .. }) => !kind_is_text,
-        _ => false,
-    })
+fn alloc_id(next_id: &RwSignal<u64>) -> u64 {
+    let mut id = 0;
+    next_id.update(|n| {
+        *n += 1;
+        id = *n;
+    });
+    id
 }
 
 fn fmt_usage(u: &Value) -> String {
@@ -73,76 +93,47 @@ fn short_id(id: &str) -> String {
 }
 
 /// Rebuild the block list from the session API's ordered block log.
-fn build_history(v: &Value) -> Vec<MsgEntry> {
+fn build_history(v: &Value, next_id: &RwSignal<u64>) -> Vec<MsgEntry> {
     let mut out: Vec<MsgEntry> = Vec::new();
     let Some(arr) = v.get("messages").and_then(|x| x.as_array()) else {
         return out;
     };
     for m in arr {
-        let kind = m.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-        match kind {
+        match m.get("kind").and_then(|k| k.as_str()).unwrap_or("") {
             "user" => out.push(MsgEntry {
+                id: alloc_id(next_id),
                 block: UiBlock::User {
-                    content: m
-                        .get("text")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("")
-                        .to_string(),
+                    content: text_of(m),
                 },
             }),
             "thinking" => out.push(MsgEntry {
+                id: alloc_id(next_id),
                 block: UiBlock::Thinking {
-                    text: RwSignal::new(
-                        m.get("text")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                    ),
+                    text: RwSignal::new(text_of(m)),
                 },
             }),
             "text" => out.push(MsgEntry {
+                id: alloc_id(next_id),
                 block: UiBlock::Text {
-                    text: RwSignal::new(
-                        m.get("text")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                    ),
+                    text: RwSignal::new(text_of(m)),
                 },
             }),
             "tool-use" => out.push(MsgEntry {
+                id: alloc_id(next_id),
                 block: UiBlock::ToolUse {
                     card: RwSignal::new(ToolCard {
-                        id: m
-                            .get("tool_call_id")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        name: m
-                            .get("tool_name")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        arguments: m
-                            .get("arguments")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        result: None,
-                        is_error: false,
+                        id: str_of(m, "tool_call_id"),
+                        name: str_of(m, "tool_name"),
+                        arguments: str_of(m, "arguments"),
+                        ..Default::default()
                     }),
                 },
             }),
             "tool-result" => {
-                let tid = m
-                    .get("tool_call_id")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let result = m.get("text").and_then(|c| c.as_str()).unwrap_or("");
-                let preview = truncate(result, 500);
+                let tid = str_of(m, "tool_call_id");
+                let preview = truncate(&str_of(m, "text"), 500);
                 let is_error = m.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
-                for e in out.iter_mut().rev() {
+                for e in out.iter().rev() {
                     if let UiBlock::ToolUse { card } = &e.block
                         && card.get_untracked().id == tid
                     {
@@ -160,28 +151,81 @@ fn build_history(v: &Value) -> Vec<MsgEntry> {
     out
 }
 
+fn bubble_groups(entries: Vec<MsgEntry>) -> Vec<Group> {
+    let mut out: Vec<Group> = Vec::new();
+    for e in entries {
+        let is_user = matches!(e.block, UiBlock::User { .. });
+        match out.last_mut() {
+            Some(g) if !is_user && !g.starts_user() => g.entries.push(e),
+            _ => out.push(Group {
+                id: e.id,
+                entries: vec![e],
+            }),
+        }
+    }
+    out
+}
+
+fn text_of(v: &Value) -> String {
+    v.get("text")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn str_of(v: &Value, key: &str) -> String {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
 async fn load_history(
     id: &str,
     messages: &RwSignal<Vec<MsgEntry>>,
     error: &RwSignal<Option<String>>,
     scroll_tick: &RwSignal<u64>,
-    at_bottom: &RwSignal<bool>,
+    follow: &RwSignal<bool>,
+    next_id: &RwSignal<u64>,
 ) {
     if let Ok((status, v)) = api::get(&format!("/api/sessions/{id}")).await {
         if status == 200 {
-            messages.set(build_history(&v));
+            messages.set(build_history(&v, next_id));
         } else {
-            error.set(Some(
-                v.get("error")
-                    .and_then(|e| e.as_str())
-                    .unwrap_or("failed to load history")
-                    .to_string(),
-            ));
+            error.set(Some(str_of(&v, "error")));
         }
     }
-    // Fresh content lands at the bottom; resume auto-scroll there.
-    at_bottom.set(true);
+    // Fresh content lands at the bottom; resume following there.
+    follow.set(true);
     scroll_tick.update(|t| *t += 1);
+}
+
+/// Append stream text to the trailing block of this kind, opening a new block
+/// when the kind changes (thinking -> tool-use -> text ...). The display
+/// order therefore matches the stream exactly, and thinking after a tool call
+/// is no longer dropped.
+fn stream_text(
+    messages: &RwSignal<Vec<MsgEntry>>,
+    next_id: &RwSignal<u64>,
+    matches_kind: impl Fn(&UiBlock) -> bool,
+    make: impl FnOnce() -> UiBlock,
+    extract: fn(&mut UiBlock) -> Option<&mut RwSignal<String>>,
+    text: &str,
+) {
+    let last_matches = messages.with_untracked(|m| m.last().map(|e| matches_kind(&e.block)));
+    if !last_matches.unwrap_or(false) {
+        messages.update(|m| {
+            m.push(MsgEntry {
+                id: alloc_id(next_id),
+                block: make(),
+            })
+        });
+    }
+    messages.update(|m| {
+        if let Some(buf) = m.last_mut().and_then(|e| extract(&mut e.block)) {
+            buf.update(|s| s.push_str(text));
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -194,20 +238,19 @@ fn send(
     error: RwSignal<Option<String>>,
     status_line: RwSignal<Option<String>>,
     scroll_tick: RwSignal<u64>,
+    follow: RwSignal<bool>,
+    next_id: RwSignal<u64>,
 ) {
     let text = input.get().trim().to_string();
     if text.is_empty() || running.get() {
         return;
     }
-    let content = RwSignal::new(String::new());
     messages.update(|m| {
         m.push(MsgEntry {
+            id: alloc_id(&next_id),
             block: UiBlock::User {
                 content: text.clone(),
             },
-        });
-        m.push(MsgEntry {
-            block: UiBlock::Text { text: content },
         });
     });
     input.set(String::new());
@@ -215,158 +258,113 @@ fn send(
     usage.set(None);
     error.set(None);
     status_line.set(None);
+    // The user asked for this reply; follow it regardless of prior scroll.
+    follow.set(true);
     scroll_tick.update(|t| *t += 1);
 
     let path = format!("/api/sessions/{session_id}/stream");
     let body = json!({ "content": text });
     spawn_local(async move {
-        let result = sse::stream_post(&path, &body, move |ev| {
-            scroll_tick.update(|t| *t += 1);
-            match ev.event.as_str() {
-                "chunk" => {
-                    let text = serde_json::from_str::<String>(&ev.data)
-                        .unwrap_or_else(|_| ev.data.clone());
-                    ensure_text_block(&messages);
-                    append_last_text(&messages, &text);
-                }
-                "thinking" => {
-                    let text = serde_json::from_str::<String>(&ev.data)
-                        .unwrap_or_else(|_| ev.data.clone());
-                    ensure_thinking_block(&messages);
-                    append_last_thinking(&messages, &text);
-                }
-                "tool_use" => {
-                    if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
-                        messages.update(|m| {
-                            m.push(MsgEntry {
-                                block: UiBlock::ToolUse {
-                                    card: RwSignal::new(ToolCard {
-                                        id: v
-                                            .get("id")
-                                            .and_then(|x| x.as_str())
-                                            .unwrap_or("")
-                                            .to_string(),
-                                        name: v
-                                            .get("name")
-                                            .and_then(|x| x.as_str())
-                                            .unwrap_or("")
-                                            .to_string(),
-                                        ..Default::default()
-                                    }),
-                                },
-                            });
-                        });
-                    }
-                }
-                "tool_args" => {
-                    if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
-                        let tid = v
-                            .get("id")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let args = v
-                            .get("arguments")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        for_each_card(&messages, &tid, &|card| {
-                            card.arguments = args.clone();
-                        });
-                    }
-                }
-                "tool_result" => {
-                    if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
-                        let tid = v
-                            .get("id")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let preview = truncate(
-                            v.get("result_preview")
-                                .and_then(|x| x.as_str())
-                                .unwrap_or(""),
-                            500,
-                        );
-                        let is_error = v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
-                        for_each_card(&messages, &tid, &|card| {
-                            card.result = Some(preview.clone());
-                            card.is_error = is_error;
-                        });
-                    }
-                }
-                "status" => {
-                    let text = serde_json::from_str::<String>(&ev.data)
-                        .unwrap_or_else(|_| ev.data.clone());
-                    status_line.set(Some(text));
-                }
-                "error" => {
-                    let msg = serde_json::from_str::<Value>(&ev.data)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("message")
-                                .and_then(|m| m.as_str())
-                                .map(|m| m.to_string())
-                        })
-                        .unwrap_or_else(|| ev.data.clone());
-                    error.set(Some(msg));
-                }
-                "done" => {
-                    if let Ok(v) = serde_json::from_str::<Value>(&ev.data)
-                        && let Some(u) = v.get("usage")
-                    {
-                        usage.set(Some(fmt_usage(u)));
-                    }
-                    running.set(false);
-                }
-                _ => {}
+        let result = sse::stream_post(&path, &body, move |ev| match ev.event.as_str() {
+            "chunk" => {
+                let text =
+                    serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
+                stream_text(
+                    &messages,
+                    &next_id,
+                    last_is_text,
+                    || UiBlock::Text {
+                        text: RwSignal::new(String::new()),
+                    },
+                    |block| match block {
+                        UiBlock::Text { text } => Some(text),
+                        _ => None,
+                    },
+                    &text,
+                );
+                scroll_tick.update(|t| *t += 1);
             }
+            "thinking" => {
+                let text =
+                    serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
+                stream_text(
+                    &messages,
+                    &next_id,
+                    last_is_thinking,
+                    || UiBlock::Thinking {
+                        text: RwSignal::new(String::new()),
+                    },
+                    |block| match block {
+                        UiBlock::Thinking { text } => Some(text),
+                        _ => None,
+                    },
+                    &text,
+                );
+                scroll_tick.update(|t| *t += 1);
+            }
+            "tool_use" => {
+                if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
+                    messages.update(|m| {
+                        m.push(MsgEntry {
+                            id: alloc_id(&next_id),
+                            block: UiBlock::ToolUse {
+                                card: RwSignal::new(ToolCard {
+                                    id: str_of(&v, "id"),
+                                    name: str_of(&v, "name"),
+                                    ..Default::default()
+                                }),
+                            },
+                        });
+                    });
+                    scroll_tick.update(|t| *t += 1);
+                }
+            }
+            "tool_args" => {
+                if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
+                    let tid = str_of(&v, "id");
+                    let args = str_of(&v, "arguments");
+                    for_each_card(&messages, &tid, &|card| {
+                        card.arguments = args.clone();
+                    });
+                }
+            }
+            "tool_result" => {
+                if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
+                    let tid = str_of(&v, "id");
+                    let preview = truncate(&str_of(&v, "result_preview"), 500);
+                    let is_error = v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
+                    for_each_card(&messages, &tid, &|card| {
+                        card.result = Some(preview.clone());
+                        card.is_error = is_error;
+                    });
+                }
+            }
+            "status" => {
+                let text =
+                    serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
+                status_line.set(Some(text));
+            }
+            "error" => {
+                let msg = serde_json::from_str::<Value>(&ev.data)
+                    .ok()
+                    .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
+                    .unwrap_or_else(|| ev.data.clone());
+                error.set(Some(msg));
+            }
+            "done" => {
+                if let Ok(v) = serde_json::from_str::<Value>(&ev.data)
+                    && let Some(u) = v.get("usage")
+                {
+                    usage.set(Some(fmt_usage(u)));
+                }
+                running.set(false);
+            }
+            _ => {}
         })
         .await;
         running.set(false);
         if let Err(e) = result {
             error.set(Some(e));
-        }
-    });
-}
-
-fn ensure_text_block(messages: &RwSignal<Vec<MsgEntry>>) {
-    if !last_is_kind(messages, true) {
-        messages.update(|m| {
-            m.push(MsgEntry {
-                block: UiBlock::Text {
-                    text: RwSignal::new(String::new()),
-                },
-            });
-        });
-    }
-}
-
-fn ensure_thinking_block(messages: &RwSignal<Vec<MsgEntry>>) {
-    let empty = messages.get_untracked().last().map(|e| &e.block).is_none();
-    if last_is_kind(messages, true) || empty {
-        messages.update(|m| {
-            m.push(MsgEntry {
-                block: UiBlock::Thinking {
-                    text: RwSignal::new(String::new()),
-                },
-            });
-        });
-    }
-}
-
-fn append_last_text(messages: &RwSignal<Vec<MsgEntry>>, text: &str) {
-    messages.update(|m| {
-        if let Some(UiBlock::Text { text: buf }) = m.last_mut().map(|e| &mut e.block) {
-            buf.update(|s| s.push_str(text));
-        }
-    });
-}
-
-fn append_last_thinking(messages: &RwSignal<Vec<MsgEntry>>, text: &str) {
-    messages.update(|m| {
-        if let Some(UiBlock::Thinking { text: buf }) = m.last_mut().map(|e| &mut e.block) {
-            buf.update(|s| s.push_str(text));
         }
     });
 }
@@ -390,8 +388,16 @@ fn for_each_card(messages: &RwSignal<Vec<MsgEntry>>, id: &str, f: &impl Fn(&mut 
     });
 }
 
-fn block_child(block: &UiBlock) -> AnyView {
-    match block {
+fn last_is_text(block: &UiBlock) -> bool {
+    matches!(block, UiBlock::Text { .. })
+}
+
+fn last_is_thinking(block: &UiBlock) -> bool {
+    matches!(block, UiBlock::Thinking { .. })
+}
+
+fn block_child(entry: &MsgEntry) -> AnyView {
+    match &entry.block {
         UiBlock::Thinking { text } => {
             let t = *text;
             view! { <div class="thinking">{move || (!t.get().is_empty()).then(|| t.get())}</div> }
@@ -431,9 +437,23 @@ fn block_child(block: &UiBlock) -> AnyView {
 
 /// Consecutive assistant-side blocks share one chat bubble, keeping the
 /// original order (thinking → text → tool cards → more text …).
-fn assistant_group(run: Vec<MsgEntry>) -> AnyView {
-    let children: Vec<AnyView> = run.iter().map(|e| block_child(&e.block)).collect();
-    view! { <div class="msg assistant">{children}</div> }.into_any()
+#[component]
+fn Bubble(group: Group) -> impl IntoView {
+    if group.starts_user() {
+        let content = match group.entries.first().map(|e| &e.block) {
+            Some(UiBlock::User { content }) => content.clone(),
+            _ => String::new(),
+        };
+        view! { <div class="msg user">{content}</div> }.into_any()
+    } else {
+        let entries = group.entries;
+        view! {
+            <div class="msg assistant">
+                <For each=move || entries.clone() key=|e: &MsgEntry| e.id children=move |e| block_child(&e)/>
+            </div>
+        }
+        .into_any()
+    }
 }
 
 #[component]
@@ -489,17 +509,23 @@ pub fn ChatPage() -> impl IntoView {
     let status_line = RwSignal::new(None::<String>);
     let active = RwSignal::new(None::<String>);
     let selected_agent = RwSignal::new(String::new());
+    let next_id = RwSignal::new(1u64);
+    let drawer_open = RwSignal::new(false);
+    let sidebar_w = sidebar_width();
 
-    // Auto-scroll bookkeeping: follow the stream only while the user is at
-    // (or near) the bottom of the buffer.
+    // Auto-scroll: follow the stream only while `follow` is engaged. Any
+    // user intent (wheel / touch / scrollbar grab) disengages it immediately
+    // and synchronously, so streaming never fights the user. Scrolling back
+    // to the bottom re-engages; sending a message or switching sessions
+    // resets it.
     let messages_el = NodeRef::<leptos::html::Div>::new();
-    let at_bottom = RwSignal::new(true);
+    let follow = RwSignal::new(true);
     let scroll_tick = RwSignal::new(0u64);
 
     Effect::new(move |_| {
         scroll_tick.get();
-        messages.get();
-        if !at_bottom.get() {
+        messages.track();
+        if !follow.get() {
             return;
         }
         if let Some(el) = messages_el.get() {
@@ -507,7 +533,7 @@ pub fn ChatPage() -> impl IntoView {
         }
     });
 
-    spawn_local(refresh_sessions_async(sessions));
+    spawn_local(async move { refresh_sessions_async(sessions).await });
     spawn_local(async move {
         if let Ok((_, v)) = api::get("/api/agents").await
             && let Some(list) = v.get("agents").and_then(|x| x.as_array())
@@ -527,9 +553,10 @@ pub fn ChatPage() -> impl IntoView {
             let messages = messages;
             let error = error;
             let scroll_tick = scroll_tick;
-            let at_bottom = at_bottom;
+            let follow = follow;
+            let next_id = next_id;
             spawn_local(async move {
-                load_history(&id, &messages, &error, &scroll_tick, &at_bottom).await;
+                load_history(&id, &messages, &error, &scroll_tick, &follow, &next_id).await;
             });
         } else {
             active.set(None);
@@ -553,6 +580,7 @@ pub fn ChatPage() -> impl IntoView {
     let go_to = RwSignal::new(None::<String>);
     Effect::new(move |_| {
         if let Some(target) = go_to.get() {
+            drawer_open.set(false);
             navigate(&target, Default::default());
             untrack(|| go_to.set(None));
         }
@@ -569,6 +597,8 @@ pub fn ChatPage() -> impl IntoView {
                 error,
                 status_line,
                 scroll_tick,
+                follow,
+                next_id,
             );
         }
     };
@@ -583,6 +613,7 @@ pub fn ChatPage() -> impl IntoView {
                 && status == 201
                 && let Some(id) = v.get("session_id").and_then(|x| x.as_str())
             {
+                refresh_sessions_async(sessions).await;
                 go_to.set(Some(format!("/chat/{id}")));
             }
         });
@@ -614,10 +645,11 @@ pub fn ChatPage() -> impl IntoView {
             let messages = messages;
             let error = error;
             let scroll_tick = scroll_tick;
-            let at_bottom = at_bottom;
+            let follow = follow;
+            let next_id = next_id;
             spawn_local(async move {
                 let _ = api::post(&format!("/api/sessions/{id}/reset"), &json!({})).await;
-                load_history(&id, &messages, &error, &scroll_tick, &at_bottom).await;
+                load_history(&id, &messages, &error, &scroll_tick, &follow, &next_id).await;
             });
         }
     };
@@ -627,29 +659,11 @@ pub fn ChatPage() -> impl IntoView {
             let messages = messages;
             let error = error;
             let scroll_tick = scroll_tick;
-            let at_bottom = at_bottom;
+            let follow = follow;
+            let next_id = next_id;
             spawn_local(async move {
                 let _ = api::post(&format!("/api/sessions/{id}/compact"), &json!({})).await;
-                load_history(&id, &messages, &error, &scroll_tick, &at_bottom).await;
-            });
-        }
-    };
-
-    let migrate_session = move || {
-        if let Some(id) = active.get() {
-            let messages = messages;
-            let error = error;
-            let scroll_tick = scroll_tick;
-            let at_bottom = at_bottom;
-            spawn_local(async move {
-                let (_, v) = api::post(&format!("/api/sessions/{id}/migrate"), &json!({}))
-                    .await
-                    .unwrap_or((0, Value::Null));
-                if v.get("error").is_some() {
-                    error.set(v.get("error").and_then(|e| e.as_str()).map(String::from));
-                }
-                refresh_sessions_async(sessions).await;
-                load_history(&id, &messages, &error, &scroll_tick, &at_bottom).await;
+                load_history(&id, &messages, &error, &scroll_tick, &follow, &next_id).await;
             });
         }
     };
@@ -664,11 +678,14 @@ pub fn ChatPage() -> impl IntoView {
             .map(|s| s.agent.clone())
             .unwrap_or_default()
     });
-    let _ = &session_id;
 
     view! {
         <div class="app">
-            <aside class="sidebar">
+            <aside
+                class="sidebar"
+                class:open=drawer_open
+                style:width=move || format!("{}px", sidebar_w.get())
+            >
                 <div class="brand-row">
                     <h1>"Carson"</h1>
                     <div class="sub">"Chat"</div>
@@ -710,6 +727,9 @@ pub fn ChatPage() -> impl IntoView {
                 <a class="admin-link" href="/admin">"Admin"</a>
             </aside>
 
+            <DragRail width=sidebar_w/>
+            <MenuButton open=drawer_open/>
+
             <main class="main">
                 {move || {
                     if active.get().is_some() {
@@ -730,8 +750,6 @@ pub fn ChatPage() -> impl IntoView {
                                 </button>
                                 <button class="btn" on:click=move |_| reset_session()>"Reset"</button>
                                 <button class="btn" on:click=move |_| compact_session()>"Compact"</button>
-                                <button class="btn" title="Move this session onto the agent's current version"
-                                    on:click=move |_| migrate_session()>"Migrate"</button>
                                 <button class="btn danger" on:click=move |_| {
                                     if let Some(id) = active.get() {
                                         delete_session(id);
@@ -745,30 +763,14 @@ pub fn ChatPage() -> impl IntoView {
                                     if let Some(el) = messages_el.get() {
                                         let near = el.scroll_top() + el.client_height()
                                             >= el.scroll_height() - 48;
-                                        at_bottom.set(near);
+                                        follow.set(near);
                                     }
                                 }
+                                on:wheel=move |_| follow.set(false)
+                                on:touchstart=move |_| follow.set(false)
+                                on:mousedown=move |_| follow.set(false)
                             >
-                                {move || {
-                                    let entries = messages.get();
-                                    let mut out: Vec<AnyView> = Vec::new();
-                                    let mut run: Vec<MsgEntry> = Vec::new();
-                                    for e in entries {
-                                        match e.block {
-                                            UiBlock::User { .. } => {
-                                                if !run.is_empty() {
-                                                    out.push(assistant_group(std::mem::take(&mut run)));
-                                                }
-                                                out.push(block_child(&e.block));
-                                            }
-                                            _ => run.push(e),
-                                        }
-                                    }
-                                    if !run.is_empty() {
-                                        out.push(assistant_group(run));
-                                    }
-                                    out
-                                }}
+                                <For each=move || bubble_groups(messages.get()) key=|g: &Group| g.id children=move |g| view! { <Bubble group=g/> }/>
                             </div>
                             <div class="composer">
                                 <textarea
@@ -813,12 +815,8 @@ pub fn ChatPage() -> impl IntoView {
                                                         let names: Vec<String> = agents
                                                             .get()
                                                             .iter()
-                                                            .filter_map(|a| {
-                                                                a.get("name")
-                                                                    .and_then(|k| k.as_str())
-                                                                    .map(|k| k.to_string())
-                                                            })
-                                                            .collect();
+                                                            .map(|a| str_of(a, "name"))
+                                                            .collect::<Vec<_>>();
                                                         names
                                                             .into_iter()
                                                             .map(|name| {
@@ -842,6 +840,7 @@ pub fn ChatPage() -> impl IntoView {
                     }
                 }}
             </main>
+            <DrawerBackdrop open=drawer_open/>
         </div>
     }
 }

@@ -354,13 +354,13 @@ async fn agent_crud_via_api() {
     assert_eq!(versions["total"], 2);
 }
 
-/// Updating an agent never disturbs existing sessions: they stay pinned to the
-/// version that created them until explicitly migrated.
+/// Sessions resolve their agent by name on every turn: after the name is
+/// repointed, the next message runs against the new version's config while
+/// prior blocks stay in the log.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn updating_an_agent_pins_existing_sessions_to_their_version() {
+async fn sessions_follow_the_current_agent_version() {
     let app = app().await;
 
-    // Create an agent with two versions and a session on the first one.
     let (status, created) = post(
         &app,
         "/api/agents",
@@ -374,7 +374,7 @@ async fn updating_an_agent_pins_existing_sessions_to_their_version() {
     let session_id = sess["session_id"].as_str().unwrap().to_string();
     assert_eq!(sess["agent_version_id"], json!(v1));
 
-    // Repoint: v2 drops the time capability entirely.
+    // Repoint: v2 drops every capability.
     let (status, updated) = put(
         &app,
         "/api/agents/writer",
@@ -385,15 +385,17 @@ async fn updating_an_agent_pins_existing_sessions_to_their_version() {
     let v2 = updated["version_id"].as_str().unwrap().to_string();
     assert_ne!(v1, v2);
 
-    // New sessions land on v2; existing ones stay on v1.
+    // New sessions land on v2 immediately.
     let (_, new_sess) = post(&app, "/api/sessions", r#"{"agent":"writer"}"#).await;
     assert_eq!(new_sess["agent_version_id"], json!(v2));
-    let (_, old_view) = get(&app, &format!("/api/sessions/{session_id}")).await;
-    let view: Value = serde_json::from_str(&old_view).unwrap();
-    assert_eq!(view["agent_version_id"], json!(v1));
-    assert_eq!(view["model"], "mock/mock");
 
-    // The pinned session still streams fine against its original version.
+    // The existing session still reports its pinned version until its next
+    // turn syncs it.
+    let (_, view) = get(&app, &format!("/api/sessions/{session_id}")).await;
+    let view: Value = serde_json::from_str(&view).unwrap();
+    assert_eq!(view["agent_version_id"], json!(v1));
+
+    // The next message migrates it onto v2 and keeps the block history.
     let (status, body) = post_raw(
         &app,
         &format!("/api/sessions/{session_id}/stream"),
@@ -403,14 +405,16 @@ async fn updating_an_agent_pins_existing_sessions_to_their_version() {
     assert_eq!(status, 200);
     assert!(body.contains("Echo: "), "{body}");
 
-    // Migrate moves it onto the current version.
-    let (status, migrated) = post(&app, &format!("/api/sessions/{session_id}/migrate"), "{}").await;
-    assert_eq!(status, 200, "{migrated}");
-    assert_eq!(migrated["agent_version_id"], json!(v2));
-
-    let (_, old_view) = get(&app, &format!("/api/sessions/{session_id}")).await;
-    let view: Value = serde_json::from_str(&old_view).unwrap();
+    let (_, view) = get(&app, &format!("/api/sessions/{session_id}")).await;
+    let view: Value = serde_json::from_str(&view).unwrap();
     assert_eq!(view["agent_version_id"], json!(v2));
+    let kinds: Vec<&str> = view["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds.first(), Some(&"user"), "history preserved: {kinds:?}");
 }
 
 /// Deleting an agent removes only the pointer; its versions and pinned
