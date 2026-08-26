@@ -16,7 +16,7 @@ struct ChatParams {
 /// One rendered conversation block, in chronological order. Streaming appends
 /// new blocks as they arrive so thinking, text and tool cards interleave
 /// exactly like the persisted log.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum UiBlock {
     User { content: String },
     Thinking { text: RwSignal<String> },
@@ -198,40 +198,38 @@ async fn load_history(
 fn stream_text(
     messages: &RwSignal<Vec<MsgEntry>>,
     next_id: &RwSignal<u64>,
+    now: u64,
     matches_kind: impl Fn(&UiBlock) -> bool,
     make: impl FnOnce() -> UiBlock,
-    extract: fn(&mut UiBlock) -> Option<&mut RwSignal<String>>,
+    extract: fn(&UiBlock) -> Option<RwSignal<String>>,
     text: &str,
 ) {
     // Signals are created OUTSIDE any update closure and ids are allocated
     // before entering the borrow: nested signal writes were trapping wasm
     // mid-stream.
-    let last_matches = messages.with_untracked(|m| m.last().map(|e| matches_kind(&e.block)));
-    if !last_matches.unwrap_or(false) {
+    let last = messages.with_untracked(|m| {
+        m.last()
+            .map(|e| (matches_kind(&e.block), extract(&e.block)))
+            .unwrap_or((false, None))
+    });
+    if !last.0 {
         let id = alloc_id(next_id);
-        let times = RwSignal::new((now_ms(), 0));
+        let times = RwSignal::new((now, 0));
         let block = make();
         messages.update(|m| m.push(MsgEntry { id, times, block }));
     }
-    append_last(messages, text, extract);
+    // Re-resolve AFTER the possible push so a freshly created block receives
+    // its first chunk too; the handle keeps every write outside any borrow.
+    let buf = messages.with_untracked(|m| m.last().and_then(|e| extract(&e.block)));
+    if let Some(buf) = buf {
+        buf.update(|s| s.push_str(text));
+    }
 }
 
-fn append_last(
-    messages: &RwSignal<Vec<MsgEntry>>,
-    text: &str,
-    extract: fn(&mut UiBlock) -> Option<&mut RwSignal<String>>,
-) {
-    messages.update(|m| {
-        if let Some(buf) = m.last_mut().and_then(|e| extract(&mut e.block)) {
-            buf.update(|s| s.push_str(text));
-        }
-    });
-}
-
-#[allow(clippy::too_many_arguments)]
-fn send(
-    session_id: String,
-    input: RwSignal<String>,
+/// The signals a chat page owns, bundled so streaming logic and the view
+/// share one handle instead of an ever-growing parameter list.
+#[derive(Clone, Copy)]
+struct ChatSignals {
     messages: RwSignal<Vec<MsgEntry>>,
     running: RwSignal<bool>,
     usage: RwSignal<Option<String>>,
@@ -241,14 +239,145 @@ fn send(
     follow: RwSignal<bool>,
     at_latest: RwSignal<bool>,
     next_id: RwSignal<u64>,
-) {
+}
+
+/// What a single SSE frame asked the page to do beyond mutating blocks.
+#[derive(Debug, PartialEq)]
+enum EventOutcome {
+    /// chunk / thinking / tool events mutated blocks in place.
+    Silent,
+    Status(String),
+    Error(String),
+    /// `finished_ms` stamps any still-open blocks; `usage_text` is the
+    /// formatted usage summary when the payload carried one.
+    Done {
+        finished_ms: u64,
+        usage_text: Option<String>,
+    },
+}
+
+/// Apply one SSE frame to the streaming state. Returns the outcome for the
+/// caller to surface (status/error/usage/done), keeping every signal write
+/// inside a single `batch()` so no borrow outlives its guard.
+fn apply_stream_event(st: &ChatSignals, now: u64, ev: &sse::SseEvent) -> EventOutcome {
+    let messages = st.messages;
+    let next_id = st.next_id;
+    match ev.event.as_str() {
+        "chunk" => {
+            let text = serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
+            stream_text(
+                &messages,
+                &next_id,
+                now,
+                last_is_text,
+                || UiBlock::Text {
+                    text: RwSignal::new(String::new()),
+                },
+                |block| match block {
+                    UiBlock::Text { text } => Some(*text),
+                    _ => None,
+                },
+                &text,
+            );
+            st.scroll_tick.update(|t| *t += 1);
+            EventOutcome::Silent
+        }
+        "thinking" => {
+            let text = serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
+            stream_text(
+                &messages,
+                &next_id,
+                now,
+                last_is_thinking,
+                || UiBlock::Thinking {
+                    text: RwSignal::new(String::new()),
+                },
+                |block| match block {
+                    UiBlock::Thinking { text } => Some(*text),
+                    _ => None,
+                },
+                &text,
+            );
+            st.scroll_tick.update(|t| *t += 1);
+            EventOutcome::Silent
+        }
+        "tool_use" => {
+            if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
+                let id = alloc_id(&next_id);
+                let times = RwSignal::new((now, 0));
+                let card = RwSignal::new(ToolCard {
+                    id: str_of(&v, "id"),
+                    name: str_of(&v, "name"),
+                    ..Default::default()
+                });
+                messages.update(|m| {
+                    m.push(MsgEntry {
+                        id,
+                        times,
+                        block: UiBlock::ToolUse { card },
+                    });
+                });
+            }
+            st.scroll_tick.update(|t| *t += 1);
+            EventOutcome::Silent
+        }
+        "tool_args" => {
+            if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
+                let tid = str_of(&v, "id");
+                let args = str_of(&v, "arguments");
+                for_each_card(&messages, &tid, &|card| {
+                    card.arguments = args.clone();
+                });
+            }
+            EventOutcome::Silent
+        }
+        "tool_result" => {
+            if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
+                let tid = str_of(&v, "id");
+                let preview = truncate(&str_of(&v, "result_preview"), 500);
+                let is_error = v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
+                for_each_card(&messages, &tid, &|card| {
+                    card.result = Some(preview.clone());
+                    card.is_error = is_error;
+                });
+            }
+            EventOutcome::Silent
+        }
+        "status" => {
+            let text = serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
+            EventOutcome::Status(text)
+        }
+        "error" => {
+            let msg = serde_json::from_str::<Value>(&ev.data)
+                .ok()
+                .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
+                .unwrap_or_else(|| ev.data.clone());
+            EventOutcome::Error(msg)
+        }
+        "done" => {
+            let usage_text = serde_json::from_str::<Value>(&ev.data)
+                .ok()
+                .and_then(|v| v.get("usage").cloned())
+                .map(|usage| fmt_usage(&usage));
+            EventOutcome::Done {
+                finished_ms: now,
+                usage_text,
+            }
+        }
+        _ => EventOutcome::Silent,
+    }
+}
+
+/// Stream a user message: push the user entry, then apply frames as they
+/// arrive and surface their outcomes.
+fn send(session_id: String, input: RwSignal<String>, st: ChatSignals) {
     let text = input.get().trim().to_string();
-    if text.is_empty() || running.get() {
+    if text.is_empty() || st.running.get() {
         return;
     }
-    let id = alloc_id(&next_id);
+    let id = alloc_id(&st.next_id);
     let times = RwSignal::new((now_ms(), 0));
-    messages.update(|m| {
+    st.messages.update(|m| {
         m.push(MsgEntry {
             id,
             times,
@@ -258,134 +387,55 @@ fn send(
         });
     });
     input.set(String::new());
-    running.set(true);
-    usage.set(None);
-    error.set(None);
-    status_line.set(None);
+    st.running.set(true);
+    st.usage.set(None);
+    st.error.set(None);
+    st.status_line.set(None);
     // The user asked for this reply; follow it regardless of prior scroll.
-    follow.set(true);
-    at_latest.set(true);
-    scroll_tick.update(|t| *t += 1);
+    st.follow.set(true);
+    st.at_latest.set(true);
+    st.scroll_tick.update(|t| *t += 1);
 
     let path = format!("/api/sessions/{session_id}/stream");
     let body = json!({ "content": text });
     spawn_local(async move {
-        let result = sse::stream_post(&path, &body, move |ev| match ev.event.as_str() {
-            "chunk" => {
-                let text =
-                    serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
-                stream_text(
-                    &messages,
-                    &next_id,
-                    last_is_text,
-                    || UiBlock::Text {
-                        text: RwSignal::new(String::new()),
-                    },
-                    |block| match block {
-                        UiBlock::Text { text } => Some(text),
-                        _ => None,
-                    },
-                    &text,
-                );
-                scroll_tick.update(|t| *t += 1);
-            }
-            "thinking" => {
-                let text =
-                    serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
-                stream_text(
-                    &messages,
-                    &next_id,
-                    last_is_thinking,
-                    || UiBlock::Thinking {
-                        text: RwSignal::new(String::new()),
-                    },
-                    |block| match block {
-                        UiBlock::Thinking { text } => Some(text),
-                        _ => None,
-                    },
-                    &text,
-                );
-                scroll_tick.update(|t| *t += 1);
-            }
-            "tool_use" => {
-                if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
-                    let id = alloc_id(&next_id);
-                    let times = RwSignal::new((now_ms(), 0));
-                    let card = RwSignal::new(ToolCard {
-                        id: str_of(&v, "id"),
-                        name: str_of(&v, "name"),
-                        ..Default::default()
-                    });
-                    messages.update(|m| {
-                        m.push(MsgEntry {
-                            id,
-                            times,
-                            block: UiBlock::ToolUse { card },
-                        });
-                    });
-                    scroll_tick.update(|t| *t += 1);
+        let result = sse::stream_post(&path, &body, move |ev| {
+            match apply_stream_event(&st, now_ms(), &ev) {
+                EventOutcome::Status(text) => st.status_line.set(Some(text)),
+                EventOutcome::Error(msg) => st.error.set(Some(msg)),
+                EventOutcome::Done {
+                    finished_ms,
+                    usage_text,
+                } => {
+                    if let Some(text) = usage_text {
+                        st.usage.set(Some(text));
+                    }
+                    finish_open_blocks(&st.messages, finished_ms);
+                    st.scroll_tick.update(|t| *t += 1);
+                    st.running.set(false);
                 }
+                EventOutcome::Silent => {}
             }
-            "tool_args" => {
-                if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
-                    let tid = str_of(&v, "id");
-                    let args = str_of(&v, "arguments");
-                    for_each_card(&messages, &tid, &|card| {
-                        card.arguments = args.clone();
-                    });
-                }
-            }
-            "tool_result" => {
-                if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
-                    let tid = str_of(&v, "id");
-                    let preview = truncate(&str_of(&v, "result_preview"), 500);
-                    let is_error = v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
-                    for_each_card(&messages, &tid, &|card| {
-                        card.result = Some(preview.clone());
-                        card.is_error = is_error;
-                    });
-                }
-            }
-            "status" => {
-                let text =
-                    serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
-                status_line.set(Some(text));
-            }
-            "error" => {
-                let msg = serde_json::from_str::<Value>(&ev.data)
-                    .ok()
-                    .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
-                    .unwrap_or_else(|| ev.data.clone());
-                error.set(Some(msg));
-            }
-            "done" => {
-                if let Ok(v) = serde_json::from_str::<Value>(&ev.data)
-                    && let Some(u) = v.get("usage")
-                {
-                    usage.set(Some(fmt_usage(u)));
-                }
-                // Stamp finish time on blocks still open (finished == 0).
-                let finished = now_ms();
-                let open: Vec<RwSignal<(u64, u64)>> = messages.with_untracked(|m| {
-                    m.iter()
-                        .filter(|e| e.times.get_untracked().1 == 0)
-                        .map(|e| e.times)
-                        .collect()
-                });
-                for t in open {
-                    t.update(|(_created, fin)| *fin = finished);
-                }
-                scroll_tick.update(|t| *t += 1);
-                running.set(false);
-            }
-            _ => {}
         })
         .await;
-        running.set(false);
+        st.running.set(false);
         if let Err(e) = result {
-            error.set(Some(e));
+            st.error.set(Some(e));
         }
     });
+}
+
+/// Stamp `finished` on every block still open (`finished == 0`).
+fn finish_open_blocks(messages: &RwSignal<Vec<MsgEntry>>, finished: u64) {
+    let open: Vec<RwSignal<(u64, u64)>> = messages.with_untracked(|m| {
+        m.iter()
+            .filter(|e| e.times.get_untracked().1 == 0)
+            .map(|e| e.times)
+            .collect()
+    });
+    for t in open {
+        t.update(|(_created, fin)| *fin = finished);
+    }
 }
 
 fn for_each_card(messages: &RwSignal<Vec<MsgEntry>>, id: &str, f: &impl Fn(&mut ToolCard)) {
@@ -453,8 +503,24 @@ fn block_child(entry: &MsgEntry) -> AnyView {
     }
 }
 
+/// Pure transition for one scroll event: returns `(at_latest, follow)`.
+/// Echoes of our own pins (inside the suppression window) are ignored.
+fn scroll_update(
+    now: f64,
+    pinned_until: f64,
+    near: bool,
+    follow: bool,
+    at_latest: bool,
+) -> (bool, bool) {
+    if now < pinned_until {
+        return (at_latest, follow);
+    }
+    if near { (true, true) } else { (false, follow) }
+}
+
 fn fmt_clock(ms: u64) -> String {
-    let d = js_sys::Date::new(&ms.into());
+    // u64 converts to a JS BigInt, which `new Date` rejects; go through f64.
+    let d = js_sys::Date::new(&(ms as f64).into());
     format!(
         "{:02}:{:02}:{:02}",
         d.get_hours(),
@@ -465,6 +531,19 @@ fn fmt_clock(ms: u64) -> String {
 
 /// Muted per-card timestamp: local clock on creation plus a duration when
 /// finishing took a measurable amount of time. Hover shows the full ISO.
+/// Duration-aware label: injected clock formatter keeps this testable off-wasm.
+fn time_label(created: u64, finished: u64, fmt_clock: impl Fn(u64) -> String) -> Option<String> {
+    if created == 0 {
+        return None;
+    }
+    let mut label = fmt_clock(created);
+    if finished > created + 1000 {
+        let dur = (finished - created) as f64 / 1000.0;
+        label.push_str(&format!(" · {dur:.1}s"));
+    }
+    Some(label)
+}
+
 fn time_footer(times: RwSignal<(u64, u64)>) -> AnyView {
     view! {
         <div class="msg-time" title=move || {
@@ -473,15 +552,7 @@ fn time_footer(times: RwSignal<(u64, u64)>) -> AnyView {
         }>
             {move || {
                 let (created, finished) = times.get();
-                if created == 0 {
-                    None
-                } else {
-                    let mut label = fmt_clock(created);
-                    if finished > created + 1000 {
-                        label.push_str(&format!(" \u{b7} {:.1}s", (finished - created) as f64 / 1000.0));
-                    }
-                    Some(label)
-                }
+                time_label(created, finished, fmt_clock)
             }}
         </div>
     }
@@ -525,19 +596,20 @@ fn render_md(text: &str) -> String {
     sanitize_hrefs(&html)
 }
 
+/// Replace non-`http(s)` link targets with `#`, preserving attribute
+/// structure for every other attribute and tag.
 fn sanitize_hrefs(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
-    while let Some(rel) = rest.find("href=\"") {
-        out.push_str(&rest[..rel]);
-        rest = &rest[rel + "href=\"".len()..];
-        let end = rest.find('"').map(|i| i + 1).unwrap_or(rest.len());
-        let (url, after) = rest.split_at(end);
-        let inner = url.strip_prefix('"').unwrap_or(url);
-        let blocked = inner.to_ascii_lowercase().starts_with("javascript:")
-            || inner.to_ascii_lowercase().starts_with("data:");
-        out.push_str(if blocked { "#\"" } else { url });
-        rest = after;
+    while let Some(start) = rest.find("href=\"") {
+        out.push_str(&rest[..start + "href=\"".len()]);
+        rest = &rest[start + "href=\"".len()..];
+        let end = rest.find('"').unwrap_or(rest.len());
+        let url = &rest[..end];
+        let blocked = url.starts_with("javascript:") || url.starts_with("data:");
+        out.push_str(if blocked { "#" } else { url });
+        out.push('"');
+        rest = &rest[end + 1..];
     }
     out.push_str(rest);
     out
@@ -575,6 +647,18 @@ pub fn ChatPage() -> impl IntoView {
     // mislabel visibility.
     let pinned_until = RwSignal::new(0f64);
     let scroll_tick = RwSignal::new(0u64);
+
+    let stream_signals = ChatSignals {
+        messages,
+        running,
+        usage,
+        error,
+        status_line,
+        scroll_tick,
+        follow,
+        at_latest,
+        next_id,
+    };
 
     Effect::new(move |_| {
         scroll_tick.get();
@@ -659,19 +743,7 @@ pub fn ChatPage() -> impl IntoView {
 
     let do_send = move || {
         if let Some(id) = active.get() {
-            send(
-                id,
-                input,
-                messages,
-                running,
-                usage,
-                error,
-                status_line,
-                scroll_tick,
-                follow,
-                at_latest,
-                next_id,
-            );
+            send(id, input, stream_signals);
         }
     };
 
@@ -855,18 +927,18 @@ pub fn ChatPage() -> impl IntoView {
                                     on:touchstart=move |_| follow.set(false)
                                     on:mousedown=move |_| follow.set(false)
                                     on:scroll=move |_| {
-                                        if js_sys::Date::now() < pinned_until.get_untracked() {
-                                            return; // our own pin echoing back
-                                        }
                                         let Some(el) = messages_el.get() else { return };
                                         let near = el.scroll_top() + el.client_height()
                                             >= el.scroll_height() - 48;
-                                        at_latest.set(near);
-                                        // Genuine manual return to the bottom
-                                        // resumes following.
-                                        if near && !follow.get_untracked() {
-                                            follow.set(true);
-                                        }
+                                        let (a, f) = scroll_update(
+                                            js_sys::Date::now(),
+                                            pinned_until.get_untracked(),
+                                            near,
+                                            follow.get_untracked(),
+                                            at_latest.get_untracked(),
+                                        );
+                                        at_latest.set(a);
+                                        follow.set(f);
                                     }
                                 >
                                     <For each=move || messages.get() key=|e: &MsgEntry| e.id children=move |e| entry_view(&e)/>
@@ -965,5 +1037,337 @@ async fn refresh_sessions_async(sessions: RwSignal<Vec<SessionSummary>>) {
                 .filter_map(|s| serde_json::from_value::<SessionSummary>(s.clone()).ok())
                 .collect(),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_block_signal() -> UiBlock {
+        UiBlock::Text {
+            text: RwSignal::new(String::new()),
+        }
+    }
+
+    fn text_extract(block: &UiBlock) -> Option<RwSignal<String>> {
+        match block {
+            UiBlock::Text { text } => Some(*text),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn stream_text_opens_blocks_on_kind_switch_and_appends_within_kind() {
+        let messages = RwSignal::new(Vec::<MsgEntry>::new());
+        let next_id = RwSignal::new(0u64); // first allocated id is 1
+
+        stream_text(
+            &messages,
+            &next_id,
+            1000,
+            last_is_thinking,
+            || UiBlock::Thinking {
+                text: RwSignal::new(String::new()),
+            },
+            |block| match block {
+                UiBlock::Thinking { text } => Some(*text),
+                _ => None,
+            },
+            "let me ",
+        );
+        stream_text(
+            &messages,
+            &next_id,
+            1050,
+            last_is_thinking,
+            || UiBlock::Thinking {
+                text: RwSignal::new(String::new()),
+            },
+            |block| match block {
+                UiBlock::Thinking { text } => Some(*text),
+                _ => None,
+            },
+            "think",
+        );
+        stream_text(
+            &messages,
+            &next_id,
+            1100,
+            last_is_text,
+            || UiBlock::Text {
+                text: RwSignal::new(String::new()),
+            },
+            text_extract,
+            "Hello",
+        );
+
+        let entries = messages.get_untracked();
+        assert_eq!(entries.len(), 2, "kind switch opens a new block");
+        assert_eq!(entries[0].id, 1);
+        match &entries[0].block {
+            UiBlock::Thinking { text } => assert_eq!(text.get_untracked(), "let me think"),
+            other => panic!("expected thinking, got {other:?}"),
+        }
+        assert_eq!(entries[0].times.get_untracked(), (1000, 0));
+        assert_eq!(entries[1].id, 2);
+        match &entries[1].block {
+            UiBlock::Text { text } => assert_eq!(text.get_untracked(), "Hello"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finish_open_blocks_stamps_only_open_entries() {
+        let messages = RwSignal::new(Vec::<MsgEntry>::new());
+        messages.set(vec![
+            MsgEntry {
+                id: 1,
+                times: RwSignal::new((10, 0)),
+                block: text_block_signal(),
+            },
+            MsgEntry {
+                id: 2,
+                times: RwSignal::new((20, 25)),
+                block: text_block_signal(),
+            },
+        ]);
+
+        finish_open_blocks(&messages, 99);
+
+        let entries = messages.get_untracked();
+        assert_eq!(entries[0].times.get_untracked(), (10, 99));
+        assert_eq!(
+            entries[1].times.get_untracked(),
+            (20, 25),
+            "already finished untouched"
+        );
+    }
+
+    fn history_fixture() -> Value {
+        json!({
+            "messages": [
+                {"kind": "user", "text": "hi", "created_at_ms": 1000, "finished_at_ms": 1000},
+                {"kind": "thinking", "text": "reasoning", "created_at_ms": 2000, "finished_at_ms": 2500},
+                {"kind": "tool-use", "tool_call_id": "c1", "tool_name": "time",
+                 "arguments": "{}", "created_at_ms": 3000, "finished_at_ms": 3000},
+                {"kind": "tool-result", "text": "12:00:00", "tool_call_id": "c1",
+                 "created_at_ms": 4000, "finished_at_ms": 4500},
+                {"kind": "text", "text": "done", "created_at_ms": 5000, "finished_at_ms": 6000}
+            ]
+        })
+    }
+
+    #[test]
+    fn build_history_parses_blocks_payloads_and_links_results() {
+        let next_id = RwSignal::new(1u64);
+        let entries = build_history(&history_fixture(), &next_id);
+
+        // tool-result attaches to the existing card instead of adding one.
+        assert_eq!(entries.len(), 4);
+        assert!(
+            entries
+                .iter()
+                .zip(entries.iter().skip(1))
+                .all(|(a, b)| a.id < b.id)
+        );
+
+        assert!(matches!(entries[0].block, UiBlock::User { ref content } if content == "hi"));
+        assert_eq!(entries[0].times.get_untracked(), (1000, 1000));
+
+        match &entries[2].block {
+            UiBlock::ToolUse { card } => {
+                let c = card.get_untracked();
+                assert_eq!(c.id, "c1");
+                assert_eq!(c.name, "time");
+                assert_eq!(c.arguments, "{}");
+                assert_eq!(c.result.as_deref(), Some("12:00:00"));
+                assert!(!c.is_error);
+            }
+            other => panic!("expected tool-use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_history_marks_error_results() {
+        let mut v = history_fixture();
+        v["messages"][3]["text"] = json!("boom");
+        v["messages"][3]["is_error"] = json!(true);
+        let next_id = RwSignal::new(1u64);
+        let entries = build_history(&v, &next_id);
+        match &entries[2].block {
+            UiBlock::ToolUse { card } => {
+                let c = card.get_untracked();
+                assert_eq!(c.result.as_deref(), Some("boom"));
+                assert!(c.is_error);
+            }
+            other => panic!("expected tool-use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scroll_update_ignores_suppressed_echoes() {
+        // Our own pin echoing back inside the suppression window changes
+        // nothing — this is the exact race that used to yank the user down.
+        assert_eq!(scroll_update(500.0, 600.0, true, true, true), (true, true));
+        assert_eq!(
+            scroll_update(500.0, 600.0, true, false, false),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn scroll_update_disengages_when_scrolled_away() {
+        assert_eq!(scroll_update(1000.0, 0.0, false, true, true), (false, true));
+    }
+
+    #[test]
+    fn scroll_update_resumes_follow_on_genuine_bottom_hit() {
+        assert_eq!(scroll_update(1000.0, 0.0, true, false, false), (true, true));
+    }
+
+    #[test]
+    fn time_label_composition() {
+        let fmt = |ms: u64| format!("c{ms}");
+        assert_eq!(time_label(0, 0, fmt), None);
+        assert_eq!(time_label(1000, 1500, fmt), Some("c1000".to_string()));
+        let long = time_label(1000, 3000, fmt).unwrap();
+        assert!(
+            long.starts_with("c1000") && long.ends_with("2.0s"),
+            "{long}"
+        );
+    }
+
+    #[test]
+    fn truncate_is_char_safe() {
+        assert_eq!(truncate("hello", 4), "hell…");
+        let multibyte = "héllo wörld";
+        assert_eq!(truncate(multibyte, 6), "héllo…");
+    }
+
+    #[test]
+    fn sanitize_hrefs_blocks_script_and_data() {
+        let html = r#"<a href="javascript:alert(1)">x</a><a href="https://ok">y</a>"#;
+        let out = sanitize_hrefs(html);
+        assert!(out.contains(r##"<a href="#">x</a>"##), "{out}");
+        assert!(out.contains(r##"<a href="https://ok">y</a>"##), "{out}");
+    }
+
+    fn chat_signals() -> ChatSignals {
+        ChatSignals {
+            messages: RwSignal::new(Vec::<MsgEntry>::new()),
+            running: RwSignal::new(false),
+            usage: RwSignal::new(None),
+            error: RwSignal::new(None),
+            status_line: RwSignal::new(None),
+            scroll_tick: RwSignal::new(0),
+            follow: RwSignal::new(true),
+            at_latest: RwSignal::new(true),
+            next_id: RwSignal::new(0u64),
+        }
+    }
+
+    fn ev(event: &str, data: &str) -> sse::SseEvent {
+        sse::SseEvent {
+            event: event.to_string(),
+            data: data.to_string(),
+        }
+    }
+
+    #[test]
+    fn apply_stream_event_creates_and_fills_tool_cards() {
+        let st = chat_signals();
+        assert!(matches!(
+            apply_stream_event(&st, 1000, &ev("tool_use", r#"{"id":"c1","name":"time"}"#)),
+            EventOutcome::Silent
+        ));
+
+        // First card's identity lands immediately.
+        let entries = st.messages.get_untracked();
+        assert_eq!(entries.len(), 1);
+        match &entries[0].block {
+            UiBlock::ToolUse { card } => {
+                assert_eq!(card.get_untracked().id, "c1");
+                assert_eq!(card.get_untracked().name, "time");
+            }
+            other => panic!("expected tool-use, got {other:?}"),
+        }
+
+        // Arguments stream in, then the result (error-flagged) attaches.
+        apply_stream_event(
+            &st,
+            1100,
+            &ev("tool_args", r#"{"id":"c1","arguments":"{}"}"#),
+        );
+        apply_stream_event(
+            &st,
+            1200,
+            &ev(
+                "tool_result",
+                r#"{"id":"c1","result_preview":"12:00","is_error":true}"#,
+            ),
+        );
+        let entries = st.messages.get_untracked();
+        match &entries[0].block {
+            UiBlock::ToolUse { card } => {
+                let c = card.get_untracked();
+                assert_eq!(c.arguments, "{}");
+                assert_eq!(c.result.as_deref(), Some("12:00"));
+                assert!(c.is_error);
+            }
+            other => panic!("expected tool-use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_stream_event_surfaces_status_error_and_done() {
+        let st = chat_signals();
+        assert!(matches!(
+            apply_stream_event(&st, 0, &ev("status", "\"compacted: 3 summarized\"")),
+            EventOutcome::Status(text) if text == "compacted: 3 summarized"
+        ));
+        assert!(matches!(
+            apply_stream_event(&st, 0, &ev("error", "{\"message\":\"boom\"}")),
+            EventOutcome::Error(msg) if msg == "boom"
+        ));
+        // done stamps open blocks and returns usage text.
+        apply_stream_event(&st, 900, &ev("chunk", "\"Hel\""));
+        let out = apply_stream_event(
+            &st,
+            2000,
+            &ev(
+                "done",
+                r#"{"done":true,"usage":{"input_tokens":3,"cache_read_tokens":2,"cache_creation_tokens":1,"output_tokens":4}}"#,
+            ),
+        );
+        let finished_ms = match out {
+            EventOutcome::Done {
+                finished_ms,
+                usage_text,
+            } => {
+                assert!(finished_ms > 0);
+                assert_eq!(
+                    usage_text.as_deref(),
+                    Some("in 3 | cache read 2 + write 1 | out 4")
+                );
+                finished_ms
+            }
+            other => panic!("expected Done, got {other:?}"),
+        };
+        // send() performs the finishing pass after receiving Done.
+        finish_open_blocks(&st.messages, finished_ms);
+        let entries = st.messages.get_untracked();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].times.get_untracked().1 > 0,
+            "open block stamped finished"
+        );
+    }
+
+    #[test]
+    fn fmt_usage_renders_all_fields() {
+        let u = json!({"input_tokens": 3, "cache_read_tokens": 2,
+                       "cache_creation_tokens": 1, "output_tokens": 4});
+        assert_eq!(fmt_usage(&u), "in 3 | cache read 2 + write 1 | out 4");
     }
 }

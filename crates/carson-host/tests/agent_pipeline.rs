@@ -120,7 +120,6 @@ async fn chat_streams_the_echo_reply() {
     assert!(!items.iter().any(|i| i.event == "thinking"));
 }
 
-#[allow(clippy::needless_borrow)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_loop_invokes_time_and_continues() {
     let (hub, _registry, instance) = setup().await;
@@ -141,7 +140,7 @@ async fn tool_loop_invokes_time_and_continues() {
     assert!(tool_use[0].contains("\"name\":\"time\""), "{}", tool_use[0]);
     assert_eq!(tool_result.len(), 1);
     let payload: serde_json::Value =
-        serde_json::from_str::<serde_json::Value>(&tool_result[0]).expect("tool_result json");
+        serde_json::from_str::<serde_json::Value>(tool_result[0]).expect("tool_result json");
     let preview = payload["result_preview"].as_str().expect("preview");
     let parsed: serde_json::Value =
         serde_json::from_str(preview).expect("preview carries the tool's JSON output");
