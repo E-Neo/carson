@@ -18,6 +18,7 @@ pub fn main() {
 
 #[component]
 pub fn App() -> impl IntoView {
+    shell::init_shell();
     view! {
         <Router>
             <Routes fallback=|| view! { <Redirect path="/chat"/> }>

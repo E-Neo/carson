@@ -494,3 +494,25 @@ body {
 
   .panel-grid { grid-template-columns: 1fr; }
 }
+
+/* ---------- jump to latest ---------- */
+.main { position: relative; }
+
+.jump-pill {
+  position: absolute;
+  right: 18px;
+  bottom: 86px;
+  z-index: 10;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--accent);
+  background: var(--bg-panel);
+  color: var(--text);
+  font-size: 13px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+}
+
+.jump-pill:hover { background: var(--accent-dim); }
+
+/* Tighten consecutive assistant cards into a subtle stack */
+.msg.assistant + .msg.assistant { margin-top: -8px; }

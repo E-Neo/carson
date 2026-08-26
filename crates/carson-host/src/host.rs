@@ -19,17 +19,41 @@ use crate::tools::{Capabilities, ToolRunner};
 /// The single agent module, baked into the binary by `build.rs`.
 pub const EMBEDDED_AGENT: &[u8] = include_bytes!(env!("CARSON_AGENT_WASM"));
 
-/// Built-in tool components, baked into the binary by `build.rs`.
+/// Built-in tool component, baked into the binary by `build.rs`.
 pub const EMBEDDED_TIME_TOOL: &[u8] = include_bytes!(env!("CARSON_TOOL_TIME_WASM"));
-pub const EMBEDDED_ECHO_TOOL: &[u8] = include_bytes!(env!("CARSON_TOOL_ECHO_WASM"));
 
 /// Returns the embedded bytes for a built-in tool, if any.
 pub fn embedded_tool(name: &str) -> Option<&'static [u8]> {
     match name {
         "time" => Some(EMBEDDED_TIME_TOOL),
-        "echo" => Some(EMBEDDED_ECHO_TOOL),
         _ => None,
     }
+}
+
+/// Stable namespace for deterministic built-in tool ids (uuid v5).
+pub const TOOL_ID_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x6361_7273_6f6e_5f74_6f6f_6c5f_6964_7301);
+
+/// The deterministic id of a built-in tool by its bare name.
+pub fn builtin_id(name: &str) -> String {
+    uuid::Uuid::new_v5(&TOOL_ID_NAMESPACE, name.as_bytes()).to_string()
+}
+
+/// The bundled tools: code-defined, seeded into the runner at startup,
+/// immutable through the API. Names are bare and provider-safe.
+pub fn builtin_tools() -> Vec<ToolDef> {
+    vec![ToolDef {
+        id: builtin_id("time"),
+        name: "time".into(),
+        description: "Return the current UTC time in ISO 8601 format".into(),
+        parameters: serde_json::json!({"type": "object"}),
+        env: Default::default(),
+    }]
+}
+
+/// Look up a built-in tool by its deterministic id.
+pub fn builtin_by_id(id: &str) -> Option<ToolDef> {
+    builtin_tools().into_iter().find(|t| t.id == id)
 }
 
 /// Shared, immutable state used to build every agent instance. Providers and tools are registered
@@ -181,7 +205,7 @@ pub async fn build_instance(ctx: &HostContext, def: &AgentDef) -> Result<AgentIn
         hub: ctx.hub.clone(),
         drivers: ctx.drivers.clone(),
         tool_runner: ctx.tool_runner.clone(),
-        caps: Capabilities::from_names(def.capabilities.clone()),
+        caps: Capabilities::from_ids(def.capabilities.clone()),
         stop: Arc::new(AtomicBool::new(false)),
         streams: HashMap::new(),
         next_stream_id: 0,

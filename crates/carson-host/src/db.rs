@@ -7,8 +7,6 @@ use rusqlite::{Connection, params};
 use crate::drivers::Usage;
 use crate::registry::{AgentDef, ProviderDef, ToolDef};
 
-const SCHEMA_VERSION: i32 = 2;
-
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS agents (
     id TEXT PRIMARY KEY,
@@ -36,7 +34,8 @@ CREATE TABLE IF NOT EXISTS providers (
     updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS tools (
-    name TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
     description TEXT NOT NULL DEFAULT '',
     parameters_json TEXT NOT NULL DEFAULT '{}',
     env_json TEXT NOT NULL DEFAULT '{}',
@@ -81,100 +80,6 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-/// Apply additive schema changes to databases created by older binaries.
-///
-/// Version 2 rewrote sessions/messages completely (uuid ids plus a typed
-/// block log), so those tables are recreated and chat history is discarded.
-/// Agent definitions are preserved: legacy `kind` rows become named versions
-/// with freshly generated ids.
-fn migrate(conn: &Connection) -> Result<()> {
-    // Idempotent: creates missing tables, leaves existing ones untouched.
-    conn.execute_batch(SCHEMA)?;
-    let has_column = |table: &str, column: &str| -> Result<bool> {
-        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let name: String = row.get(1)?;
-            if name == column {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    };
-    if !has_column("providers", "api_key")? {
-        conn.execute("ALTER TABLE providers ADD COLUMN api_key TEXT", [])
-            .context("migrate providers.api_key")?;
-    }
-
-    let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version >= SCHEMA_VERSION {
-        return Ok(());
-    }
-
-    // Legacy agents table (keyed by `kind`) is carried forward as versions.
-    if !has_column("agents", "id")? && has_column("agents", "kind")? {
-        let tx = conn.unchecked_transaction()?;
-        tx.execute("ALTER TABLE agents RENAME TO agents_legacy", [])?;
-        tx.commit()?;
-        conn.execute_batch(SCHEMA)?;
-        let tx = conn.unchecked_transaction()?;
-        let mut stmt = tx.prepare(
-            "SELECT kind, system_prompt, model, instances, max_history, context_window, \
-             compaction_ratio, auto_compact, capabilities_json FROM agents_legacy",
-        )?;
-        #[allow(clippy::type_complexity)]
-        let rows: Vec<(String, String, String, i64, i64, i64, f64, i64, String)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                ))
-            })?
-            .collect::<std::result::Result<_, _>>()?;
-        drop(stmt);
-        for (kind, prompt, model, instances, history, window, ratio, auto, caps) in rows {
-            let id = uuid::Uuid::new_v4().to_string();
-            tx.execute(
-                "INSERT INTO agents (id, name, system_prompt, model, instances, max_history, \
-                 context_window, compaction_ratio, auto_compact, capabilities_json, created_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-                params![
-                    id,
-                    kind,
-                    prompt,
-                    model,
-                    instances,
-                    history,
-                    window,
-                    ratio,
-                    auto,
-                    caps,
-                    now_ms()
-                ],
-            )?;
-            tx.execute(
-                "INSERT OR REPLACE INTO agent_names (name, current_id) VALUES (?1, ?2)",
-                params![kind, id],
-            )?;
-        }
-        tx.execute("DROP TABLE agents_legacy", [])?;
-        tx.execute("DELETE FROM sessions", [])?;
-        tx.execute("DELETE FROM messages", [])?;
-        tx.commit()?;
-    } else {
-        conn.execute_batch(SCHEMA)?;
-    }
-    conn.execute(&format!("PRAGMA user_version = {SCHEMA_VERSION}"), [])?;
-    Ok(())
 }
 
 /// One entry of the persisted conversation block log (mirrors the WIT `block`).
@@ -262,6 +167,25 @@ fn def_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentDef> {
     })
 }
 
+fn tool_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolDef> {
+    let parameters: String = row.get(3)?;
+    let env: String = row.get(4)?;
+    Ok(ToolDef {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        description: row.get(2)?,
+        parameters: serde_json::from_str(&parameters).unwrap_or_default(),
+        env: serde_json::from_str(&env).unwrap_or_default(),
+    })
+}
+
+fn collect_tools<I>(rows: I) -> Result<Vec<ToolDef>>
+where
+    I: Iterator<Item = rusqlite::Result<ToolDef>>,
+{
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
 const AGENT_COLUMNS: &str = "a.id, a.name, a.system_prompt, a.model, a.instances, a.max_history, a.context_window, \
      a.compaction_ratio, a.auto_compact, a.capabilities_json";
 
@@ -273,7 +197,8 @@ impl Db {
     pub fn open(path: &Path) -> Result<Arc<Self>> {
         let conn =
             Connection::open(path).with_context(|| format!("open database {}", path.display()))?;
-        migrate(&conn).with_context(|| format!("migrate {}", path.display()))?;
+        conn.execute_batch(SCHEMA)
+            .with_context(|| format!("initialize schema in {}", path.display()))?;
         Ok(Arc::new(Self {
             conn: Mutex::new(conn),
         }))
@@ -283,7 +208,7 @@ impl Db {
     #[doc(hidden)]
     pub fn open_in_memory() -> Result<Arc<Self>> {
         let conn = Connection::open_in_memory()?;
-        migrate(&conn)?;
+        conn.execute_batch(SCHEMA)?;
         Ok(Arc::new(Self {
             conn: Mutex::new(conn),
         }))
@@ -411,61 +336,42 @@ impl Db {
     pub fn list_tools(&self) -> Result<Vec<ToolDef>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT name, description, parameters_json, env_json FROM tools ORDER BY name",
+            "SELECT id, name, description, parameters_json, env_json FROM tools ORDER BY name",
         )?;
-        let rows = stmt.query_map([], |row| {
-            let parameters: String = row.get(2)?;
-            let env: String = row.get(3)?;
-            Ok(ToolDef {
-                name: row.get(0)?,
-                description: row.get(1)?,
-                parameters: serde_json::from_str(&parameters).unwrap_or_default(),
-                env: serde_json::from_str(&env).unwrap_or_default(),
-            })
-        })?;
-        Ok(rows.collect::<std::result::Result<_, _>>()?)
+        collect_tools(stmt.query_map([], tool_from_row)?)
     }
 
-    pub fn get_tool_wasm(&self, name: &str) -> Result<Option<Vec<u8>>> {
+    pub fn get_tool_wasm(&self, id: &str) -> Result<Option<Vec<u8>>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT wasm FROM tools WHERE name = ?1")?;
-        let mut rows = stmt.query(params![name])?;
+        let mut stmt = conn.prepare("SELECT wasm FROM tools WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id])?;
         match rows.next()? {
             Some(row) => Ok(Some(row.get(0)?)),
             None => Ok(None),
         }
     }
 
-    pub fn get_tool_def(&self, name: &str) -> Result<Option<ToolDef>> {
+    pub fn get_tool(&self, id: &str) -> Result<Option<ToolDef>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT name, description, parameters_json, env_json FROM tools WHERE name = ?1",
+            "SELECT id, name, description, parameters_json, env_json FROM tools WHERE id = ?1",
         )?;
-        let mut rows = stmt.query(params![name])?;
+        let mut rows = stmt.query(params![id])?;
         match rows.next()? {
-            Some(row) => {
-                let parameters: String = row.get(2)?;
-                let env: String = row.get(3)?;
-                Ok(Some(ToolDef {
-                    name: row.get(0)?,
-                    description: row.get(1)?,
-                    parameters: serde_json::from_str(&parameters).unwrap_or_default(),
-                    env: serde_json::from_str(&env).unwrap_or_default(),
-                }))
-            }
+            Some(row) => collect_tools(std::iter::once(tool_from_row(row))).map(|mut v| v.pop()),
             None => Ok(None),
         }
     }
 
-    pub fn upsert_tool(&self, def: &ToolDef, wasm: &[u8]) -> Result<()> {
+    /// Insert a custom tool; the caller supplies a fresh uuid in `def.id`.
+    pub fn insert_tool(&self, def: &ToolDef, wasm: &[u8]) -> Result<()> {
         let now = now_ms();
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO tools (name, description, parameters_json, env_json, wasm, created_at, updated_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?6) \
-             ON CONFLICT(name) DO UPDATE SET description=?2, parameters_json=?3, env_json=?4, \
-             wasm=?5, updated_at=?6",
+            "INSERT INTO tools (id, name, description, parameters_json, env_json, wasm, created_at, updated_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?7)",
             params![
+                def.id,
                 def.name,
                 def.description,
                 serde_json::to_string(&def.parameters)?,
@@ -477,9 +383,28 @@ impl Db {
         Ok(())
     }
 
-    pub fn delete_tool(&self, name: &str) -> Result<usize> {
+    /// Update an existing custom tool's metadata/wasm by id.
+    pub fn update_tool(&self, def: &ToolDef, wasm: &[u8]) -> Result<usize> {
+        let now = now_ms();
         let conn = self.conn.lock().unwrap();
-        Ok(conn.execute("DELETE FROM tools WHERE name = ?1", params![name])?)
+        Ok(conn.execute(
+            "UPDATE tools SET name=?2, description=?3, parameters_json=?4, env_json=?5, \
+             wasm=?6, updated_at=?7 WHERE id=?1",
+            params![
+                def.id,
+                def.name,
+                def.description,
+                serde_json::to_string(&def.parameters)?,
+                serde_json::to_string(&def.env)?,
+                wasm,
+                now
+            ],
+        )?)
+    }
+
+    pub fn delete_tool(&self, id: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM tools WHERE id = ?1", params![id])?)
     }
 
     pub fn upsert_session(&self, session: &PersistedSession) -> Result<()> {
@@ -832,27 +757,28 @@ mod tests {
     }
 
     #[test]
-    fn tool_upsert_list_and_wasm_roundtrip() {
+    fn tool_insert_get_delete_roundtrip() {
         let db = Db::open_in_memory().unwrap();
         let def = ToolDef {
-            name: "custom/websearch".into(),
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "websearch".into(),
             description: "Search the web".into(),
             parameters: serde_json::json!({"type": "object"}),
             env: [("KEY".to_string(), "value".to_string())]
                 .into_iter()
                 .collect(),
         };
-        db.upsert_tool(&def, b"wasm-bytes").unwrap();
+        db.insert_tool(&def, b"wasm-bytes").unwrap();
         let tools = db.list_tools().unwrap();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "custom/websearch");
+        assert_eq!(tools[0].id, def.id);
+        assert_eq!(tools[0].name, "websearch");
         assert_eq!(tools[0].description, "Search the web");
         assert_eq!(tools[0].env["KEY"], "value");
-        assert_eq!(
-            db.get_tool_wasm("custom/websearch").unwrap().unwrap(),
-            b"wasm-bytes"
-        );
-        assert_eq!(db.delete_tool("custom/websearch").unwrap(), 1);
+        assert_eq!(db.get_tool_wasm(&def.id).unwrap().unwrap(), b"wasm-bytes");
+        let fetched = db.get_tool(&def.id).unwrap().unwrap();
+        assert_eq!(fetched.name, "websearch");
+        assert_eq!(db.delete_tool(&def.id).unwrap(), 1);
         assert!(db.list_tools().unwrap().is_empty());
     }
 }

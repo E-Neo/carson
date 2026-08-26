@@ -9,19 +9,18 @@ use carson_host::registry::{AgentDef, AgentInstance, ToolDef};
 fn ctx_with_fake() -> Arc<HostContext> {
     let ctx = Arc::new(HostContext::new().unwrap());
     ctx.register_driver("mock", Arc::new(EchoDriver));
-    for name in ["time", "echo"] {
-        let wasm = carson_host::host::embedded_tool(name).unwrap();
-        ctx.register_tool(
-            &ToolDef {
-                name: format!("core/{name}"),
-                description: String::new(),
-                parameters: serde_json::json!({}),
-                env: Default::default(),
-            },
-            wasm,
-        )
-        .unwrap();
-    }
+    let wasm = carson_host::host::embedded_tool("time").unwrap();
+    ctx.register_tool(
+        &ToolDef {
+            id: carson_host::host::builtin_id("time"),
+            name: "time".into(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+            env: Default::default(),
+        },
+        wasm,
+    )
+    .unwrap();
     ctx
 }
 
@@ -36,7 +35,7 @@ fn def() -> AgentDef {
         context_window: 128_000,
         compaction_ratio: 0.8,
         auto_compact: true,
-        capabilities: vec!["core/time".into(), "core/echo".into()],
+        capabilities: vec![carson_host::host::builtin_id("time")],
     }
 }
 
@@ -220,7 +219,7 @@ async fn tool_turn_persists_ordered_blocks() {
         .iter()
         .find(|b| b.kind == "tool-use")
         .unwrap();
-    assert_eq!(call.tool_name.as_deref(), Some("core/time"));
+    assert_eq!(call.tool_name.as_deref(), Some("time"));
     assert_eq!(call.arguments_json.as_deref(), Some("{}"));
     let result = session
         .messages

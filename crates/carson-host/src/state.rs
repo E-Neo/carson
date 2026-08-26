@@ -250,24 +250,34 @@ impl crate::bindings::carson::agent::llm::Host for State {
 }
 
 impl crate::bindings::carson::agent::tools::Host for State {
+    /// Advertise the agent's selected tools by their bare provider-safe
+    /// names. Identity stays internal (tool uuids); the wire never sees ids.
     fn list_tools(&mut self) -> Vec<ToolDefinition> {
-        self.tool_runner
-            .specs()
-            .into_iter()
-            .filter(|spec| self.caps.allows_tool(&spec.name))
+        let specs = self.tool_runner.specs();
+        self.caps
+            .ids
+            .iter()
+            .filter_map(|id| specs.iter().find(|spec| &spec.id == id))
             .map(|spec| ToolDefinition {
-                name: spec.name,
-                description: spec.description,
+                name: spec.name.clone(),
+                description: spec.description.clone(),
                 parameters_json: spec.parameters.to_string(),
             })
             .collect()
     }
 
+    /// The model invokes by bare name; resolve it through this instance's
+    /// capabilities to exactly one tool id, then run that sandbox.
     fn invoke(&mut self, name: String, arguments_json: String) -> Result<String, ToolError> {
-        if !self.caps.allows_tool(&name) {
+        let specs = self.tool_runner.specs();
+        let Some(id) = self
+            .caps
+            .resolve_bare_name(&specs, &name)
+            .map(str::to_owned)
+        else {
             return Err(ToolError::PermissionDenied);
-        }
-        match self.tool_runner.run(&name, &arguments_json) {
+        };
+        match self.tool_runner.run(&id, &arguments_json) {
             Some(Ok(output)) => Ok(output),
             Some(Err(_)) => Err(ToolError::Failed),
             None => Err(ToolError::NotFound),
@@ -300,25 +310,23 @@ mod tests {
         assert_eq!(resolve_model("provider/"), None);
     }
 
-    fn test_state(tool_names: &[&str]) -> State {
+    fn test_state(tool_ids: &[&str]) -> State {
         let engine = Engine::new(&wasmtime::Config::new()).unwrap();
         let tool_runner = Arc::new(ToolRunner::new(&engine));
-        let register = |name: &str| {
-            let wasm = crate::host::embedded_tool(name).unwrap();
-            tool_runner
-                .register(
-                    &crate::registry::ToolDef {
-                        name: format!("core/{name}"),
-                        description: String::new(),
-                        parameters: serde_json::json!({}),
-                        env: HashMap::new(),
-                    },
-                    wasm,
-                )
-                .unwrap();
-        };
-        register("time");
-        register("echo");
+        let time_id = crate::host::builtin_id("time");
+        let wasm = crate::host::embedded_tool("time").unwrap();
+        tool_runner
+            .register(
+                &crate::registry::ToolDef {
+                    id: time_id.clone(),
+                    name: "time".into(),
+                    description: String::new(),
+                    parameters: serde_json::json!({}),
+                    env: HashMap::new(),
+                },
+                wasm,
+            )
+            .unwrap();
         let mut drivers: HashMap<String, Arc<dyn LlmDriver>> = HashMap::new();
         drivers.insert("mock".into(), Arc::new(crate::drivers::EchoDriver));
         State {
@@ -327,7 +335,7 @@ mod tests {
             hub: Hub::new(),
             drivers: Arc::new(RwLock::new(drivers)),
             tool_runner,
-            caps: Capabilities::from_names(tool_names.iter().map(|s| s.to_string()).collect()),
+            caps: Capabilities::from_ids(tool_ids.iter().map(|s| s.to_string()).collect()),
             stop: Arc::new(AtomicBool::new(false)),
             streams: HashMap::new(),
             next_stream_id: 0,
@@ -336,7 +344,8 @@ mod tests {
 
     #[test]
     fn emit_event_forwards_to_hub() {
-        let mut state = test_state(&["time"]);
+        let time_id = crate::host::builtin_id("time");
+        let mut state = test_state(&[&time_id]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         state.hub.register("s1", tx.clone());
 
@@ -393,31 +402,43 @@ mod tests {
     }
 
     #[test]
-    fn list_tools_is_filtered_by_capabilities() {
-        let mut state = test_state(&["core/time"]);
+    fn list_tools_advertises_bare_names() {
+        let time_id = crate::host::builtin_id("time");
+        let mut state = test_state(&[&time_id]);
         let tools = state.list_tools();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "core/time");
+        assert_eq!(tools[0].name, "time");
     }
 
     #[test]
-    fn invoke_enforces_capabilities() {
+    fn invoke_resolves_bare_names_through_capabilities() {
         use crate::bindings::carson::agent::tools::ToolError;
 
-        let mut state = test_state(&["core/time"]);
+        let time_id = crate::host::builtin_id("time");
+
+        // No capabilities: bare name is not permitted at all.
+        let mut state = test_state(&[]);
         assert_eq!(
-            state.invoke("core/echo".into(), "x".into()),
+            state.invoke("time".into(), "{}".into()),
             Err(ToolError::PermissionDenied)
         );
 
-        let mut state = test_state(&["core/nonexistent"]);
+        // A capability id that resolves to nothing: still denied, never a
+        // name-based fallback.
+        let mut state = test_state(&["nope"]);
         assert_eq!(
-            state.invoke("core/nonexistent".into(), "{}".into()),
-            Err(ToolError::NotFound)
+            state.invoke("time".into(), "{}".into()),
+            Err(ToolError::PermissionDenied)
         );
 
-        let mut state = test_state(&["core/echo"]);
-        assert_eq!(state.invoke("core/echo".into(), "x".into()), Ok("x".into()));
+        // Selected capability resolves the wire name to its sandbox.
+        let mut state = test_state(&[&time_id]);
+        assert!(
+            state
+                .invoke("time".into(), "{}".into())
+                .map(|out| out.contains("\"time\""))
+                .unwrap_or(false)
+        );
     }
 
     fn request() -> Request {

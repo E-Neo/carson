@@ -68,10 +68,13 @@ pub struct ProviderDef {
     pub api_key: Option<String>,
 }
 
-/// A persisted tool definition. `core/` names map to embedded bytes; `custom/` names carry their
-/// wasm in the DB.
+/// A tool definition. `id` is the stable identity agents reference; `name`
+/// is the bare, provider-safe display/wire name. Built-ins carry
+/// deterministic ids (uuid v5); uploaded tools get random v4 ids.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ToolDef {
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     #[serde(default)]
     pub description: String,

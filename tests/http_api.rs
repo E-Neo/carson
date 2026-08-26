@@ -29,26 +29,29 @@ fn coder_def() -> AgentDef {
         context_window: 128_000,
         compaction_ratio: 0.8,
         auto_compact: true,
-        capabilities: vec!["core/time".into(), "core/echo".into()],
+        capabilities: vec![carson_host::host::builtin_id("time")],
     }
+}
+
+fn time_id() -> String {
+    carson_host::host::builtin_id("time")
 }
 
 fn ctx_with_fake() -> Arc<HostContext> {
     let ctx = Arc::new(HostContext::new().unwrap());
     ctx.register_driver("mock", Arc::new(EchoDriver));
-    for name in ["time", "echo"] {
-        let wasm = carson_host::host::embedded_tool(name).unwrap();
-        ctx.register_tool(
-            &ToolDef {
-                name: format!("core/{name}"),
-                description: String::new(),
-                parameters: serde_json::json!({}),
-                env: Default::default(),
-            },
-            wasm,
-        )
-        .unwrap();
-    }
+    let wasm = carson_host::host::embedded_tool("time").unwrap();
+    ctx.register_tool(
+        &ToolDef {
+            id: carson_host::host::builtin_id("time"),
+            name: "time".into(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+            env: Default::default(),
+        },
+        wasm,
+    )
+    .unwrap();
     ctx
 }
 
@@ -269,7 +272,7 @@ async fn get_session_returns_ordered_blocks_with_metadata() {
         msgs[2]["tool_call_id"], msgs[1]["tool_call_id"],
         "result links to its call"
     );
-    assert_eq!(msgs[1]["tool_name"], "core/time");
+    assert_eq!(msgs[1]["tool_name"], "time");
     assert!(msgs[1]["created_at_ms"].as_u64().unwrap() > 0);
     // The final text carries its LLM usage.
     assert!(msgs[3]["output_tokens"].as_u64().unwrap() > 0);
@@ -317,7 +320,7 @@ async fn agent_crud_via_api() {
     let (status, created) = post(
         &app,
         "/api/agents",
-        json!({"name":"writer","model":"mock/mock","system_prompt":"write","capabilities":["core/time"]})
+        json!({"name":"writer","model":"mock/mock","system_prompt":"write","capabilities":[time_id()]})
             .to_string()
             .as_str(),
     )
@@ -364,7 +367,9 @@ async fn sessions_follow_the_current_agent_version() {
     let (status, created) = post(
         &app,
         "/api/agents",
-        r#"{"name":"writer","model":"mock/mock","system_prompt":"v1","capabilities":["core/time"]}"#,
+        json!({"name":"writer","model":"mock/mock","system_prompt":"v1","capabilities":[time_id()]})
+            .to_string()
+            .as_str(),
     )
     .await;
     assert_eq!(status, 201, "{created}");
@@ -468,4 +473,133 @@ async fn update_agent_name_mismatch_rejected() {
     )
     .await;
     assert_eq!(status, 400, "{body}");
+}
+
+/// Tools are listed as two distinct groups; bundled tools carry their
+/// deterministic ids and cannot be modified or deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tools_are_grouped_and_bundled_tools_are_immutable() {
+    let app = app().await;
+
+    let (status, body) = get(&app, "/api/tools").await;
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let builtins = v["builtins"].as_array().unwrap();
+    assert_eq!(builtins.len(), 1);
+    assert_eq!(builtins[0]["name"], "time");
+    let time_tool_id = builtins[0]["id"].as_str().unwrap().to_string();
+    let _ = time_tool_id;
+    assert_eq!(v["customs"].as_array().unwrap().len(), 0);
+
+    // Bundled tools are immutable (PUT carries a valid body to pass
+    // extraction and reach the guard).
+    let put_body = {
+        use base64::Engine as _;
+        json!({
+            "name":"time",
+            "description":"x",
+            "parameters":{},
+            "env":{},
+            "wasm_b64": base64::engine::general_purpose::STANDARD
+                .encode(carson_host::host::embedded_tool("time").unwrap())
+        })
+        .to_string()
+    };
+    let (status, body) = put(
+        &app,
+        &format!("/api/tools/{}", builtins[0]["id"].as_str().unwrap()),
+        &put_body,
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    let (status, body) = del(
+        &app,
+        &format!("/api/tools/{}", builtins[0]["id"].as_str().unwrap()),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+}
+
+/// Custom tools may reuse a bundled tool's name (agents disambiguate by id),
+/// but duplicate custom names are rejected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn custom_tools_can_shadow_builtin_names_but_not_each_other() {
+    let app = app().await;
+    let wasm_b64 = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode(carson_host::host::embedded_tool("time").unwrap())
+    };
+
+    // Reusing the bundled name "time" is fine.
+    let (status, created) = post(
+        &app,
+        "/api/tools",
+        json!({"name":"time","description":"custom clock","parameters":{},"env":{},"wasm_b64":wasm_b64})
+            .to_string()
+            .as_str(),
+    )
+    .await;
+    assert_eq!(status, 201, "{created}");
+    let custom_time_id = created["id"].as_str().unwrap().to_string();
+    assert_ne!(custom_time_id, carson_host::host::builtin_id("time"));
+
+    // A second custom with the same name conflicts.
+    let (status, body) = post(
+        &app,
+        "/api/tools",
+        json!({"name":"time","description":"again","parameters":{},"env":{},"wasm_b64":wasm_b64})
+            .to_string()
+            .as_str(),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+
+    // The customs array now holds it.
+    let (_, body) = get(&app, "/api/tools").await;
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["customs"].as_array().unwrap().len(), 1);
+
+    let _ = custom_time_id;
+}
+
+/// An agent cannot select a bundled and a custom tool that share a bare name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_rejects_two_tools_with_the_same_name() {
+    let app = app().await;
+    let wasm_b64 = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode(carson_host::host::embedded_tool("time").unwrap())
+    };
+    let (_, created) = post(
+        &app,
+        "/api/tools",
+        json!({"name":"time","description":"custom clock","parameters":{},"env":{},"wasm_b64":wasm_b64})
+            .to_string()
+            .as_str(),
+    )
+    .await;
+    let custom_id = created["id"].as_str().unwrap();
+
+    let (status, body) = post(
+        &app,
+        "/api/agents",
+        json!({
+            "name":"ambiguous",
+            "model":"mock/mock",
+            "system_prompt":"x",
+            "capabilities":[time_id(), custom_id]
+        })
+        .to_string()
+        .as_str(),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("duplicate tool 'time'")),
+        "expected duplicate-name error: {body}"
+    );
 }

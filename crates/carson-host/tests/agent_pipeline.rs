@@ -17,26 +17,25 @@ fn coder_def() -> AgentDef {
         context_window: 128_000,
         compaction_ratio: 0.8,
         auto_compact: true,
-        capabilities: vec!["core/time".into(), "core/echo".into()],
+        capabilities: vec![carson_host::host::builtin_id("time")],
     }
 }
 
 fn ctx_with_fake() -> Arc<HostContext> {
     let ctx = Arc::new(HostContext::new().unwrap());
     ctx.register_driver("mock", Arc::new(EchoDriver));
-    for name in ["time", "echo"] {
-        let wasm = carson_host::host::embedded_tool(name).unwrap();
-        ctx.register_tool(
-            &ToolDef {
-                name: format!("core/{name}"),
-                description: String::new(),
-                parameters: serde_json::json!({}),
-                env: Default::default(),
-            },
-            wasm,
-        )
-        .unwrap();
-    }
+    let wasm = carson_host::host::embedded_tool("time").unwrap();
+    ctx.register_tool(
+        &ToolDef {
+            id: carson_host::host::builtin_id("time"),
+            name: "time".into(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+            env: Default::default(),
+        },
+        wasm,
+    )
+    .unwrap();
     ctx
 }
 
@@ -138,7 +137,7 @@ async fn tool_loop_invokes_time_and_continues() {
         .filter_map(|i| i.data.as_str())
         .collect::<Vec<_>>();
     assert_eq!(tool_use.len(), 1);
-    assert!(tool_use[0].contains("\"name\":\"core/time\""));
+    assert!(tool_use[0].contains("\"name\":\"time\""), "{}", tool_use[0]);
     assert_eq!(tool_result.len(), 1);
     let payload: serde_json::Value =
         serde_json::from_str::<serde_json::Value>(&tool_result[0]).expect("tool_result json");
@@ -249,7 +248,7 @@ fn compaction_def(max_history: usize, context_window: usize, auto_compact: bool)
         context_window,
         compaction_ratio: 0.8,
         auto_compact,
-        capabilities: vec!["core/time".into(), "core/echo".into()],
+        capabilities: vec![carson_host::host::builtin_id("time")],
     }
 }
 

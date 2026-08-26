@@ -38,6 +38,13 @@ fn err_of(v: &Value) -> String {
         .to_string()
 }
 
+fn item_id(item: &Value) -> String {
+    item.get("id")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
 fn item_name(item: &Value) -> String {
     item.get("name")
         .and_then(|n| n.as_str())
@@ -61,41 +68,64 @@ async fn fetch_agents(agents: &RwSignal<Vec<Value>>) {
     }
 }
 
-async fn fetch_tools(tools: &RwSignal<Vec<Value>>) {
-    if let Ok((_, v)) = api::get("/api/tools").await
-        && let Some(list) = v.get("tools").and_then(|x| x.as_array())
-    {
-        tools.set(list.clone());
+/// Bundled + custom tool entries, kept as separate lists.
+#[derive(Default, Clone)]
+pub struct ToolLists {
+    pub builtins: Vec<Value>,
+    pub customs: Vec<Value>,
+}
+
+async fn fetch_tools(tools: &RwSignal<ToolLists>) {
+    if let Ok((_, v)) = api::get("/api/tools").await {
+        let read = |key: &str| {
+            v.get(key)
+                .and_then(|x| x.as_array())
+                .cloned()
+                .unwrap_or_default()
+        };
+        tools.set(ToolLists {
+            builtins: read("builtins"),
+            customs: read("customs"),
+        });
     }
 }
 
-fn tool_checks(tools: RwSignal<Vec<Value>>, caps: RwSignal<Vec<String>>) -> impl IntoView {
+/// Capability checkboxes over both tool groups. Values are tool ids; a
+/// bundled and a custom tool may share a display name, so custom entries are
+/// suffixed for clarity.
+fn tool_checks(tools: RwSignal<ToolLists>, caps: RwSignal<Vec<String>>) -> impl IntoView {
+    let entry = |t: &Value, suffix: &str| -> (String, String) {
+        (item_id(t), format!("{}{suffix}", item_name(t)))
+    };
     view! {
         <div class="field">
             <label>"Tools"</label>
             {move || {
-                tools
-                    .get()
+                let lists = tools.get();
+                let mut options: Vec<(String, String)> = lists
+                    .builtins
                     .iter()
-                    .map(|t| {
-                        let owned = t.clone();
-                        let name = item_name(&owned);
-                        let label = name.clone();
+                    .map(|t| entry(t, ""))
+                    .collect();
+                options.extend(lists.customs.iter().map(|t| entry(t, " (custom)")));
+                options
+                    .into_iter()
+                    .map(|(id, label)| {
                         let checked_caps = caps;
-                        let checked_name = name.clone();
+                        let checked_id = id.clone();
                         let change_caps = caps;
-                        let change_name = name.clone();
+                        let change_id = id.clone();
                         view! {
                             <label class="check">
                                 <input type="checkbox"
-                                    prop:checked=move || checked_caps.get().contains(&checked_name)
+                                    prop:checked=move || checked_caps.get().contains(&checked_id)
                                     on:change=move |ev| {
                                         let checked = event_target_checked(&ev);
                                         let mut v = change_caps.get();
                                         if checked {
-                                            v.push(change_name.clone());
+                                            v.push(change_id.clone());
                                         } else {
-                                            v.retain(|n| n != &change_name);
+                                            v.retain(|n| n != &change_id);
                                         }
                                         change_caps.set(v);
                                     }/>
@@ -118,7 +148,6 @@ fn show_notice(notice: &RwSignal<Option<String>>, ok: bool, msg: String) {
 pub fn AdminPage() -> impl IntoView {
     let tab = RwSignal::new("status".to_string());
     let drawer_open = RwSignal::new(false);
-    let sidebar_w = sidebar_width();
     let pick_tab = move |name: &'static str| {
         drawer_open.set(false);
         tab.set(name.to_string());
@@ -138,7 +167,7 @@ pub fn AdminPage() -> impl IntoView {
             <aside
                 class="sidebar"
                 class:open=drawer_open
-                style:width=move || format!("{}px", sidebar_w.get())
+                style:width=move || format!("{}px", sidebar_width().get())
             >
                 <div class="brand-row">
                     <h1>"Carson"</h1>
@@ -151,7 +180,7 @@ pub fn AdminPage() -> impl IntoView {
                 <a class="admin-link" href="/chat">"Back to chat"</a>
             </aside>
 
-            <DragRail width=sidebar_w/>
+            <DragRail/>
             <MenuButton open=drawer_open/>
 
             <main class="main">
@@ -420,7 +449,7 @@ fn AgentsPanel() -> impl IntoView {
     let edit_context_window = RwSignal::new(String::new());
     let edit_compaction_ratio = RwSignal::new(String::new());
     let edit_auto_compact = RwSignal::new(false);
-    let tools = RwSignal::new(Vec::<Value>::new());
+    let tools = RwSignal::new(ToolLists::default());
     let create_caps = RwSignal::new(Vec::<String>::new());
     let edit_caps = RwSignal::new(Vec::<String>::new());
 
@@ -696,18 +725,15 @@ fn AgentsPanel() -> impl IntoView {
 
 #[component]
 fn ToolsPanel() -> impl IntoView {
-    let tools = RwSignal::new(Vec::<Value>::new());
+    let tools = RwSignal::new(ToolLists::default());
     let name = RwSignal::new(String::new());
     let description = RwSignal::new(String::new());
     let file = RwSignal::new(None::<web_sys::File>);
     let notice = RwSignal::new(None::<String>);
-    let editing = RwSignal::new(None::<Value>);
+    let editing = RwSignal::new(None::<String>); // editing tool id
     let edit_description = RwSignal::new(String::new());
     let edit_parameters = RwSignal::new(String::new());
     let edit_env = RwSignal::new(String::new());
-    let wasm_mode = RwSignal::new("keep".to_string());
-    let edit_file = RwSignal::new(None::<web_sys::File>);
-
     spawn_local(async move {
         fetch_tools(&tools).await;
     });
@@ -718,14 +744,6 @@ fn ToolsPanel() -> impl IntoView {
             .and_then(|t| t.dyn_into::<HtmlInputElement>().ok())
             .expect("file input");
         file.set(input.files().and_then(|f| f.get(0)));
-    };
-
-    let on_edit_file = move |ev: web_sys::Event| {
-        let input = ev
-            .target()
-            .and_then(|t| t.dyn_into::<HtmlInputElement>().ok())
-            .expect("file input");
-        edit_file.set(input.files().and_then(|f| f.get(0)));
     };
 
     let create = move || {
@@ -772,17 +790,37 @@ fn ToolsPanel() -> impl IntoView {
         });
     };
 
-    let remove = move |name: String| {
+    let remove = move |id: String| {
         let tools = tools;
         let notice = notice;
         spawn_local(async move {
-            let _ = api::delete(&format!("/api/tools/{name}")).await;
-            show_notice(&notice, true, format!("deleted {name}"));
+            let (_, v) = api::delete(&format!("/api/tools/{id}"))
+                .await
+                .unwrap_or((0, Value::Null));
+            if let Some(err) = err_of(&v).strip_prefix("request failed") {
+                let _ = err;
+            }
+            if v.get("error").is_some() {
+                show_notice(&notice, false, err_of(&v));
+            } else {
+                show_notice(&notice, true, "deleted".to_string());
+            }
             fetch_tools(&tools).await;
         });
     };
 
-    let start_edit = move |item: Value| {
+    let custom_by_id = move |id: String| -> Option<Value> {
+        tools
+            .get_untracked()
+            .customs
+            .into_iter()
+            .find(|t| item_id(t) == id)
+    };
+
+    let start_edit = move |id: String| {
+        let Some(item) = custom_by_id(id.clone()) else {
+            return;
+        };
         let params = item.get("parameters").cloned().unwrap_or(Value::Null);
         let env = item.get("env").cloned().unwrap_or(Value::Null);
         edit_description.set(
@@ -793,15 +831,16 @@ fn ToolsPanel() -> impl IntoView {
         );
         edit_parameters.set(serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string()));
         edit_env.set(serde_json::to_string(&env).unwrap_or_else(|_| "{}".to_string()));
-        wasm_mode.set("keep".to_string());
-        edit_file.set(None);
-        editing.set(Some(item));
+        editing.set(Some(id));
     };
 
     let cancel_edit = move || editing.set(None);
 
     let save_edit = move || {
-        let Some(item) = editing.get() else { return };
+        let Some(id) = editing.get() else { return };
+        let Some(item) = custom_by_id(id.clone()) else {
+            return;
+        };
         let n = item_name(&item);
         let tools = tools;
         let notice = notice;
@@ -821,44 +860,14 @@ fn ToolsPanel() -> impl IntoView {
                     return;
                 }
             };
-            let b64 = if wasm_mode.get() == "replace" {
-                let Some(f) = edit_file.get() else {
-                    show_notice(
-                        &notice,
-                        false,
-                        "select a .wasm file to replace with".to_string(),
-                    );
-                    return;
-                };
-                match JsFuture::from(read_file_b64(f)).await {
-                    Ok(v) => v.as_string().unwrap_or_default(),
-                    Err(_) => {
-                        show_notice(&notice, false, "failed to read wasm file".to_string());
-                        return;
-                    }
-                }
-            } else {
-                item.get("wasm_b64")
-                    .and_then(|w| w.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            };
-            if b64.is_empty() {
-                show_notice(
-                    &notice,
-                    false,
-                    "wasm is required (keep the original or replace it with a file)".to_string(),
-                );
-                return;
-            }
+            // Omitting wasm_b64 keeps the stored module server-side.
             let body = json!({
                 "name": n,
                 "description": edit_description.get(),
                 "parameters": params,
                 "env": env,
-                "wasm_b64": b64,
             });
-            let path = format!("/api/tools/{n}");
+            let path = format!("/api/tools/{id}");
             let (status, v) = api::put(&path, &body).await.unwrap_or((0, Value::Null));
             if status == 200 {
                 editing.set(None);
@@ -881,8 +890,8 @@ fn ToolsPanel() -> impl IntoView {
             <div class="card">
                 <h3>"Add custom tool"</h3>
                 <div class="field">
-                    <label>"Name (must start with custom/)"</label>
-                    <input prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) placeholder="custom/my-tool"/>
+                    <label>"Name"</label>
+                    <input prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) placeholder="websearch"/>
                 </div>
                 <div class="field">
                     <label>"Description"</label>
@@ -894,10 +903,42 @@ fn ToolsPanel() -> impl IntoView {
                 </div>
                 <div><button class="btn primary" on:click=move |_| create()>"Upload"</button></div>
             </div>
+
+            <h3>"Bundled"</h3>
             <div class="panel-grid">
                 {move || {
                     tools
                         .get()
+                        .builtins
+                        .iter()
+                        .map(|t| {
+                            let name = item_name(t);
+                            let desc = t
+                                .get("description")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            view! {
+                                <div class="card">
+                                    <div class="row">
+                                        <h3>{name}</h3>
+                                        <span class="badge">"bundled"</span>
+                                    </div>
+                                    <div class="muted">{desc}</div>
+                                </div>
+                            }
+                            .into_any()
+                        })
+                        .collect::<Vec<_>>()
+                }}
+            </div>
+
+            <h3>"Custom"</h3>
+            <div class="panel-grid">
+                {move || {
+                    tools
+                        .get()
+                        .customs
                         .iter()
                         .map(|t| {
                             let owned = t.clone();
@@ -912,19 +953,13 @@ fn ToolsPanel() -> impl IntoView {
                                 .cloned()
                                 .unwrap_or(Value::Null)
                                 .to_string();
-                            let n2 = name.clone();
-                            let edit_item = owned.clone();
-                            let builtin = name.starts_with("core/");
-                            let is_editing = !builtin
-                                && editing
-                                    .get()
-                                    .as_ref()
-                                    .map(item_name)
-                                    == Some(name.clone());
+                            let id = item_id(&owned);
+                            let is_editing =
+                                editing.get().as_ref() == Some(&id);
                             if is_editing {
                                 view! {
                                     <div class="card">
-                                        <h3>{name}</h3>
+                                        <h3>{name.clone()}</h3>
                                         <div class="field">
                                             <label>"Description"</label>
                                             <input prop:value=move || edit_description.get() on:input=move |ev| edit_description.set(event_target_value(&ev))/>
@@ -937,24 +972,6 @@ fn ToolsPanel() -> impl IntoView {
                                             <label>"Env (JSON)"</label>
                                             <textarea prop:value=move || edit_env.get() on:input=move |ev| edit_env.set(event_target_value(&ev))></textarea>
                                         </div>
-                                        <div class="field">
-                                            <label>"Wasm module"</label>
-                                            <label class="check">
-                                                <input type="radio" name="wasm-mode" prop:checked=move || wasm_mode.get() == "keep" on:change=move |_| wasm_mode.set("keep".to_string())/>
-                                                "Keep original"
-                                            </label>
-                                            <label class="check">
-                                                <input type="radio" name="wasm-mode" prop:checked=move || wasm_mode.get() == "replace" on:change=move |_| wasm_mode.set("replace".to_string())/>
-                                                "Replace"
-                                            </label>
-                                            {move || {
-                                                if wasm_mode.get() == "replace" {
-                                                    view! { <input type="file" accept=".wasm" on:change=on_edit_file/> }.into_any()
-                                                } else {
-                                                    ().into_any()
-                                                }
-                                            }}
-                                        </div>
                                         <div class="row">
                                             <button class="btn primary" on:click=move |_| save_edit()>"Confirm"</button>
                                             <button class="btn" on:click=move |_| cancel_edit()>"Cancel"</button>
@@ -963,34 +980,16 @@ fn ToolsPanel() -> impl IntoView {
                                 }
                                 .into_any()
                             } else {
+                                let del_id = id.clone();
+                                let edit_id = id.clone();
                                 view! {
                                     <div class="card">
                                         <div class="row">
+                                            <h3>{name.clone()}</h3>
                                             <div class="row">
-                                                <h3>{name}</h3>
-                                                {move || {
-                                                    if builtin {
-                                                        view! { <span class="badge">"built-in"</span> }.into_any()
-                                                    } else {
-                                                        ().into_any()
-                                                    }
-                                                }}
+                                                <button class="btn" on:click=move |_| start_edit(edit_id.clone())>"Edit"</button>
+                                                <button class="btn danger" on:click=move |_| remove(del_id.clone())>"Delete"</button>
                                             </div>
-                                            {move || {
-                                                if builtin {
-                                                    ().into_any()
-                                                } else {
-                                                    let edit = edit_item.clone();
-                                                    let del = n2.clone();
-                                                    view! {
-                                                        <div class="row">
-                                                            <button class="btn" on:click=move |_| start_edit(edit.clone())>"Edit"</button>
-                                                            <button class="btn danger" on:click=move |_| remove(del.clone())>"Delete"</button>
-                                                        </div>
-                                                    }
-                                                    .into_any()
-                                                }
-                                            }}
                                         </div>
                                         <div class="muted">{desc}</div>
                                         <pre>{params}</pre>

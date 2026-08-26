@@ -14,9 +14,7 @@ use carson_api::api::router;
 use carson_host::config::Config;
 use carson_host::db::Db;
 use carson_host::host::{self, HostContext};
-use carson_host::registry::ToolDef;
 use clap::Parser;
-use serde_json::json;
 use tower::ServiceExt;
 
 use crate::cli::Cli;
@@ -102,26 +100,15 @@ async fn main() -> Result<()> {
             None => tracing::warn!(tool = %tool.name, "tool row has no wasm"),
         }
     }
-    // Built-in tools are compiled into the binary; make them always available.
-    for (name, description) in [
-        (
-            "core/time",
-            "Return the current UTC time in ISO 8601 format",
-        ),
-        ("core/echo", "Echo the given text back to the caller"),
-    ] {
-        let Some(wasm) = host::embedded_tool(name.strip_prefix("core/").unwrap_or(name)) else {
-            continue;
-        };
-        let def = ToolDef {
-            name: name.to_string(),
-            description: description.to_string(),
-            parameters: json!({}),
-            env: std::collections::HashMap::new(),
-        };
+    // Built-in tools ship with the binary and are seeded into the runner
+    // under deterministic ids; custom tools load from the DB.
+    for def in host::builtin_tools() {
+        let wasm = host::embedded_tool(&def.name).expect("embedded bytes for builtin");
         match ctx.register_tool(&def, wasm) {
-            Ok(()) => tracing::info!(tool = name, "loaded builtin tool"),
-            Err(err) => tracing::warn!(tool = name, error = %err, "failed to compile builtin tool"),
+            Ok(()) => tracing::info!(tool = %def.name, id = %def.id, "loaded builtin tool"),
+            Err(err) => {
+                tracing::warn!(tool = %def.name, error = %err, "failed to compile builtin tool")
+            }
         }
     }
 

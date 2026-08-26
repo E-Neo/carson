@@ -32,7 +32,8 @@ pub struct MessageReq {
     content: String,
 }
 
-/// Request body for registering or updating a `custom/` tool. The wasm is base64-encoded.
+/// Request body for registering or updating a custom tool. The wasm is
+/// base64-encoded; on update, omitting `wasm_b64` keeps the stored module.
 #[derive(Deserialize, ToSchema)]
 pub struct ToolReq {
     pub name: String,
@@ -42,7 +43,8 @@ pub struct ToolReq {
     pub parameters: Value,
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
-    pub wasm_b64: String,
+    #[serde(default)]
+    pub wasm_b64: Option<String>,
 }
 
 #[derive(TypedPath, Deserialize)]
@@ -100,9 +102,9 @@ pub(crate) struct ProviderNamePath {
 }
 
 #[derive(TypedPath, Deserialize)]
-#[typed_path("/api/tools/{*name}")]
-pub(crate) struct ToolNamePath {
-    name: String,
+#[typed_path("/api/tools/{*id}")]
+pub(crate) struct ToolIdPath {
+    id: String,
 }
 
 #[derive(OpenApi)]
@@ -372,7 +374,7 @@ pub fn router(state: AppState) -> Router {
             put(update_provider).delete(delete_provider),
         )
         .route("/api/tools", get(list_tools).post(create_tool))
-        .route(ToolNamePath::PATH, put(update_tool).delete(delete_tool))
+        .route(ToolIdPath::PATH, put(update_tool).delete(delete_tool))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route(SessionPath::PATH, get(get_session).delete(destroy_session))
@@ -573,6 +575,9 @@ pub(crate) async fn create_agent(
     if let Some(err) = validate_agent_model(&st, &def) {
         return json_err(StatusCode::BAD_REQUEST, err);
     }
+    if let Some(err) = validate_agent_caps(&st, &def) {
+        return json_err(StatusCode::BAD_REQUEST, &err);
+    }
     def.id = uuid::Uuid::new_v4().to_string();
     let version_id = def.id.clone();
     let name = def.name.clone();
@@ -592,6 +597,48 @@ pub(crate) async fn create_agent(
         Ok(_) => json_created(json!({"name": name, "version_id": version_id, "status": "created"})),
         Err(err) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
     }
+}
+
+/// Providers only accept function names matching `^[a-zA-Z0-9_-]+$`, so a
+/// `custom/…` tool name must sanitize cleanly: the namespace prefix plus a
+/// remainder of plain word characters. Anything else would be rejected
+/// upstream on every request.
+fn invalid_tool_name(name: &str) -> Option<&'static str> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Some("tool names may only contain [a-zA-Z0-9_-]");
+    }
+    None
+}
+
+/// Validate an agent's capability list: every entry must resolve to a known
+/// tool id, and no two entries may share the same bare name (a bundled and a
+/// custom tool may both be called `time`, but one agent cannot select both —
+/// the model would have no way to disambiguate).
+fn validate_agent_caps(st: &AppState, def: &AgentDef) -> Option<String> {
+    let mut seen: Vec<(String, String)> = Vec::new(); // (bare name, id)
+    for id in &def.capabilities {
+        let def = if let Some(b) = carson_host::host::builtin_by_id(id) {
+            b
+        } else {
+            match st.db.get_tool(id) {
+                Ok(Some(d)) => d,
+                _ => return Some(format!("unknown tool id '{id}'")),
+            }
+        };
+        if seen.iter().any(|(name, _)| name == &def.name) {
+            return Some(format!(
+                "duplicate tool '{}': bundled and custom tools with identical names \
+                 cannot both be selected",
+                def.name
+            ));
+        }
+        seen.push((def.name, def.id.clone()));
+    }
+    None
 }
 
 /// Validate that the agent's model is `provider/model` and the provider is registered.
@@ -641,6 +688,9 @@ pub(crate) async fn update_agent(
     }
     if let Some(err) = validate_agent_model(&st, &def) {
         return json_err(StatusCode::BAD_REQUEST, err);
+    }
+    if let Some(err) = validate_agent_caps(&st, &def) {
+        return json_err(StatusCode::BAD_REQUEST, &err);
     }
     def.id = uuid::Uuid::new_v4().to_string();
     let version_id = def.id.clone();
@@ -807,7 +857,8 @@ pub(crate) async fn delete_provider(
     }
 }
 
-/// List registered tools (bundled `core/` built-ins plus `custom/` tools from the DB).
+/// List tools as two distinct groups: bundled (immutable) and custom
+/// (editable). Names are bare; identity is the `id`.
 #[utoipa::path(
     get,
     path = "/api/tools",
@@ -816,43 +867,32 @@ pub(crate) async fn delete_provider(
     )
 )]
 pub(crate) async fn list_tools(State(st): State<AppState>) -> Response {
-    let mut tools: Vec<Value> = st
-        .ctx
-        .tool_runner
-        .specs()
-        .into_iter()
-        .map(|spec| {
-            let name = spec.name.clone();
-            if name.starts_with("custom/")
-                && let Ok(Some(def)) = st.db.get_tool_def(&name)
-            {
-                let mut v = serde_json::to_value(&def).unwrap_or(Value::Null);
-                if let Ok(Some(wasm)) = st.db.get_tool_wasm(&name)
-                    && let Some(obj) = v.as_object_mut()
-                {
-                    obj.insert(
-                        "wasm_b64".into(),
-                        Value::String(base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            wasm,
-                        )),
-                    );
-                }
-                v
-            } else {
-                serde_json::to_value(spec).unwrap_or(Value::Null)
-            }
-        })
+    let builtins: Vec<Value> = carson_host::host::builtin_tools()
+        .iter()
+        .map(|def| serde_json::to_value(def).unwrap_or(Value::Null))
         .collect();
-    tools.sort_by(|a, b| {
-        a.get("name")
-            .and_then(|n| n.as_str())
-            .cmp(&b.get("name").and_then(|n| n.as_str()))
-    });
-    json_ok(json!({"tools": tools, "total": tools.len()}))
+    let customs = match st.db.list_tools() {
+        Ok(t) => t,
+        Err(err) => {
+            return json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("db error: {err}"),
+            );
+        }
+    };
+    let customs: Vec<Value> = customs
+        .iter()
+        .map(|def| serde_json::to_value(def).unwrap_or(Value::Null))
+        .collect();
+    json_ok(json!({
+        "builtins": builtins,
+        "customs": customs,
+        "total": builtins.len() + customs.len(),
+    }))
 }
 
-/// Register a new `custom/` tool. The wasm module is base64-encoded in the request.
+/// Register a custom tool. The wasm module is base64-encoded in the request.
+/// A custom tool may reuse a bundled tool's name; agents disambiguate by id.
 #[utoipa::path(
     post,
     path = "/api/tools",
@@ -860,103 +900,168 @@ pub(crate) async fn list_tools(State(st): State<AppState>) -> Response {
     responses(
         (status = 201, description = "Tool created", body = ToolCommandResponse),
         (status = 400, description = "Invalid tool name or wasm", body = ErrorResponse),
+        (status = 409, description = "A custom tool with this name already exists", body = ErrorResponse),
         (status = 500, description = "Tool compile or db failure", body = ErrorResponse)
     )
 )]
 pub(crate) async fn create_tool(State(st): State<AppState>, Json(req): Json<ToolReq>) -> Response {
-    upsert_tool_common(&st, &req, "created", true)
-}
-
-fn upsert_tool_common(st: &AppState, req: &ToolReq, status: &str, created: bool) -> Response {
-    if !req.name.starts_with("custom/") {
+    if let Some(reason) = invalid_tool_name(&req.name) {
+        return json_err(StatusCode::BAD_REQUEST, reason);
+    }
+    if st
+        .db
+        .list_tools()
+        .map(|t| t.iter().any(|d| d.name == req.name))
+        .unwrap_or(false)
+    {
         return json_err(
-            StatusCode::BAD_REQUEST,
-            "tool name must start with 'custom/'",
+            StatusCode::CONFLICT,
+            "a custom tool with this name already exists",
         );
     }
-    let wasm =
-        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.wasm_b64) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                return json_err(
-                    StatusCode::BAD_REQUEST,
-                    &format!("invalid base64 wasm: {err}"),
-                );
-            }
-        };
-    if wasm.is_empty() {
-        return json_err(StatusCode::BAD_REQUEST, "wasm must not be empty");
-    }
-    let def = ToolDef {
-        name: req.name.clone(),
-        description: req.description.clone(),
-        parameters: req.parameters.clone(),
-        env: req.env.clone(),
-    };
-    if let Err(err) = st.db.upsert_tool(&def, &wasm) {
-        return json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("db error: {err}"),
-        );
-    }
-    match st.ctx.register_tool(&def, &wasm) {
-        Ok(()) => {}
-        Err(err) => {
-            return json_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("tool compile failed: {err}"),
-            );
-        }
-    }
-    if created {
-        json_created(json!({"name": def.name, "status": status}))
-    } else {
-        json_ok(json!({"name": def.name, "status": status}))
-    }
+    upsert_tool_common(&st, &req, "created", None)
 }
 
-/// Update an existing `custom/` tool.
+/// Update an existing custom tool by id.
 #[utoipa::path(
     put,
-    path = "/api/tools/{name}",
+    path = "/api/tools/{id}",
     params(
-        ("name" = String, Path, description = "Tool name")
+        ("id" = String, Path, description = "Tool id")
     ),
     request_body = ToolReq,
     responses(
         (status = 200, description = "Tool updated", body = ToolCommandResponse),
         (status = 400, description = "Invalid tool name or wasm", body = ErrorResponse),
+        (status = 404, description = "Unknown tool id", body = ErrorResponse),
         (status = 500, description = "Tool compile or db failure", body = ErrorResponse)
     )
 )]
 pub(crate) async fn update_tool(
     State(st): State<AppState>,
-    path: ToolNamePath,
+    path: ToolIdPath,
     Json(req): Json<ToolReq>,
 ) -> Response {
-    if req.name != path.name {
-        return json_err(StatusCode::BAD_REQUEST, "name in body must match path");
+    if carson_host::host::builtin_by_id(&path.id).is_some() {
+        return json_err(StatusCode::BAD_REQUEST, "bundled tools cannot be modified");
     }
-    upsert_tool_common(&st, &req, "updated", false)
+    if st.db.get_tool(&path.id).ok().flatten().is_none() {
+        return json_err(StatusCode::NOT_FOUND, "unknown tool id");
+    }
+    if req.name != item_name_of(&st, &path.id) {
+        // Renaming must not collide with another custom tool.
+        if st
+            .db
+            .list_tools()
+            .map(|t| t.iter().any(|d| d.name == req.name && d.id != path.id))
+            .unwrap_or(false)
+        {
+            return json_err(
+                StatusCode::CONFLICT,
+                "a custom tool with this name already exists",
+            );
+        }
+    }
+    upsert_tool_common(&st, &req, "updated", Some(path.id.clone()))
 }
 
-/// Delete a tool.
+fn item_name_of(st: &AppState, id: &str) -> String {
+    st.db
+        .get_tool(id)
+        .ok()
+        .flatten()
+        .map(|d| d.name)
+        .unwrap_or_default()
+}
+
+/// Shared create/update body: validate, decode, persist under `id` (a fresh
+/// uuid when creating), and register into the live runner.
+fn upsert_tool_common(st: &AppState, req: &ToolReq, status: &str, id: Option<String>) -> Response {
+    if let Some(reason) = invalid_tool_name(&req.name) {
+        return json_err(StatusCode::BAD_REQUEST, reason);
+    }
+    let wasm = match &req.wasm_b64 {
+        Some(b64) => {
+            match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64) {
+                Ok(bytes) if !bytes.is_empty() => bytes,
+                Ok(_) => {
+                    return json_err(StatusCode::BAD_REQUEST, "wasm must not be empty");
+                }
+                Err(err) => {
+                    return json_err(
+                        StatusCode::BAD_REQUEST,
+                        &format!("invalid base64 wasm: {err}"),
+                    );
+                }
+            }
+        }
+        None => {
+            // Update-only: keep the stored module.
+            let Some(id) = &id else {
+                return json_err(StatusCode::BAD_REQUEST, "wasm_b64 is required");
+            };
+            match st.db.get_tool_wasm(id) {
+                Ok(Some(bytes)) => bytes,
+                _ => return json_err(StatusCode::NOT_FOUND, "unknown tool id"),
+            }
+        }
+    };
+    let def = ToolDef {
+        id: id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        name: req.name.clone(),
+        description: req.description.clone(),
+        parameters: req.parameters.clone(),
+        env: req.env.clone(),
+    };
+    let db_result = match &id {
+        Some(_) => st.db.update_tool(&def, &wasm).map(|_| ()),
+        None => st.db.insert_tool(&def, &wasm),
+    };
+    if let Err(err) = db_result {
+        return json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("db error: {err}"),
+        );
+    }
+    if let Err(err) = st.ctx.register_tool(&def, &wasm) {
+        return json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("tool compile failed: {err}"),
+        );
+    }
+    let payload = json!({"id": def.id, "name": def.name, "status": status});
+    if id.is_none() {
+        json_created(payload)
+    } else {
+        json_ok(payload)
+    }
+}
+
+/// Delete a custom tool by id. Bundled tools are immutable.
 #[utoipa::path(
     delete,
-    path = "/api/tools/{name}",
+    path = "/api/tools/{id}",
     params(
-        ("name" = String, Path, description = "Tool name")
+        ("id" = String, Path, description = "Tool id")
     ),
     responses(
         (status = 200, description = "Tool deleted", body = ToolCommandResponse),
+        (status = 400, description = "Bundled tools cannot be deleted", body = ErrorResponse),
+        (status = 404, description = "Unknown tool id", body = ErrorResponse),
         (status = 500, description = "Db failure", body = ErrorResponse)
     )
 )]
-pub(crate) async fn delete_tool(State(st): State<AppState>, path: ToolNamePath) -> Response {
-    match st.db.delete_tool(&path.name) {
+pub(crate) async fn delete_tool(State(st): State<AppState>, path: ToolIdPath) -> Response {
+    if carson_host::host::builtin_by_id(&path.id).is_some() {
+        return json_err(StatusCode::BAD_REQUEST, "bundled tools cannot be deleted");
+    }
+    match st.db.delete_tool(&path.id) {
+        Ok(0) => json_err(StatusCode::NOT_FOUND, "unknown tool id"),
         Ok(_) => {
-            st.ctx.remove_tool(&path.name);
-            json_ok(json!({"name": path.name, "status": "deleted"}))
+            st.ctx.remove_tool(&path.id);
+            json_ok(json!({"id": path.id, "status": "deleted"}))
         }
         Err(err) => json_err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1714,37 +1819,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_tool_name_charset_is_validated() {
+        let app = router(app_state().await);
+        let engine = base64::engine::general_purpose::STANDARD;
+        let wasm =
+            base64::Engine::encode(&engine, carson_host::host::embedded_tool("time").unwrap());
+        for bad in ["bad.name", "", "a b", "ns/x"] {
+            let (status, _, body) = read(post(
+                &app,
+                "/api/tools",
+                &format!(
+                    r#"{{"name":"{bad}","description":"d","parameters":{{}},"env":{{}},"wasm_b64":"{wasm}"}}"#
+                ),
+            ).await)
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+        }
+        // A legal name passes validation (201).
+        let (status, _, body) = read(post(
+            &app,
+            "/api/tools",
+            &format!(
+                r#"{{"name":"good-name_1","description":"d","parameters":{{}},"env":{{}},"wasm_b64":"{wasm}"}}"#
+            ),
+        ).await)
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    #[tokio::test]
     async fn custom_tool_roundtrip() {
         let app = router(app_state().await);
         let engine = base64::engine::general_purpose::STANDARD;
         let wasm =
-            base64::Engine::encode(&engine, carson_host::host::embedded_tool("echo").unwrap());
+            base64::Engine::encode(&engine, carson_host::host::embedded_tool("time").unwrap());
         let (status, _, body) = read(post(
             &app,
             "/api/tools",
-            &format!(r#"{{"name":"custom/x","description":"d","parameters":{{}},"env":{{}},"wasm_b64":"{wasm}"}}"#),
+            &format!(r#"{{"name":"x","description":"d","parameters":{{}},"env":{{}},"wasm_b64":"{wasm}"}}"#),
         ).await)
         .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
+        let created: Value = serde_json::from_str(&body).unwrap();
+        let id = created["id"].as_str().unwrap().to_string();
+
         let (status, _, body) = read(response(app.clone(), "/api/tools").await).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("custom/x"), "{body}");
-        let (status, _, _) = read(delete(&app, "/api/tools/custom/x").await).await;
+        assert!(body.contains("\"x\""), "{body}");
+
+        // Same name again conflicts.
+        let (status, _, _) = read(post(
+            &app,
+            "/api/tools",
+            &format!(r#"{{"name":"x","description":"d","parameters":{{}},"env":{{}},"wasm_b64":"{wasm}"}}"#),
+        ).await)
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let (status, _, _) = read(delete(&app, &format!("/api/tools/{id}")).await).await;
         assert_eq!(status, StatusCode::OK);
     }
 
+    /// A custom tool may reuse a bundled tool's bare name; agents are the
+    /// disambiguation point.
     #[tokio::test]
-    async fn bundled_tool_name_is_rejected() {
+    async fn custom_tool_may_reuse_a_bundled_name() {
         let app = router(app_state().await);
         let engine = base64::engine::general_purpose::STANDARD;
         let wasm =
-            base64::Engine::encode(&engine, carson_host::host::embedded_tool("echo").unwrap());
+            base64::Engine::encode(&engine, carson_host::host::embedded_tool("time").unwrap());
         let (status, _, body) = read(post(
             &app,
             "/api/tools",
-            &format!(r#"{{"name":"core/time","description":"d","parameters":{{}},"env":{{}},"wasm_b64":"{wasm}"}}"#),
+            &format!(r#"{{"name":"time","description":"shadow","parameters":{{}},"env":{{}},"wasm_b64":"{wasm}"}}"#),
         ).await)
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(status, StatusCode::CREATED, "{body}");
     }
 }

@@ -30,24 +30,6 @@ struct MsgEntry {
     block: UiBlock,
 }
 
-/// A maximal run of consecutive assistant-side blocks sharing one bubble.
-/// `id` is the first entry's id, so a group stays mounted while its turn
-/// streams more blocks into it.
-#[derive(Clone)]
-struct Group {
-    id: u64,
-    entries: Vec<MsgEntry>,
-}
-
-impl Group {
-    fn starts_user(&self) -> bool {
-        matches!(
-            self.entries.first().map(|e| &e.block),
-            Some(UiBlock::User { .. })
-        )
-    }
-}
-
 #[derive(Clone, Default)]
 struct ToolCard {
     id: String,
@@ -146,21 +128,6 @@ fn build_history(v: &Value, next_id: &RwSignal<u64>) -> Vec<MsgEntry> {
                 }
             }
             _ => {}
-        }
-    }
-    out
-}
-
-fn bubble_groups(entries: Vec<MsgEntry>) -> Vec<Group> {
-    let mut out: Vec<Group> = Vec::new();
-    for e in entries {
-        let is_user = matches!(e.block, UiBlock::User { .. });
-        match out.last_mut() {
-            Some(g) if !is_user && !g.starts_user() => g.entries.push(e),
-            _ => out.push(Group {
-                id: e.id,
-                entries: vec![e],
-            }),
         }
     }
     out
@@ -435,24 +402,16 @@ fn block_child(entry: &MsgEntry) -> AnyView {
     }
 }
 
-/// Consecutive assistant-side blocks share one chat bubble, keeping the
-/// original order (thinking → text → tool cards → more text …).
-#[component]
-fn Bubble(group: Group) -> impl IntoView {
-    if group.starts_user() {
-        let content = match group.entries.first().map(|e| &e.block) {
-            Some(UiBlock::User { content }) => content.clone(),
-            _ => String::new(),
-        };
-        view! { <div class="msg user">{content}</div> }.into_any()
-    } else {
-        let entries = group.entries;
-        view! {
-            <div class="msg assistant">
-                <For each=move || entries.clone() key=|e: &MsgEntry| e.id children=move |e| block_child(&e)/>
-            </div>
+/// Render one log entry as its own card. The list is flat and keyed by entry
+/// id: streaming mounts new cards while already-mounted ones keep their
+/// signals, so streamed text grows in place and tool cards update live.
+fn entry_view(entry: &MsgEntry) -> AnyView {
+    match &entry.block {
+        UiBlock::User { .. } => block_child(entry),
+        UiBlock::Thinking { .. } | UiBlock::Text { .. } | UiBlock::ToolUse { .. } => {
+            let child = block_child(entry);
+            view! { <div class="msg assistant">{child}</div> }.into_any()
         }
-        .into_any()
     }
 }
 
@@ -511,7 +470,6 @@ pub fn ChatPage() -> impl IntoView {
     let selected_agent = RwSignal::new(String::new());
     let next_id = RwSignal::new(1u64);
     let drawer_open = RwSignal::new(false);
-    let sidebar_w = sidebar_width();
 
     // Auto-scroll: follow the stream only while `follow` is engaged. Any
     // user intent (wheel / touch / scrollbar grab) disengages it immediately
@@ -684,7 +642,7 @@ pub fn ChatPage() -> impl IntoView {
             <aside
                 class="sidebar"
                 class:open=drawer_open
-                style:width=move || format!("{}px", sidebar_w.get())
+                style:width=move || format!("{}px", sidebar_width().get())
             >
                 <div class="brand-row">
                     <h1>"Carson"</h1>
@@ -727,7 +685,7 @@ pub fn ChatPage() -> impl IntoView {
                 <a class="admin-link" href="/admin">"Admin"</a>
             </aside>
 
-            <DragRail width=sidebar_w/>
+            <DragRail/>
             <MenuButton open=drawer_open/>
 
             <main class="main">
@@ -759,19 +717,27 @@ pub fn ChatPage() -> impl IntoView {
                             <div
                                 class="messages"
                                 node_ref=messages_el
-                                on:scroll=move |_| {
-                                    if let Some(el) = messages_el.get() {
-                                        let near = el.scroll_top() + el.client_height()
-                                            >= el.scroll_height() - 48;
-                                        follow.set(near);
-                                    }
-                                }
                                 on:wheel=move |_| follow.set(false)
                                 on:touchstart=move |_| follow.set(false)
                                 on:mousedown=move |_| follow.set(false)
                             >
-                                <For each=move || bubble_groups(messages.get()) key=|g: &Group| g.id children=move |g| view! { <Bubble group=g/> }/>
+                                <For each=move || messages.get() key=|e: &MsgEntry| e.id children=move |e| entry_view(&e)/>
                             </div>
+                            {move || {
+                                (!follow.get()).then(|| {
+                                    view! {
+                                        <button
+                                            class="jump-pill"
+                                            on:click=move |_| {
+                                                follow.set(true);
+                                                scroll_tick.update(|t| *t += 1);
+                                            }
+                                        >
+                                            "↓ latest"
+                                        </button>
+                                    }
+                                })
+                            }}
                             <div class="composer">
                                 <textarea
                                     prop:value=move || input.get()

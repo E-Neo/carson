@@ -194,6 +194,38 @@ impl SseDecoder {
     }
 }
 
+/// Providers require every function's parameters to be a JSON Schema object
+/// of `type: "object"`. Normalize lenient inputs: objects without a type get
+/// one injected; anything that is not an object becomes a permissive
+/// empty-object schema.
+fn normalize_parameters(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut map = map.clone();
+            map.entry("type".to_string())
+                .or_insert_with(|| json!("object"));
+            serde_json::Value::Object(map)
+        }
+        _ => json!({"type": "object", "properties": {}}),
+    }
+}
+
+/// Providers constrain function names to `^[a-zA-Z0-9_-]+$`, so canonical
+/// names like `core/time` travel the wire as `core_time`. Canonical names
+/// carry exactly one slash, which makes this mapping injective.
+fn wire_tool_name(canonical: &str) -> String {
+    canonical.replacen('/', "_", 1)
+}
+
+/// Char-boundary-safe excerpt of a response body for logs and errors.
+fn excerpt(body: &str, max_chars: usize) -> String {
+    if body.chars().count() <= max_chars {
+        return body.to_string();
+    }
+    let cut: String = body.chars().take(max_chars).collect();
+    format!("{cut}…")
+}
+
 /// Removes one complete line (including its trailing `\n`) from `buffer`.
 fn pop_line(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
     let pos = buffer.iter().position(|&b| b == b'\n')?;
@@ -276,6 +308,28 @@ impl LlmDriver for OpenAiCompatDriver {
         let mut body = serde_json::Map::new();
         body.insert("model".into(), json!(req.model));
 
+        // Wire -> canonical lookup for names echoed back by the provider.
+        let canonical_of_wire: std::collections::HashMap<String, String> = req
+            .tools
+            .iter()
+            .map(|t| (wire_tool_name(&t.name), t.name.clone()))
+            .collect();
+        let translate = move |event: DriverEvent| match event {
+            DriverEvent::ToolCallStart(mut tc) => {
+                if let Some(name) = canonical_of_wire.get(&tc.name) {
+                    tc.name = name.clone();
+                }
+                DriverEvent::ToolCallStart(tc)
+            }
+            DriverEvent::ToolCallEnd(mut tc) => {
+                if let Some(name) = canonical_of_wire.get(&tc.name) {
+                    tc.name = name.clone();
+                }
+                DriverEvent::ToolCallEnd(tc)
+            }
+            other => other,
+        };
+
         let mut messages: Vec<serde_json::Value> = Vec::new();
         if let Some(system_prompt) = &req.system_prompt {
             messages.push(json!({"role": "system", "content": system_prompt}));
@@ -286,7 +340,7 @@ impl LlmDriver for OpenAiCompatDriver {
                     .tool_calls
                     .iter()
                     .map(|tc| {
-                        json!({"id": tc.id, "type": "function", "function": {"name": tc.name, "arguments": tc.arguments}})
+                        json!({"id": tc.id, "type": "function", "function": {"name": wire_tool_name(&tc.name), "arguments": tc.arguments}})
                     })
                     .collect();
                 messages
@@ -307,7 +361,7 @@ impl LlmDriver for OpenAiCompatDriver {
                 .tools
                 .iter()
                 .map(|t| {
-                    json!({"type": "function", "function": {"name": t.name, "description": t.description, "parameters": t.parameters}})
+                    json!({"type": "function", "function": {"name": wire_tool_name(&t.name), "description": t.description, "parameters": normalize_parameters(&t.parameters)}})
                 })
                 .collect();
             body.insert("tools".into(), json!(tools));
@@ -320,23 +374,53 @@ impl LlmDriver for OpenAiCompatDriver {
             body.insert("max_tokens".into(), json!(max_tokens));
         }
 
+        // The serialized payload is reused for the actual request so the
+        // logged body is byte-identical to what was sent.
+        let payload =
+            serde_json::to_string(&body).map_err(|err| DriverError::Internal(err.to_string()))?;
+        tracing::info!(
+            url = %url,
+            model = %req.model,
+            messages = req.messages.len(),
+            tools = req.tools.len(),
+            bytes = payload.len(),
+            "llm request"
+        );
+        tracing::debug!(body = %payload, "llm request body");
+
         let client = reqwest::Client::new();
-        let mut builder = client.post(&url).json(&body);
-        if !self.api_key.is_empty() {
-            builder = builder.bearer_auth(&self.api_key);
-        }
-        let resp = builder
-            .send()
-            .await
-            .map_err(|err| DriverError::Internal(format!("request to provider failed: {err}")))?;
+        let builder = client
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(payload.clone());
+        let builder = if self.api_key.is_empty() {
+            builder
+        } else {
+            builder.bearer_auth(&self.api_key)
+        };
+        let resp = match builder.send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                tracing::warn!(url = %url, error = %err, "llm request failed");
+                return Err(DriverError::Internal(format!(
+                    "request to provider failed: {err}"
+                )));
+            }
+        };
         if !resp.status().is_success() {
             let status = resp.status();
+            // The rejection body carries the provider's actual reason (unknown
+            // model, context length exceeded, ...): log it fully and surface
+            // an excerpt to clients.
+            let detail = resp.text().await.unwrap_or_default();
+            let shown = excerpt(&detail, 512);
+            tracing::warn!(status = %status, url = %url, body = %detail, "upstream rejected llm request");
             return Err(if status == reqwest::StatusCode::UNAUTHORIZED {
                 DriverError::Auth
             } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 DriverError::RateLimited
             } else {
-                DriverError::Internal(format!("upstream status {status}"))
+                DriverError::Internal(format!("upstream status {status}: {shown}"))
             });
         }
 
@@ -361,7 +445,7 @@ impl LlmDriver for OpenAiCompatDriver {
                     None => continue,
                 };
                 for event in events {
-                    if tx.send(event).is_err() {
+                    if tx.send(translate(event)).is_err() {
                         return Err(DriverError::Cancelled);
                     }
                 }
@@ -373,7 +457,7 @@ impl LlmDriver for OpenAiCompatDriver {
 
         let events = decoder.finish();
         for event in events {
-            if tx.send(event).is_err() {
+            if tx.send(translate(event)).is_err() {
                 return Err(DriverError::Cancelled);
             }
         }
@@ -628,6 +712,147 @@ mod tests {
         assert!(decoder.decode(r#"{"choices":[]}"#).is_none());
     }
 
+    /// A non-success response's body — where providers put the real reason —
+    /// must be surfaced in the error.
+    #[tokio::test]
+    async fn openai_surfaces_upstream_error_body() {
+        let body =
+            r#"{"error":{"message":"model xyz does not exist","type":"invalid_request_error"}}"#;
+        let base_url = stub_server(
+            body,
+            "HTTP/1.1 400 Bad Request",
+            std::sync::Arc::new(std::sync::Mutex::new(Recorded::default())),
+        )
+        .await;
+
+        let driver = OpenAiCompatDriver {
+            base_url,
+            api_key: String::new(),
+        };
+        let (tx, _rx) = mpsc::channel();
+        let err = driver.stream(openai_request(), tx).await.unwrap_err();
+        match err {
+            DriverError::Internal(msg) => {
+                assert!(msg.contains("400"), "{msg}");
+                assert!(msg.contains("model xyz does not exist"), "{msg}");
+            }
+            other => panic!("expected Internal error, got {other:?}"),
+        }
+    }
+
+    /// Canonical tool names (`core/time`) travel the wire sanitized and come
+    /// back translated to their canonical form.
+    #[tokio::test]
+    async fn openai_sanitizes_tool_names_on_the_wire() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+            "\"function\":{\"name\":\"core_time\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Recorded::default()));
+        let base_url = stub_server(body, "HTTP/1.1 200 OK", std::sync::Arc::clone(&recorded)).await;
+
+        let mut req = openai_request();
+        req.tools = vec![DriverToolDef {
+            name: "core/time".into(),
+            description: String::new(),
+            parameters: serde_json::Value::Null,
+        }];
+        // A prior turn's assistant message also carries the canonical name.
+        req.messages.push(DriverMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: vec![DriverToolCall {
+                id: "c0".into(),
+                name: "core/time".into(),
+                arguments: "{}".into(),
+            }],
+            tool_call_id: None,
+        });
+
+        let (tx, rx) = mpsc::channel();
+        OpenAiCompatDriver {
+            base_url,
+            api_key: String::new(),
+        }
+        .stream(req, tx)
+        .await
+        .unwrap();
+
+        // Outgoing: sanitized in both tools[] and message history.
+        let sent = recorded.lock().unwrap().body.clone();
+        assert!(sent.contains("\"name\":\"core_time\""), "{sent}");
+        assert!(!sent.contains("core/time"), "canonical name leaked: {sent}");
+
+        // Incoming: translated back to canonical for the guest/UI.
+        match rx.recv().unwrap() {
+            DriverEvent::ToolCallStart(tc) => assert_eq!(tc.name, "core/time"),
+            other => panic!("expected ToolCallStart, got {other:?}"),
+        }
+        match rx.recv().unwrap() {
+            DriverEvent::ToolCallEnd(tc) => assert_eq!(tc.name, "core/time"),
+            other => panic!("expected ToolCallEnd, got {other:?}"),
+        }
+        assert!(rx.recv().is_err(), "no events after [DONE]");
+    }
+
+    /// Lenient parameter schemas are normalized to what providers accept:
+    /// objects gain `type: "object"`, non-objects become permissive schemas.
+    #[tokio::test]
+    async fn openai_normalizes_parameter_schemas() {
+        let body = "data: [DONE]\n\n";
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Recorded::default()));
+        let base_url = stub_server(body, "HTTP/1.1 200 OK", std::sync::Arc::clone(&recorded)).await;
+
+        let mut req = openai_request();
+        req.tools = vec![
+            DriverToolDef {
+                name: "time".into(),
+                description: String::new(),
+                parameters: serde_json::Value::Null,
+            },
+            DriverToolDef {
+                name: "typed".into(),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+            },
+            DriverToolDef {
+                name: "rich".into(),
+                description: String::new(),
+                parameters: serde_json::json!({"type":"object","properties":{"x":{"type":"number"}}}),
+            },
+        ];
+        let (tx, _rx) = mpsc::channel();
+        OpenAiCompatDriver {
+            base_url,
+            api_key: String::new(),
+        }
+        .stream(req, tx)
+        .await
+        .unwrap();
+
+        let sent = recorded.lock().unwrap().body.clone();
+        let payload: serde_json::Value = serde_json::from_str(&sent).unwrap();
+        let fns: Vec<&serde_json::Value> = payload["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| &t["function"])
+            .collect();
+        // Null schema -> permissive object.
+        assert_eq!(
+            fns[0]["parameters"],
+            serde_json::json!({"type":"object","properties":{}})
+        );
+        // Empty object gains the type key.
+        assert_eq!(fns[1]["parameters"], serde_json::json!({"type":"object"}));
+        // A well-formed schema passes through untouched.
+        assert_eq!(
+            fns[2]["parameters"],
+            serde_json::json!({"type":"object","properties":{"x":{"type":"number"}}})
+        );
+    }
+
     fn openai_request() -> LlmRequest {
         LlmRequest {
             model: "mock".into(),
@@ -639,11 +864,19 @@ mod tests {
         }
     }
 
-    /// Serves one canned HTTP response, recording the Authorization header.
+    /// What the stub server saw from the client.
+    #[derive(Default)]
+    struct Recorded {
+        authorization: Option<String>,
+        body: String,
+    }
+
+    /// Serves one canned HTTP response, recording the Authorization header and
+    /// the JSON request body the driver sent.
     async fn stub_server(
         body: &'static str,
         status_line: &'static str,
-        authorization: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+        recorded: std::sync::Arc<std::sync::Mutex<Recorded>>,
     ) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -667,8 +900,12 @@ mod tests {
                 .lines()
                 .find(|l| l.to_ascii_lowercase().starts_with("authorization"))
             {
-                *authorization.lock().unwrap() = Some(line.to_string());
+                recorded.lock().unwrap().authorization = Some(line.to_string());
             }
+            recorded.lock().unwrap().body = request_text
+                .split_once("\r\n\r\n")
+                .map(|(_, payload)| payload.to_string())
+                .unwrap_or_default();
             let response = format!(
                 "{status_line}\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len(),
@@ -688,8 +925,8 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":9,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\n",
             "data: [DONE]\n\n",
         );
-        let authorization = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let base_url = stub_server(body, "HTTP/1.1 200 OK", authorization.clone()).await;
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Recorded::default()));
+        let base_url = stub_server(body, "HTTP/1.1 200 OK", std::sync::Arc::clone(&recorded)).await;
 
         let driver = OpenAiCompatDriver {
             base_url,
@@ -727,7 +964,7 @@ mod tests {
         );
         assert!(rx.try_recv().is_err(), "no events after [DONE]");
         assert_eq!(
-            authorization.lock().unwrap().as_deref(),
+            recorded.lock().unwrap().authorization.as_deref(),
             Some("authorization: Bearer test-key")
         );
     }
@@ -739,11 +976,16 @@ mod tests {
             ("HTTP/1.1 429 Too Many Requests", DriverError::RateLimited),
             (
                 "HTTP/1.1 500 Internal Server Error",
-                DriverError::Internal("upstream status 500 Internal Server Error".into()),
+                // Empty body: the excerpt suffix is empty.
+                DriverError::Internal("upstream status 500 Internal Server Error: ".into()),
             ),
         ] {
-            let authorization = std::sync::Arc::new(std::sync::Mutex::new(None));
-            let base_url = stub_server("", status_line, authorization).await;
+            let base_url = stub_server(
+                "",
+                status_line,
+                std::sync::Arc::new(std::sync::Mutex::new(Recorded::default())),
+            )
+            .await;
             let driver = OpenAiCompatDriver {
                 base_url,
                 api_key: String::new(),
