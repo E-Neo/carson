@@ -53,6 +53,7 @@ impl TurnUsage {
 
 struct Session {
     id: String,
+    agent_version_id: String,
     system_prompt: String,
     model: String,
     blocks: Vec<Block>,
@@ -75,15 +76,12 @@ fn now_ms() -> u64 {
     events::now_ms()
 }
 
-fn user_block(text: String) -> Block {
+fn user_block(version: &str, text: String) -> Block {
     let now = now_ms();
     Block {
+        agent_version_id: version.to_string(),
         kind: "user".into(),
         text: Some(text),
-        tool_call_id: None,
-        tool_name: None,
-        arguments_json: None,
-        is_error: false,
         input_tokens: 0,
         cache_read_tokens: 0,
         cache_creation_tokens: 0,
@@ -137,18 +135,30 @@ fn blocks_to_chat(blocks: &[Block]) -> Vec<Message> {
                     content.push_str(t);
                 }
             }
-            "tool-use" => calls.push(ToolCall {
-                id: b.tool_call_id.clone().unwrap_or_default(),
-                name: b.tool_name.clone().unwrap_or_default(),
-                arguments_json: b.arguments_json.clone().unwrap_or_default(),
-            }),
+            "tool-use" => {
+                let Ok(v) =
+                    serde_json::from_str::<serde_json::Value>(b.text.as_deref().unwrap_or(""))
+                else {
+                    continue;
+                };
+                calls.push(ToolCall {
+                    id: v["id"].as_str().unwrap_or_default().to_string(),
+                    name: v["name"].as_str().unwrap_or_default().to_string(),
+                    arguments_json: v["arguments"].as_str().unwrap_or_default().to_string(),
+                });
+            }
             "tool-result" => {
+                let Ok(v) =
+                    serde_json::from_str::<serde_json::Value>(b.text.as_deref().unwrap_or(""))
+                else {
+                    continue;
+                };
                 flush(&mut out, &mut content, &mut calls);
                 out.push(Message {
                     role: "tool".into(),
-                    content: b.text.clone(),
+                    content: Some(v["output"].as_str().unwrap_or_default().to_string()),
                     tool_calls: None,
-                    tool_call_id: b.tool_call_id.clone(),
+                    tool_call_id: Some(v["id"].as_str().unwrap_or_default().to_string()),
                 });
             }
             _ => {}
@@ -170,6 +180,7 @@ impl Guest for CarsonAgent {
             session_id.clone(),
             Session {
                 id: session_id,
+                agent_version_id: config.agent_version_id,
                 system_prompt: config.system_prompt,
                 model: config.model,
                 blocks: Vec::new(),
@@ -197,6 +208,7 @@ impl Guest for CarsonAgent {
             session_id.clone(),
             Session {
                 id: session_id,
+                agent_version_id: config.agent_version_id,
                 system_prompt: config.system_prompt,
                 model: config.model,
                 blocks: state.blocks,
@@ -262,7 +274,9 @@ impl Guest for CarsonAgent {
         let mut sessions = sessions().lock().unwrap();
         let session = sessions.get_mut(&session_id).ok_or(Error::NotFound)?;
         session.turn_usage = TurnUsage::default();
-        session.blocks.push(user_block(message));
+        session
+            .blocks
+            .push(user_block(&session.agent_version_id, message));
         let result = run_loop(session);
         // Fold the finished turn into the lifetime totals, but keep
         // `turn_usage` readable for `session-usage` until the next turn.
@@ -351,26 +365,23 @@ impl Seg {
         }
     }
 
-    fn into_block(self, finished: u64, usage: &Usage) -> Block {
-        let (kind, text, tool_call_id, tool_name, arguments_json, created) = match self {
-            Seg::Thinking { text, started } => ("thinking", Some(text), None, None, None, started),
-            Seg::Text { text, started } => ("text", Some(text), None, None, None, started),
+    fn into_block(self, version: &str, finished: u64, usage: &Usage) -> Block {
+        let (kind, text, created) = match self {
+            Seg::Thinking { text, started } => ("thinking", Some(text), started),
+            Seg::Text { text, started } => ("text", Some(text), started),
             Seg::ToolUse(tc) => (
                 "tool-use",
-                None,
-                Some(tc.id),
-                Some(tc.name),
-                Some(tc.arguments_json),
+                Some(
+                    json!({"id": tc.id, "name": tc.name, "arguments": tc.arguments_json})
+                        .to_string(),
+                ),
                 finished,
             ),
         };
         Block {
+            agent_version_id: version.to_string(),
             kind: kind.into(),
             text,
-            tool_call_id,
-            tool_name,
-            arguments_json,
-            is_error: false,
             input_tokens: usage.input_tokens,
             cache_read_tokens: usage.cache_read_tokens,
             cache_creation_tokens: usage.cache_creation_tokens,
@@ -381,15 +392,15 @@ impl Seg {
     }
 }
 
-fn tool_result_block(tc: &ToolCall, result: String, is_error: bool) -> Block {
+fn tool_result_block(version: &str, tc: &ToolCall, result: String, is_error: bool) -> Block {
     let started = now_ms();
     Block {
+        agent_version_id: version.to_string(),
         kind: "tool-result".into(),
-        text: Some(result),
-        tool_call_id: Some(tc.id.clone()),
-        tool_name: Some(tc.name.clone()),
-        arguments_json: None,
-        is_error,
+        text: Some(
+            json!({"id": tc.id, "name": tc.name, "output": result, "is_error": is_error})
+                .to_string(),
+        ),
         input_tokens: 0,
         cache_read_tokens: 0,
         cache_creation_tokens: 0,
@@ -495,7 +506,9 @@ fn run_loop(session: &mut Session) -> Result<(), Error> {
             if let Seg::ToolUse(tc) = &seg {
                 tool_calls.push(tc.clone());
             }
-            session.blocks.push(seg.into_block(finished, &turn_usage));
+            session
+                .blocks
+                .push(seg.into_block(&session.agent_version_id, finished, &turn_usage));
         }
 
         if tool_calls.is_empty() {
@@ -527,7 +540,12 @@ fn run_loop(session: &mut Session) -> Result<(), Error> {
                 "tool_result",
                 &tool_result_json(tc, &preview, is_error),
             );
-            session.blocks.push(tool_result_block(tc, result, is_error));
+            session.blocks.push(tool_result_block(
+                &session.agent_version_id,
+                tc,
+                result,
+                is_error,
+            ));
         }
     }
     Ok(())

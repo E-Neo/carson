@@ -95,6 +95,9 @@ interface agent {
     use llm.{message, usage};
 
     record session-config {
+        /// The agent version producing new blocks; stamped onto every block
+        /// the session creates so provenance survives compaction/migration.
+        agent-version-id: string,
         system-prompt: string,
         model: string,
         capabilities-json: string,
@@ -110,12 +113,9 @@ interface agent {
     /// or "system". Token counters carry the usage of the LLM call that
     /// produced the block (zero for user/tool-result entries).
     record block {
+        agent-version-id: string,
         kind: string,
         text: option<string>,
-        tool-call-id: option<string>,
-        tool-name: option<string>,
-        arguments-json: option<string>,
-        is-error: bool,
         input-tokens: u32,
         cache-read-tokens: u32,
         cache-creation-tokens: u32,

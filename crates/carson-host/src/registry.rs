@@ -118,6 +118,7 @@ impl AgentPool {
     /// The guest session config derived from this pool's agent definition.
     pub fn config(&self) -> crate::bindings::exports::carson::agent::agent::SessionConfig {
         crate::bindings::exports::carson::agent::agent::SessionConfig {
+            agent_version_id: self.version_id.clone(),
             system_prompt: self.def.system_prompt.clone(),
             model: self.def.model.clone(),
             capabilities_json: serde_json::json!(self.def.capabilities).to_string(),

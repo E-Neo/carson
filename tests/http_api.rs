@@ -56,6 +56,10 @@ fn ctx_with_fake() -> Arc<HostContext> {
 }
 
 async fn app() -> Router {
+    app_with_db().await.0
+}
+
+async fn app_with_db() -> (Router, Arc<Db>) {
     let config = config();
     let ctx = ctx_with_fake();
     let db = Db::open_in_memory().unwrap();
@@ -63,7 +67,15 @@ async fn app() -> Router {
     db.insert_agent_version(&coder).unwrap();
     db.set_current_agent("coder", &coder.id).unwrap();
     let registry = build_registry(&ctx, &[coder]).await.unwrap();
-    router(carson_host::app::build_app_state(ctx, registry, db, config))
+    (
+        router(carson_host::app::build_app_state(
+            ctx,
+            registry,
+            std::sync::Arc::clone(&db),
+            config,
+        )),
+        db,
+    )
 }
 
 async fn post(app: &Router, uri: &str, body: &str) -> (u16, Value) {
@@ -602,4 +614,63 @@ async fn agent_rejects_two_tools_with_the_same_name() {
             .is_some_and(|e| e.contains("duplicate tool 'time'")),
         "expected duplicate-name error: {body}"
     );
+}
+
+/// Per-block provenance survives an agent edit: messages generated before a
+/// repoint keep the old version id, only new turns stamp the new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_blocks_keep_their_original_agent_version() {
+    let (app, db) = app_with_db().await;
+
+    let (status, created) = post(
+        &app,
+        "/api/agents",
+        r#"{"name":"writer","model":"mock/mock","system_prompt":"v1"}"#,
+    )
+    .await;
+    assert_eq!(status, 201, "{created}");
+    let v1 = created["version_id"].as_str().unwrap().to_string();
+
+    let (_, sess) = post(&app, "/api/sessions", r#"{"agent":"writer"}"#).await;
+    let session_id = sess["session_id"].as_str().unwrap().to_string();
+
+    // Turn 1 under v1.
+    let (status, _) = post(
+        &app,
+        &format!("/api/sessions/{session_id}/message"),
+        r#"{"content":"first"}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // Repoint to v2.
+    let (_, updated) = put(
+        &app,
+        "/api/agents/writer",
+        r#"{"name":"writer","model":"mock/mock","system_prompt":"v2"}"#,
+    )
+    .await;
+    let v2 = updated["version_id"].as_str().unwrap().to_string();
+
+    // Turn 2 runs on v2 and syncs the session.
+    let (status, _) = post(
+        &app,
+        &format!("/api/sessions/{session_id}/message"),
+        r#"{"content":"second"}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // Inspect persisted blocks through the shared DB handle.
+    let sessions = db.load_sessions().unwrap();
+    let stored = sessions.iter().find(|s| s.id == session_id).unwrap();
+    let versions: Vec<&str> = stored
+        .messages
+        .iter()
+        .map(|b| b.agent_version_id.as_str())
+        .collect();
+    let v1_count = versions.iter().filter(|v| **v == v1).count();
+    let v2_count = versions.iter().filter(|v| **v == v2).count();
+    assert!(v1_count >= 2, "turn-1 blocks keep v1: {versions:?}");
+    assert!(v2_count >= 1, "turn-2 blocks stamped v2: {versions:?}");
 }

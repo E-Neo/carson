@@ -61,10 +61,6 @@ CREATE TABLE IF NOT EXISTS messages (
     agent_version_id TEXT NOT NULL,
     kind TEXT NOT NULL,
     content TEXT,
-    tool_call_id TEXT,
-    tool_name TEXT,
-    arguments_json TEXT,
-    is_error INTEGER NOT NULL DEFAULT 0,
     input_tokens INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
     cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
@@ -85,12 +81,11 @@ fn now_ms() -> i64 {
 /// One entry of the persisted conversation block log (mirrors the WIT `block`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredBlock {
+    pub agent_version_id: String,
     pub kind: String,
+    /// Plain text for user/thinking/text/system; a JSON payload for tool
+    /// kinds (`{"id","name","arguments"}` / `{"id","name","output","is_error"}`).
     pub text: Option<String>,
-    pub tool_call_id: Option<String>,
-    pub tool_name: Option<String>,
-    pub arguments_json: Option<String>,
-    pub is_error: bool,
     pub input_tokens: u32,
     pub cache_read_tokens: u32,
     pub cache_creation_tokens: u32,
@@ -102,12 +97,9 @@ pub struct StoredBlock {
 impl From<&crate::bindings::exports::carson::agent::agent::Block> for StoredBlock {
     fn from(b: &crate::bindings::exports::carson::agent::agent::Block) -> Self {
         Self {
+            agent_version_id: b.agent_version_id.clone(),
             kind: b.kind.clone(),
             text: b.text.clone(),
-            tool_call_id: b.tool_call_id.clone(),
-            tool_name: b.tool_name.clone(),
-            arguments_json: b.arguments_json.clone(),
-            is_error: b.is_error,
             input_tokens: b.input_tokens,
             cache_read_tokens: b.cache_read_tokens,
             cache_creation_tokens: b.cache_creation_tokens,
@@ -121,12 +113,9 @@ impl From<&crate::bindings::exports::carson::agent::agent::Block> for StoredBloc
 impl From<&StoredBlock> for crate::bindings::exports::carson::agent::agent::Block {
     fn from(b: &StoredBlock) -> Self {
         Self {
+            agent_version_id: b.agent_version_id.clone(),
             kind: b.kind.clone(),
             text: b.text.clone(),
-            tool_call_id: b.tool_call_id.clone(),
-            tool_name: b.tool_name.clone(),
-            arguments_json: b.arguments_json.clone(),
-            is_error: b.is_error,
             input_tokens: b.input_tokens,
             cache_read_tokens: b.cache_read_tokens,
             cache_creation_tokens: b.cache_creation_tokens,
@@ -437,19 +426,16 @@ impl Db {
         for (seq, block) in session.messages.iter().enumerate() {
             tx.execute(
                 "INSERT INTO messages (session_id, seq, agent_version_id, kind, content, \
-                 tool_call_id, tool_name, arguments_json, is_error, input_tokens, \
-                 cache_read_tokens, cache_creation_tokens, output_tokens, created_at, finished_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                 input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, \
+                 created_at, finished_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                 params![
                     session.id,
                     seq as i64,
-                    session.agent_version_id,
+                    // Per-block provenance: which agent version produced it.
+                    block.agent_version_id,
                     block.kind,
                     block.text,
-                    block.tool_call_id,
-                    block.tool_name,
-                    block.arguments_json,
-                    block.is_error as i64,
                     block.input_tokens,
                     block.cache_read_tokens,
                     block.cache_creation_tokens,
@@ -468,8 +454,8 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT s.id, s.agent_name, s.agent_version_id, s.summary, s.input_tokens, \
              s.cache_read_tokens, s.cache_creation_tokens, s.output_tokens, \
-             m.seq, m.kind, m.content, m.tool_call_id, m.tool_name, m.arguments_json, \
-             m.is_error, m.input_tokens, m.cache_read_tokens, m.cache_creation_tokens, \
+             m.seq, m.agent_version_id, m.kind, m.content, m.input_tokens, \
+             m.cache_read_tokens, m.cache_creation_tokens, \
              m.output_tokens, m.created_at, m.finished_at \
              FROM sessions s LEFT JOIN messages m ON m.session_id = s.id \
              ORDER BY s.rowid, m.seq",
@@ -477,18 +463,15 @@ impl Db {
         let rows = stmt.query_map([], |row| {
             let block = if row.get::<_, Option<i64>>(8)?.is_some() {
                 Some(MessageRow(StoredBlock {
-                    kind: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
-                    text: row.get(10)?,
-                    tool_call_id: row.get(11)?,
-                    tool_name: row.get(12)?,
-                    arguments_json: row.get(13)?,
-                    is_error: row.get::<_, i64>(14)? != 0,
-                    input_tokens: row.get::<_, i64>(15)? as u32,
-                    cache_read_tokens: row.get::<_, i64>(16)? as u32,
-                    cache_creation_tokens: row.get::<_, i64>(17)? as u32,
-                    output_tokens: row.get::<_, i64>(18)? as u32,
-                    created_at_ms: row.get::<_, Option<i64>>(19)?.unwrap_or(0) as u64,
-                    finished_at_ms: row.get::<_, Option<i64>>(20)?.unwrap_or(0) as u64,
+                    agent_version_id: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                    kind: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                    text: row.get(11)?,
+                    input_tokens: row.get::<_, i64>(12)? as u32,
+                    cache_read_tokens: row.get::<_, i64>(13)? as u32,
+                    cache_creation_tokens: row.get::<_, i64>(14)? as u32,
+                    output_tokens: row.get::<_, i64>(15)? as u32,
+                    created_at_ms: row.get::<_, Option<i64>>(16)?.unwrap_or(0) as u64,
+                    finished_at_ms: row.get::<_, Option<i64>>(17)?.unwrap_or(0) as u64,
                 }))
             } else {
                 None
@@ -577,14 +560,11 @@ mod tests {
         }
     }
 
-    fn block(kind: &str, text: &str) -> StoredBlock {
+    fn block(version: &str, kind: &str, text: &str) -> StoredBlock {
         StoredBlock {
+            agent_version_id: version.into(),
             kind: kind.into(),
             text: Some(text.into()),
-            tool_call_id: None,
-            tool_name: None,
-            arguments_json: None,
-            is_error: false,
             input_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
@@ -652,25 +632,28 @@ mod tests {
     fn session_block_roundtrip() {
         let db = Db::open_in_memory().unwrap();
         let agent = create_agent(&db, "coder");
-        let mut thinking = block("thinking", "let me reason");
+        let mut thinking = block(&agent.id, "thinking", "let me reason");
         thinking.input_tokens = 7;
         thinking.output_tokens = 3;
-        let mut call = block("tool-use", "");
-        call.tool_call_id = Some("c1".into());
-        call.tool_name = Some("core/time".into());
-        call.arguments_json = Some("{}".into());
-        let mut result = block("tool-result", "{\"time\":\"2026-01-01T00:00:00.000Z\"}");
-        result.tool_call_id = Some("c1".into());
-        result.is_error = false;
+        let call = block(
+            &agent.id,
+            "tool-use",
+            r#"{"id":"c1","name":"time","arguments":"{}"}"#,
+        );
+        let result = block(
+            &agent.id,
+            "tool-result",
+            r#"{"id":"c1","name":"time","output":"{\"time\":\"2026-01-01T00:00:00.000Z\"}","is_error":false}"#,
+        );
 
         let persisted = session(
             "sess-1",
             "coder",
             &agent.id,
             vec![
-                block("user", "hi"),
+                block("v0", "user", "hi"),
                 thinking,
-                block("text", "hello"),
+                block(&agent.id, "text", "hello"),
                 call,
                 result,
             ],
@@ -689,8 +672,20 @@ mod tests {
         assert_eq!(s.messages[0].text.as_deref(), Some("hi"));
         assert_eq!(s.messages[1].kind, "thinking");
         assert_eq!(s.messages[1].input_tokens, 7);
-        assert_eq!(s.messages[3].tool_name.as_deref(), Some("core/time"));
-        assert!(!s.messages[4].is_error);
+        // Per-block provenance: the "user" block kept its legacy stamp while
+        // the assistant-side blocks carry the creating version.
+        assert_eq!(s.messages[0].agent_version_id, "v0");
+        assert_eq!(s.messages[1].agent_version_id, agent.id);
+
+        // Tool payloads decode out of the content JSON.
+        let call_payload: serde_json::Value =
+            serde_json::from_str(s.messages[3].text.as_deref().unwrap()).unwrap();
+        assert_eq!(call_payload["name"], "time");
+        assert_eq!(call_payload["arguments"], "{}");
+        let result_payload: serde_json::Value =
+            serde_json::from_str(s.messages[4].text.as_deref().unwrap()).unwrap();
+        assert_eq!(result_payload["is_error"], false);
+        assert!(result_payload["output"].as_str().unwrap().contains("2026-"));
         assert_eq!(s.usage.input_tokens, 10);
     }
 
@@ -698,13 +693,18 @@ mod tests {
     fn upsert_session_replaces_blocks() {
         let db = Db::open_in_memory().unwrap();
         let agent = create_agent(&db, "coder");
-        db.upsert_session(&session("s", "coder", &agent.id, vec![block("user", "a")]))
-            .unwrap();
         db.upsert_session(&session(
             "s",
             "coder",
             &agent.id,
-            vec![block("user", "a"), block("user", "b")],
+            vec![block("v", "user", "a")],
+        ))
+        .unwrap();
+        db.upsert_session(&session(
+            "s",
+            "coder",
+            &agent.id,
+            vec![block("v", "user", "a"), block("v", "user", "b")],
         ))
         .unwrap();
         let loaded = db.load_sessions().unwrap();
@@ -716,8 +716,13 @@ mod tests {
     fn delete_session_removes_rows() {
         let db = Db::open_in_memory().unwrap();
         let agent = create_agent(&db, "coder");
-        db.upsert_session(&session("s", "coder", &agent.id, vec![block("user", "x")]))
-            .unwrap();
+        db.upsert_session(&session(
+            "s",
+            "coder",
+            &agent.id,
+            vec![block("v", "user", "x")],
+        ))
+        .unwrap();
         db.delete_session("s").unwrap();
         assert!(db.load_sessions().unwrap().is_empty());
     }

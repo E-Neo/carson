@@ -1186,16 +1186,24 @@ pub(crate) async fn get_session(State(st): State<AppState>, path: SessionPath) -
         .ok()
         .flatten()
         .map(|def| def.model);
+    // Tool blocks carry their identity/payload as a JSON envelope inside the
+    // content; project it back into flat fields for clients.
     let messages: Vec<Value> = blocks
         .iter()
         .map(|b| {
+            let payload: Value =
+                serde_json::from_str(b.text.as_deref().unwrap_or("")).unwrap_or(Value::Null);
+            let text = match b.kind.as_str() {
+                "tool-result" => payload["output"].as_str().map(String::from),
+                _ => b.text.clone(),
+            };
             json!({
                 "kind": b.kind,
-                "text": b.text,
-                "tool_call_id": b.tool_call_id,
-                "tool_name": b.tool_name,
-                "arguments": b.arguments_json,
-                "is_error": b.is_error,
+                "text": text,
+                "tool_call_id": payload.get("id").and_then(|v| v.as_str()),
+                "tool_name": payload.get("name").and_then(|v| v.as_str()),
+                "arguments": payload.get("arguments").and_then(|v| v.as_str()),
+                "is_error": payload.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false),
                 "input_tokens": b.input_tokens,
                 "cache_read_tokens": b.cache_read_tokens,
                 "cache_creation_tokens": b.cache_creation_tokens,

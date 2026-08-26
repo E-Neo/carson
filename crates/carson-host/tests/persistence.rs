@@ -66,6 +66,7 @@ fn crate_config(
 ) -> carson_host::bindings::exports::carson::agent::agent::SessionConfig {
     use carson_host::bindings::exports::carson::agent::agent::SessionConfig;
     SessionConfig {
+        agent_version_id: def.id.clone(),
         system_prompt: def.system_prompt.clone(),
         model: def.model.clone(),
         capabilities_json: serde_json::json!(def.capabilities).to_string(),
@@ -219,20 +220,24 @@ async fn tool_turn_persists_ordered_blocks() {
         .iter()
         .find(|b| b.kind == "tool-use")
         .unwrap();
-    assert_eq!(call.tool_name.as_deref(), Some("time"));
-    assert_eq!(call.arguments_json.as_deref(), Some("{}"));
+    let call_payload: serde_json::Value =
+        serde_json::from_str(call.text.as_deref().unwrap()).unwrap();
+    assert_eq!(call_payload["name"], "time");
+    assert_eq!(call_payload["arguments"], "{}");
+    assert_eq!(call.agent_version_id, agent.id, "provenance stamped");
+
     let result = session
         .messages
         .iter()
         .find(|b| b.kind == "tool-result")
         .unwrap();
-    assert_eq!(result.tool_call_id, call.tool_call_id);
+    let result_payload: serde_json::Value =
+        serde_json::from_str(result.text.as_deref().unwrap()).unwrap();
+    assert_eq!(result_payload["id"], call_payload["id"]);
     assert!(
-        result
-            .text
-            .as_deref()
-            .unwrap_or_default()
-            .contains("\"time\"")
+        result_payload["output"].as_str().unwrap().contains("time"),
+        "result output: {}",
+        result_payload["output"]
     );
     // Assistant-side blocks carry the LLM usage of their turn.
     assert!(call.input_tokens > 0 || call.output_tokens > 0);
@@ -242,12 +247,9 @@ async fn tool_turn_persists_ordered_blocks() {
 #[test]
 fn stored_block_metadata_roundtrip() {
     let block = StoredBlock {
+        agent_version_id: "v9".into(),
         kind: "thinking".into(),
         text: Some("hmm".into()),
-        tool_call_id: None,
-        tool_name: None,
-        arguments_json: None,
-        is_error: false,
         input_tokens: 11,
         cache_read_tokens: 3,
         cache_creation_tokens: 1,
@@ -262,4 +264,5 @@ fn stored_block_metadata_roundtrip() {
     let back = StoredBlock::from(&wit);
     assert_eq!(back.input_tokens, 11);
     assert_eq!(back.cache_read_tokens, 3);
+    assert_eq!(back.agent_version_id, "v9");
 }

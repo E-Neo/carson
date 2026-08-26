@@ -27,6 +27,8 @@ enum UiBlock {
 #[derive(Clone)]
 struct MsgEntry {
     id: u64,
+    /// (created_ms, finished_ms); finished == 0 while the turn streams.
+    times: RwSignal<(u64, u64)>,
     block: UiBlock,
 }
 
@@ -37,6 +39,10 @@ struct ToolCard {
     arguments: String,
     result: Option<String>,
     is_error: bool,
+}
+
+fn now_ms() -> u64 {
+    js_sys::Date::now() as u64
 }
 
 fn alloc_id(next_id: &RwSignal<u64>) -> u64 {
@@ -84,24 +90,40 @@ fn build_history(v: &Value, next_id: &RwSignal<u64>) -> Vec<MsgEntry> {
         match m.get("kind").and_then(|k| k.as_str()).unwrap_or("") {
             "user" => out.push(MsgEntry {
                 id: alloc_id(next_id),
+                times: RwSignal::new((
+                    m["created_at_ms"].as_u64().unwrap_or(0),
+                    m["finished_at_ms"].as_u64().unwrap_or(0),
+                )),
                 block: UiBlock::User {
                     content: text_of(m),
                 },
             }),
             "thinking" => out.push(MsgEntry {
                 id: alloc_id(next_id),
+                times: RwSignal::new((
+                    m["created_at_ms"].as_u64().unwrap_or(0),
+                    m["finished_at_ms"].as_u64().unwrap_or(0),
+                )),
                 block: UiBlock::Thinking {
                     text: RwSignal::new(text_of(m)),
                 },
             }),
             "text" => out.push(MsgEntry {
                 id: alloc_id(next_id),
+                times: RwSignal::new((
+                    m["created_at_ms"].as_u64().unwrap_or(0),
+                    m["finished_at_ms"].as_u64().unwrap_or(0),
+                )),
                 block: UiBlock::Text {
                     text: RwSignal::new(text_of(m)),
                 },
             }),
             "tool-use" => out.push(MsgEntry {
                 id: alloc_id(next_id),
+                times: RwSignal::new((
+                    m["created_at_ms"].as_u64().unwrap_or(0),
+                    m["finished_at_ms"].as_u64().unwrap_or(0),
+                )),
                 block: UiBlock::ToolUse {
                     card: RwSignal::new(ToolCard {
                         id: str_of(m, "tool_call_id"),
@@ -153,6 +175,7 @@ async fn load_history(
     error: &RwSignal<Option<String>>,
     scroll_tick: &RwSignal<u64>,
     follow: &RwSignal<bool>,
+    at_latest: &RwSignal<bool>,
     next_id: &RwSignal<u64>,
 ) {
     if let Ok((status, v)) = api::get(&format!("/api/sessions/{id}")).await {
@@ -164,6 +187,7 @@ async fn load_history(
     }
     // Fresh content lands at the bottom; resume following there.
     follow.set(true);
+    at_latest.set(true);
     scroll_tick.update(|t| *t += 1);
 }
 
@@ -179,15 +203,24 @@ fn stream_text(
     extract: fn(&mut UiBlock) -> Option<&mut RwSignal<String>>,
     text: &str,
 ) {
+    // Signals are created OUTSIDE any update closure and ids are allocated
+    // before entering the borrow: nested signal writes were trapping wasm
+    // mid-stream.
     let last_matches = messages.with_untracked(|m| m.last().map(|e| matches_kind(&e.block)));
     if !last_matches.unwrap_or(false) {
-        messages.update(|m| {
-            m.push(MsgEntry {
-                id: alloc_id(next_id),
-                block: make(),
-            })
-        });
+        let id = alloc_id(next_id);
+        let times = RwSignal::new((now_ms(), 0));
+        let block = make();
+        messages.update(|m| m.push(MsgEntry { id, times, block }));
     }
+    append_last(messages, text, extract);
+}
+
+fn append_last(
+    messages: &RwSignal<Vec<MsgEntry>>,
+    text: &str,
+    extract: fn(&mut UiBlock) -> Option<&mut RwSignal<String>>,
+) {
     messages.update(|m| {
         if let Some(buf) = m.last_mut().and_then(|e| extract(&mut e.block)) {
             buf.update(|s| s.push_str(text));
@@ -206,15 +239,19 @@ fn send(
     status_line: RwSignal<Option<String>>,
     scroll_tick: RwSignal<u64>,
     follow: RwSignal<bool>,
+    at_latest: RwSignal<bool>,
     next_id: RwSignal<u64>,
 ) {
     let text = input.get().trim().to_string();
     if text.is_empty() || running.get() {
         return;
     }
+    let id = alloc_id(&next_id);
+    let times = RwSignal::new((now_ms(), 0));
     messages.update(|m| {
         m.push(MsgEntry {
-            id: alloc_id(&next_id),
+            id,
+            times,
             block: UiBlock::User {
                 content: text.clone(),
             },
@@ -227,6 +264,7 @@ fn send(
     status_line.set(None);
     // The user asked for this reply; follow it regardless of prior scroll.
     follow.set(true);
+    at_latest.set(true);
     scroll_tick.update(|t| *t += 1);
 
     let path = format!("/api/sessions/{session_id}/stream");
@@ -271,16 +309,18 @@ fn send(
             }
             "tool_use" => {
                 if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
+                    let id = alloc_id(&next_id);
+                    let times = RwSignal::new((now_ms(), 0));
+                    let card = RwSignal::new(ToolCard {
+                        id: str_of(&v, "id"),
+                        name: str_of(&v, "name"),
+                        ..Default::default()
+                    });
                     messages.update(|m| {
                         m.push(MsgEntry {
-                            id: alloc_id(&next_id),
-                            block: UiBlock::ToolUse {
-                                card: RwSignal::new(ToolCard {
-                                    id: str_of(&v, "id"),
-                                    name: str_of(&v, "name"),
-                                    ..Default::default()
-                                }),
-                            },
+                            id,
+                            times,
+                            block: UiBlock::ToolUse { card },
                         });
                     });
                     scroll_tick.update(|t| *t += 1);
@@ -324,6 +364,18 @@ fn send(
                 {
                     usage.set(Some(fmt_usage(u)));
                 }
+                // Stamp finish time on blocks still open (finished == 0).
+                let finished = now_ms();
+                let open: Vec<RwSignal<(u64, u64)>> = messages.with_untracked(|m| {
+                    m.iter()
+                        .filter(|e| e.times.get_untracked().1 == 0)
+                        .map(|e| e.times)
+                        .collect()
+                });
+                for t in open {
+                    t.update(|(_created, fin)| *fin = finished);
+                }
+                scroll_tick.update(|t| *t += 1);
                 running.set(false);
             }
             _ => {}
@@ -337,22 +389,21 @@ fn send(
 }
 
 fn for_each_card(messages: &RwSignal<Vec<MsgEntry>>, id: &str, f: &impl Fn(&mut ToolCard)) {
-    messages.update(|m| {
-        for e in m.iter().rev() {
-            if let UiBlock::ToolUse { card } = &e.block {
-                let mut hit = false;
-                card.update(|c| {
-                    if c.id == id {
-                        f(c);
-                        hit = true;
-                    }
-                });
-                if hit {
-                    break;
-                }
-            }
-        }
+    // Phase 1 (untracked read): collect the matching card signals.
+    let targets: Vec<RwSignal<ToolCard>> = messages.with_untracked(|m| {
+        m.iter()
+            .rev()
+            .filter_map(|e| match &e.block {
+                UiBlock::ToolUse { card } if card.get_untracked().id == id => Some(*card),
+                _ => None,
+            })
+            .take(1)
+            .collect()
     });
+    // Phase 2: mutate outside the messages borrow.
+    for card in targets {
+        card.update(f);
+    }
 }
 
 fn last_is_text(block: &UiBlock) -> bool {
@@ -402,15 +453,55 @@ fn block_child(entry: &MsgEntry) -> AnyView {
     }
 }
 
+fn fmt_clock(ms: u64) -> String {
+    let d = js_sys::Date::new(&ms.into());
+    format!(
+        "{:02}:{:02}:{:02}",
+        d.get_hours(),
+        d.get_minutes(),
+        d.get_seconds()
+    )
+}
+
+/// Muted per-card timestamp: local clock on creation plus a duration when
+/// finishing took a measurable amount of time. Hover shows the full ISO.
+fn time_footer(times: RwSignal<(u64, u64)>) -> AnyView {
+    view! {
+        <div class="msg-time" title=move || {
+            let (created, _) = times.get_untracked();
+            if created == 0 { String::new() } else { js_sys::Date::new(&(created as f64).into()).to_iso_string().into() }
+        }>
+            {move || {
+                let (created, finished) = times.get();
+                if created == 0 {
+                    None
+                } else {
+                    let mut label = fmt_clock(created);
+                    if finished > created + 1000 {
+                        label.push_str(&format!(" \u{b7} {:.1}s", (finished - created) as f64 / 1000.0));
+                    }
+                    Some(label)
+                }
+            }}
+        </div>
+    }
+    .into_any()
+}
+
 /// Render one log entry as its own card. The list is flat and keyed by entry
 /// id: streaming mounts new cards while already-mounted ones keep their
 /// signals, so streamed text grows in place and tool cards update live.
 fn entry_view(entry: &MsgEntry) -> AnyView {
     match &entry.block {
-        UiBlock::User { .. } => block_child(entry),
+        UiBlock::User { .. } => {
+            let child = block_child(entry);
+            let footer = time_footer(entry.times);
+            view! { <div class="msg user">{child} {footer}</div> }.into_any()
+        }
         UiBlock::Thinking { .. } | UiBlock::Text { .. } | UiBlock::ToolUse { .. } => {
             let child = block_child(entry);
-            view! { <div class="msg assistant">{child}</div> }.into_any()
+            let footer = time_footer(entry.times);
+            view! { <div class="msg assistant">{child} {footer}</div> }.into_any()
         }
     }
 }
@@ -478,6 +569,11 @@ pub fn ChatPage() -> impl IntoView {
     // resets it.
     let messages_el = NodeRef::<leptos::html::Div>::new();
     let follow = RwSignal::new(true);
+    let at_latest = RwSignal::new(true);
+    // Programmatic pins stamp this timestamp; scroll events within the window
+    // are our own echo and are ignored, so they can never re-engage or
+    // mislabel visibility.
+    let pinned_until = RwSignal::new(0f64);
     let scroll_tick = RwSignal::new(0u64);
 
     Effect::new(move |_| {
@@ -487,9 +583,16 @@ pub fn ChatPage() -> impl IntoView {
             return;
         }
         if let Some(el) = messages_el.get() {
+            pinned_until.set(js_sys::Date::now() + 80.0);
             el.set_scroll_top(el.scroll_height());
         }
     });
+
+    let pin_to_latest = move || {
+        follow.set(true);
+        at_latest.set(true);
+        scroll_tick.update(|t| *t += 1);
+    };
 
     spawn_local(async move { refresh_sessions_async(sessions).await });
     spawn_local(async move {
@@ -512,9 +615,19 @@ pub fn ChatPage() -> impl IntoView {
             let error = error;
             let scroll_tick = scroll_tick;
             let follow = follow;
+            let at_latest = at_latest;
             let next_id = next_id;
             spawn_local(async move {
-                load_history(&id, &messages, &error, &scroll_tick, &follow, &next_id).await;
+                load_history(
+                    &id,
+                    &messages,
+                    &error,
+                    &scroll_tick,
+                    &follow,
+                    &at_latest,
+                    &next_id,
+                )
+                .await;
             });
         } else {
             active.set(None);
@@ -556,6 +669,7 @@ pub fn ChatPage() -> impl IntoView {
                 status_line,
                 scroll_tick,
                 follow,
+                at_latest,
                 next_id,
             );
         }
@@ -604,10 +718,20 @@ pub fn ChatPage() -> impl IntoView {
             let error = error;
             let scroll_tick = scroll_tick;
             let follow = follow;
+            let at_latest = at_latest;
             let next_id = next_id;
             spawn_local(async move {
                 let _ = api::post(&format!("/api/sessions/{id}/reset"), &json!({})).await;
-                load_history(&id, &messages, &error, &scroll_tick, &follow, &next_id).await;
+                load_history(
+                    &id,
+                    &messages,
+                    &error,
+                    &scroll_tick,
+                    &follow,
+                    &at_latest,
+                    &next_id,
+                )
+                .await;
             });
         }
     };
@@ -618,10 +742,20 @@ pub fn ChatPage() -> impl IntoView {
             let error = error;
             let scroll_tick = scroll_tick;
             let follow = follow;
+            let at_latest = at_latest;
             let next_id = next_id;
             spawn_local(async move {
                 let _ = api::post(&format!("/api/sessions/{id}/compact"), &json!({})).await;
-                load_history(&id, &messages, &error, &scroll_tick, &follow, &next_id).await;
+                load_history(
+                    &id,
+                    &messages,
+                    &error,
+                    &scroll_tick,
+                    &follow,
+                    &at_latest,
+                    &next_id,
+                )
+                .await;
             });
         }
     };
@@ -638,177 +772,188 @@ pub fn ChatPage() -> impl IntoView {
     });
 
     view! {
-        <div class="app">
-            <aside
-                class="sidebar"
-                class:open=drawer_open
-                style:width=move || format!("{}px", sidebar_width().get())
-            >
-                <div class="brand-row">
-                    <h1>"Carson"</h1>
-                    <div class="sub">"Chat"</div>
-                </div>
-                <button class="btn primary" on:click=move |_| new_chat()>"+ New chat"</button>
-                <div class="session-list">
-                    <For
-                        each=move || sessions.get()
-                        key=|s: &SessionSummary| s.id.clone()
-                        children=move |session: SessionSummary| {
-                            let sid = session.id.clone();
-                            let active_class = move || {
-                                if active.get().as_ref() == Some(&sid) {
-                                    "session-item active"
-                                } else {
-                                    "session-item"
+            <div class="app">
+                <aside
+                    class="sidebar"
+                    class:open=drawer_open
+                    style:width=move || format!("{}px", sidebar_width().get())
+                >
+                    <div class="brand-row">
+                        <h1>"Carson"</h1>
+                        <div class="sub">"Chat"</div>
+                    </div>
+                    <button class="btn primary" on:click=move |_| new_chat()>"+ New chat"</button>
+                    <div class="session-list">
+                        <For
+                            each=move || sessions.get()
+                            key=|s: &SessionSummary| s.id.clone()
+                            children=move |session: SessionSummary| {
+                                let sid = session.id.clone();
+                                let active_class = move || {
+                                    if active.get().as_ref() == Some(&sid) {
+                                        "session-item active"
+                                    } else {
+                                        "session-item"
+                                    }
+                                };
+                                let label = format!("{} · {}", short_id(&session.id), session.agent);
+                                let id_del = session.id.clone();
+                                let id_sel = session.id.clone();
+                                view! {
+                                    <div class=active_class>
+                                        <button class="name" on:click=move |_| select_session(id_sel.clone())>
+                                            {label}
+                                        </button>
+                                        <button
+                                            class="del"
+                                            title="Delete session"
+                                            on:click=move |_| delete_session(id_del.clone())
+                                        >
+                                            "x"
+                                        </button>
+                                    </div>
                                 }
-                            };
-                            let label = format!("{} · {}", short_id(&session.id), session.agent);
-                            let id_del = session.id.clone();
-                            let id_sel = session.id.clone();
+                            }
+                        />
+                    </div>
+                    <a class="admin-link" href="/admin">"Admin"</a>
+                </aside>
+
+                <DragRail/>
+                <MenuButton open=drawer_open/>
+
+                <main class="main">
+                    {move || {
+                        if active.get().is_some() {
                             view! {
-                                <div class=active_class>
-                                    <button class="name" on:click=move |_| select_session(id_sel.clone())>
-                                        {label}
+                                <div class="toolbar">
+                                    <div class="title">
+                                        {move || {
+                                            let id = active.get().map(|i| short_id(&i)).unwrap_or_default();
+                                            if active_agent.get().is_empty() {
+                                                format!("Session {id}")
+                                            } else {
+                                                format!("Session {id} · {}", active_agent.get())
+                                            }
+                                        }}
+                                    </div>
+                                    <button class="btn" disabled=move || !running.get() on:click=move |_| stop_session()>
+                                        "Stop"
                                     </button>
-                                    <button
-                                        class="del"
-                                        title="Delete session"
-                                        on:click=move |_| delete_session(id_del.clone())
-                                    >
-                                        "x"
+                                    <button class="btn" on:click=move |_| reset_session()>"Reset"</button>
+                                    <button class="btn" on:click=move |_| compact_session()>"Compact"</button>
+                                    <button class="btn danger" on:click=move |_| {
+                                        if let Some(id) = active.get() {
+                                            delete_session(id);
+                                        }
+                                    }>"Delete"</button>
+                                </div>
+                                <div
+                                    class="messages"
+                                    node_ref=messages_el
+                                    on:wheel=move |_| follow.set(false)
+                                    on:touchstart=move |_| follow.set(false)
+                                    on:mousedown=move |_| follow.set(false)
+                                    on:scroll=move |_| {
+                                        if js_sys::Date::now() < pinned_until.get_untracked() {
+                                            return; // our own pin echoing back
+                                        }
+                                        let Some(el) = messages_el.get() else { return };
+                                        let near = el.scroll_top() + el.client_height()
+                                            >= el.scroll_height() - 48;
+                                        at_latest.set(near);
+                                        // Genuine manual return to the bottom
+                                        // resumes following.
+                                        if near && !follow.get_untracked() {
+                                            follow.set(true);
+                                        }
+                                    }
+                                >
+                                    <For each=move || messages.get() key=|e: &MsgEntry| e.id children=move |e| entry_view(&e)/>
+                                </div>
+                                {move || {
+                                    (!follow.get() && !at_latest.get()).then(|| {
+                                        view! {
+                                            <button
+                                                class="jump-pill"
+                                                on:click=move |_| pin_to_latest()
+                                            >
+                                                "↓ latest"
+                                            </button>
+                                        }
+                                    })
+    }}
+                                <div class="composer">
+                                    <textarea
+                                        prop:value=move || input.get()
+                                        on:input=move |ev| input.set(event_target_value(&ev))
+                                        placeholder="Type a message, Enter to send"
+                                        on:keydown=move |ev| {
+                                            let key = ev.key();
+                                            if key == "Enter" && !ev.shift_key() {
+                                                ev.prevent_default();
+                                                do_send();
+                                            }
+                                        }
+                                    ></textarea>
+                                    <button class="btn primary" disabled=move || running.get() on:click=move |_| do_send()>
+                                        "Send"
                                     </button>
                                 </div>
+                                <div class="statusbar">
+                                    {move || status_line.get().map(|s| view! { <span class="status-line">{s}</span> })}
+                                    {move || error.get().map(|e| view! { <span class="error-line">{e}</span> })}
+                                    {move || usage.get().map(|u| view! { <span class="usage-line">{u}</span> })}
+                                </div>
                             }
-                        }
-                    />
-                </div>
-                <a class="admin-link" href="/admin">"Admin"</a>
-            </aside>
-
-            <DragRail/>
-            <MenuButton open=drawer_open/>
-
-            <main class="main">
-                {move || {
-                    if active.get().is_some() {
-                        view! {
-                            <div class="toolbar">
-                                <div class="title">
+                                .into_any()
+                        } else {
+                            view! {
+                                <div class="new-chat">
+                                    <h2>"Start a new chat"</h2>
                                     {move || {
-                                        let id = active.get().map(|i| short_id(&i)).unwrap_or_default();
-                                        if active_agent.get().is_empty() {
-                                            format!("Session {id}")
+                                        if agents.get().is_empty() {
+                                            view! { <div class="hint">"No agents configured. Add one in Admin."</div> }.into_any()
                                         } else {
-                                            format!("Session {id} · {}", active_agent.get())
+                                            view! {
+                                                <div class="field">
+                                                    <label>"Agent"</label>
+                                                    <select
+                                                        prop:value=move || selected_agent.get()
+                                                        on:change=move |ev| selected_agent.set(event_target_value(&ev))
+                                                    >
+                                                        {move || {
+                                                            let names: Vec<String> = agents
+                                                                .get()
+                                                                .iter()
+                                                                .map(|a| str_of(a, "name"))
+                                                                .collect::<Vec<_>>();
+                                                            names
+                                                                .into_iter()
+                                                                .map(|name| {
+                                                                    let v = name.clone();
+                                                                    view! { <option value=v>{name}</option> }
+                                                                })
+                                                                .collect::<Vec<_>>()
+                                                        }}
+                                                    </select>
+                                                </div>
+                                                <button class="btn primary" on:click=move |_| create_session()>
+                                                    "Start"
+                                                </button>
+                                            }
+                                                .into_any()
                                         }
                                     }}
                                 </div>
-                                <button class="btn" disabled=move || !running.get() on:click=move |_| stop_session()>
-                                    "Stop"
-                                </button>
-                                <button class="btn" on:click=move |_| reset_session()>"Reset"</button>
-                                <button class="btn" on:click=move |_| compact_session()>"Compact"</button>
-                                <button class="btn danger" on:click=move |_| {
-                                    if let Some(id) = active.get() {
-                                        delete_session(id);
-                                    }
-                                }>"Delete"</button>
-                            </div>
-                            <div
-                                class="messages"
-                                node_ref=messages_el
-                                on:wheel=move |_| follow.set(false)
-                                on:touchstart=move |_| follow.set(false)
-                                on:mousedown=move |_| follow.set(false)
-                            >
-                                <For each=move || messages.get() key=|e: &MsgEntry| e.id children=move |e| entry_view(&e)/>
-                            </div>
-                            {move || {
-                                (!follow.get()).then(|| {
-                                    view! {
-                                        <button
-                                            class="jump-pill"
-                                            on:click=move |_| {
-                                                follow.set(true);
-                                                scroll_tick.update(|t| *t += 1);
-                                            }
-                                        >
-                                            "↓ latest"
-                                        </button>
-                                    }
-                                })
-                            }}
-                            <div class="composer">
-                                <textarea
-                                    prop:value=move || input.get()
-                                    on:input=move |ev| input.set(event_target_value(&ev))
-                                    placeholder="Type a message, Enter to send"
-                                    on:keydown=move |ev| {
-                                        let key = ev.key();
-                                        if key == "Enter" && !ev.shift_key() {
-                                            ev.prevent_default();
-                                            do_send();
-                                        }
-                                    }
-                                ></textarea>
-                                <button class="btn primary" disabled=move || running.get() on:click=move |_| do_send()>
-                                    "Send"
-                                </button>
-                            </div>
-                            <div class="statusbar">
-                                {move || status_line.get().map(|s| view! { <span class="status-line">{s}</span> })}
-                                {move || error.get().map(|e| view! { <span class="error-line">{e}</span> })}
-                                {move || usage.get().map(|u| view! { <span class="usage-line">{u}</span> })}
-                            </div>
+                            }
+                                .into_any()
                         }
-                            .into_any()
-                    } else {
-                        view! {
-                            <div class="new-chat">
-                                <h2>"Start a new chat"</h2>
-                                {move || {
-                                    if agents.get().is_empty() {
-                                        view! { <div class="hint">"No agents configured. Add one in Admin."</div> }.into_any()
-                                    } else {
-                                        view! {
-                                            <div class="field">
-                                                <label>"Agent"</label>
-                                                <select
-                                                    prop:value=move || selected_agent.get()
-                                                    on:change=move |ev| selected_agent.set(event_target_value(&ev))
-                                                >
-                                                    {move || {
-                                                        let names: Vec<String> = agents
-                                                            .get()
-                                                            .iter()
-                                                            .map(|a| str_of(a, "name"))
-                                                            .collect::<Vec<_>>();
-                                                        names
-                                                            .into_iter()
-                                                            .map(|name| {
-                                                                let v = name.clone();
-                                                                view! { <option value=v>{name}</option> }
-                                                            })
-                                                            .collect::<Vec<_>>()
-                                                    }}
-                                                </select>
-                                            </div>
-                                            <button class="btn primary" on:click=move |_| create_session()>
-                                                "Start"
-                                            </button>
-                                        }
-                                            .into_any()
-                                    }
-                                }}
-                            </div>
-                        }
-                            .into_any()
-                    }
-                }}
-            </main>
-            <DrawerBackdrop open=drawer_open/>
-        </div>
-    }
+                    }}
+                </main>
+                <DrawerBackdrop open=drawer_open/>
+            </div>
+        }
 }
 
 async fn refresh_sessions_async(sessions: RwSignal<Vec<SessionSummary>>) {

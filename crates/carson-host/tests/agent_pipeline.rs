@@ -54,6 +54,7 @@ async fn setup_with(agents: &[AgentDef]) -> (Arc<Hub>, Arc<AgentRegistry>, Arc<A
 
 async fn create_session_for(instance: &AgentInstance, session_id: &str, agent: &AgentDef) {
     let config = SessionConfig {
+        agent_version_id: agent.id.clone(),
         system_prompt: agent.system_prompt.clone(),
         model: agent.model.clone(),
         capabilities_json: "[]".into(),
