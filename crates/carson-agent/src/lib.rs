@@ -278,6 +278,15 @@ impl Guest for CarsonAgent {
             .blocks
             .push(user_block(&session.agent_version_id, message));
         let result = run_loop(session);
+        // The user message's duration spans the whole turn: stamp its finish
+        // at the turn end.
+        let turn_end = now_ms();
+        for block in session.blocks.iter_mut().rev() {
+            if block.kind == "user" {
+                block.finished_at_ms = turn_end;
+                break;
+            }
+        }
         // Fold the finished turn into the lifetime totals, but keep
         // `turn_usage` readable for `session-usage` until the next turn.
         let turn = session.turn_usage.to_wit();
@@ -313,7 +322,8 @@ fn emit(session_id: &str, kind: &str, data: &str) -> Result<(), events::EventErr
 }
 
 fn tool_use_json(tc: &ToolCall) -> String {
-    json!({"id": tc.id, "name": tc.name, "arguments": tc.arguments_json}).to_string()
+    // Arguments arrive separately in the `tool_args` event at call end.
+    json!({"id": tc.id, "name": tc.name}).to_string()
 }
 
 /// Human-readable explanation for an LLM failure.
@@ -332,52 +342,116 @@ fn tool_args_json(id: &str, arguments: &str) -> String {
     json!({"id": id, "arguments": arguments}).to_string()
 }
 
-fn tool_result_json(tc: &ToolCall, preview: &str, is_error: bool) -> String {
-    json!({"id": tc.id, "name": tc.name, "result_preview": preview, "is_error": is_error})
-        .to_string()
+fn tool_result_json(
+    tc: &ToolCall,
+    preview: &str,
+    is_error: bool,
+    created: u64,
+    finished: u64,
+) -> String {
+    json!({
+        "id": tc.id,
+        "name": tc.name,
+        "result_preview": preview,
+        "is_error": is_error,
+        "created_at_ms": created,
+        "finished_at_ms": finished,
+    })
+    .to_string()
 }
 
 /// One assistant-side segment accumulated during a single LLM stream.
+///
+/// `created` is when the segment began; `finished` is when the next segment
+/// started (0 while still open, closed at the stream end). This lets each
+/// block carry its own duration instead of stretching to the turn end.
 enum Seg {
-    Thinking { text: String, started: u64 },
-    Text { text: String, started: u64 },
-    ToolUse(ToolCall),
+    Thinking {
+        text: String,
+        created: u64,
+        finished: u64,
+    },
+    Text {
+        text: String,
+        created: u64,
+        finished: u64,
+    },
+    ToolUse {
+        call: ToolCall,
+        created: u64,
+        finished: u64,
+    },
 }
 
 impl Seg {
+    fn close_last(segs: &mut [Seg], at: u64) {
+        if let Some(seg) = segs.last_mut() {
+            let finished = match seg {
+                Seg::Thinking { finished, .. }
+                | Seg::Text { finished, .. }
+                | Seg::ToolUse { finished, .. } => finished,
+            };
+            if *finished == 0 {
+                *finished = at;
+            }
+        }
+    }
+
     fn push_text(segs: &mut Vec<Seg>, text: &str, started: u64) {
         match segs.last_mut() {
             Some(Seg::Text { text: buf, .. }) => buf.push_str(text),
-            _ => segs.push(Seg::Text {
-                text: text.to_string(),
-                started,
-            }),
+            _ => {
+                Seg::close_last(segs, started);
+                segs.push(Seg::Text {
+                    text: text.to_string(),
+                    created: started,
+                    finished: 0,
+                });
+            }
         }
     }
 
     fn push_thinking(segs: &mut Vec<Seg>, text: &str, started: u64) {
         match segs.last_mut() {
             Some(Seg::Thinking { text: buf, .. }) => buf.push_str(text),
-            _ => segs.push(Seg::Thinking {
-                text: text.to_string(),
-                started,
-            }),
+            _ => {
+                Seg::close_last(segs, started);
+                segs.push(Seg::Thinking {
+                    text: text.to_string(),
+                    created: started,
+                    finished: 0,
+                });
+            }
         }
     }
 
-    fn into_block(self, version: &str, finished: u64, usage: &Usage) -> Block {
-        let (kind, text, created) = match self {
-            Seg::Thinking { text, started } => ("thinking", Some(text), started),
-            Seg::Text { text, started } => ("text", Some(text), started),
-            Seg::ToolUse(tc) => (
+    fn into_block(self, version: &str, stream_end: u64, usage: &Usage) -> Block {
+        let (kind, text, created, finished) = match self {
+            Seg::Thinking {
+                text,
+                created,
+                finished,
+            } => ("thinking", Some(text), created, finished),
+            Seg::Text {
+                text,
+                created,
+                finished,
+            } => ("text", Some(text), created, finished),
+            Seg::ToolUse {
+                call,
+                created,
+                finished,
+            } => (
                 "tool-use",
                 Some(
-                    json!({"id": tc.id, "name": tc.name, "arguments": tc.arguments_json})
+                    json!({"id": call.id, "name": call.name, "arguments": call.arguments_json})
                         .to_string(),
                 ),
+                created,
                 finished,
             ),
         };
+        let finished = if finished == 0 { stream_end } else { finished };
         Block {
             agent_version_id: version.to_string(),
             kind: kind.into(),
@@ -392,8 +466,14 @@ impl Seg {
     }
 }
 
-fn tool_result_block(version: &str, tc: &ToolCall, result: String, is_error: bool) -> Block {
-    let started = now_ms();
+fn tool_result_block(
+    version: &str,
+    tc: &ToolCall,
+    result: String,
+    is_error: bool,
+    created: u64,
+    finished: u64,
+) -> Block {
     Block {
         agent_version_id: version.to_string(),
         kind: "tool-result".into(),
@@ -405,8 +485,8 @@ fn tool_result_block(version: &str, tc: &ToolCall, result: String, is_error: boo
         cache_read_tokens: 0,
         cache_creation_tokens: 0,
         output_tokens: 0,
-        created_at_ms: started,
-        finished_at_ms: started,
+        created_at_ms: created,
+        finished_at_ms: finished,
     }
 }
 
@@ -443,6 +523,7 @@ fn run_loop(session: &mut Session) -> Result<(), Error> {
         let mut segs: Vec<Seg> = Vec::new();
         let mut failed = false;
         let mut ended = false;
+        let mut tool_start: Option<u64> = None;
         loop {
             if events::cancelled(&session.id) {
                 let _ = llm::stream_close(handle);
@@ -462,15 +543,27 @@ fn run_loop(session: &mut Session) -> Result<(), Error> {
                         let _ = emit(&session.id, "thinking", &thinking);
                     }
                     if let Some(tc) = chunk.tool_call_start {
+                        // A tool call begins: close the previous segment and
+                        // start timing the yield.
+                        let started = now_ms();
+                        Seg::close_last(&mut segs, started);
+                        tool_start = Some(started);
                         let _ = emit(&session.id, "tool_use", &tool_use_json(&tc));
                     }
                     if let Some(tc) = chunk.tool_call_end {
+                        // The call is fully formed; the arguments streamed for
+                        // `started -> now` (the time to yield the tool call).
+                        let yielded = now_ms();
                         let _ = emit(
                             &session.id,
                             "tool_args",
                             &tool_args_json(&tc.id, &tc.arguments_json),
                         );
-                        segs.push(Seg::ToolUse(tc));
+                        segs.push(Seg::ToolUse {
+                            call: tc,
+                            created: tool_start.unwrap_or(yielded),
+                            finished: yielded,
+                        });
                     }
                 }
                 Ok(None) => {
@@ -503,8 +596,8 @@ fn run_loop(session: &mut Session) -> Result<(), Error> {
         let finished = now_ms();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         for seg in std::mem::take(&mut segs) {
-            if let Seg::ToolUse(tc) = &seg {
-                tool_calls.push(tc.clone());
+            if let Seg::ToolUse { call, .. } = &seg {
+                tool_calls.push(call.clone());
             }
             session
                 .blocks
@@ -528,23 +621,27 @@ fn run_loop(session: &mut Session) -> Result<(), Error> {
                 return Ok(());
             }
 
+            let invoke_started = now_ms();
             let (result, is_error) = match tools::invoke(&tc.name, &tc.arguments_json) {
                 Ok(output) => (output, false),
                 Err(tools::ToolError::PermissionDenied) => ("permission denied".to_string(), true),
                 Err(tools::ToolError::NotFound) => (format!("tool not found: {}", tc.name), true),
                 Err(tools::ToolError::Failed) => ("tool failed".to_string(), true),
             };
+            let invoke_finished = now_ms();
             let preview = truncate(&result, 500);
             let _ = emit(
                 &session.id,
                 "tool_result",
-                &tool_result_json(tc, &preview, is_error),
+                &tool_result_json(tc, &preview, is_error, invoke_started, invoke_finished),
             );
             session.blocks.push(tool_result_block(
                 &session.agent_version_id,
                 tc,
                 result,
                 is_error,
+                invoke_started,
+                invoke_finished,
             ));
         }
     }

@@ -220,6 +220,9 @@ fn stream_text(
             .unwrap_or((false, None))
     });
     if !last.0 {
+        // A new block of a different kind starts: close the previous open
+        // non-user block so it spans only up to here.
+        close_open_assistant(messages, now);
         let id = alloc_id(next_id);
         let times = RwSignal::new((now, 0));
         let block = make();
@@ -272,47 +275,40 @@ fn apply_stream_event(st: &ChatSignals, now: u64, ev: &sse::SseEvent) -> EventOu
     match ev.event.as_str() {
         "chunk" => {
             let text = serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
-            // Skip empty chunks: they used to spawn a phantom empty text
-            // block whenever the last block was a tool card, littering the
-            // log with blank bubbles.
-            if !text.is_empty() {
-                stream_text(
-                    &messages,
-                    &next_id,
-                    now,
-                    last_is_text,
-                    || UiBlock::Text {
-                        text: RwSignal::new(String::new()),
-                    },
-                    |block| match block {
-                        UiBlock::Text { text } => Some(*text),
-                        _ => None,
-                    },
-                    &text,
-                );
-                st.scroll_tick.update(|t| *t += 1);
-            }
+            stream_text(
+                &messages,
+                &next_id,
+                now,
+                last_is_text,
+                || UiBlock::Text {
+                    text: RwSignal::new(String::new()),
+                },
+                |block| match block {
+                    UiBlock::Text { text } => Some(*text),
+                    _ => None,
+                },
+                &text,
+            );
+            st.scroll_tick.update(|t| *t += 1);
             EventOutcome::Silent
         }
         "thinking" => {
             let text = serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
-            if !text.is_empty() {
-                stream_text(
-                    &messages,
-                    &next_id,
-                    now,
-                    last_is_thinking,
-                    || UiBlock::Thinking {
-                        text: RwSignal::new(String::new()),
-                    },
-                    |block| match block {
-                        UiBlock::Thinking { text } => Some(*text),
-                        _ => None,
-                    },
-                    &text,
-                );
-                st.scroll_tick.update(|t| *t += 1);
-            }
+            stream_text(
+                &messages,
+                &next_id,
+                now,
+                last_is_thinking,
+                || UiBlock::Thinking {
+                    text: RwSignal::new(String::new()),
+                },
+                |block| match block {
+                    UiBlock::Thinking { text } => Some(*text),
+                    _ => None,
+                },
+                &text,
+            );
+            st.scroll_tick.update(|t| *t += 1);
             EventOutcome::Silent
         }
         "tool_use" => {
@@ -332,6 +328,9 @@ fn apply_stream_event(st: &ChatSignals, now: u64, ev: &sse::SseEvent) -> EventOu
                 // one block (the result gets its own block).
                 append_last_tool(&messages, &format!(" {args}"));
             }
+            // The tool call is fully yielded here: its duration is the time to
+            // produce the call (streaming the arguments).
+            close_open_assistant(&messages, now);
             EventOutcome::Silent
         }
         "tool_result" => {
@@ -345,7 +344,23 @@ fn apply_stream_event(st: &ChatSignals, now: u64, ev: &sse::SseEvent) -> EventOu
             } else {
                 "→ "
             };
-            push_tool(&messages, &next_id, now, format!("{marker}{preview}"));
+            // The server measured the actual invocation; use its timestamps so
+            // the tool-result duration is the execution time.
+            let created = v
+                .get("created_at_ms")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(now);
+            let finished = v
+                .get("finished_at_ms")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(now);
+            push_tool_at(
+                &messages,
+                &next_id,
+                created,
+                finished,
+                format!("{marker}{preview}"),
+            );
             EventOutcome::Silent
         }
         "status" => {
@@ -415,7 +430,10 @@ fn send(session_id: String, input: RwSignal<String>, st: ChatSignals) {
                     if let Some(text) = usage_text {
                         st.usage.set(Some(text));
                     }
-                    finish_open_blocks(&st.messages, finished_ms);
+                    // Close the turn's final open non-user block and stamp the
+                    // user block so its duration spans the whole turn.
+                    close_open_assistant(&st.messages, finished_ms);
+                    finish_user(&st.messages, finished_ms);
                     st.scroll_tick.update(|t| *t += 1);
                     st.running.set(false);
                 }
@@ -431,24 +449,63 @@ fn send(session_id: String, input: RwSignal<String>, st: ChatSignals) {
 }
 
 /// Stamp `finished` on every block still open (`finished == 0`).
-fn finish_open_blocks(messages: &RwSignal<Vec<MsgEntry>>, finished: u64) {
-    let open: Vec<RwSignal<(u64, u64)>> = messages.with_untracked(|m| {
+/// Close the most recent non-user block still open (finished == 0), stamping
+/// its finish at `at` — so each block's duration spans until the next block
+/// of the turn begins. The user block is handled separately by `finish_user`.
+fn close_open_assistant(messages: &RwSignal<Vec<MsgEntry>>, at: u64) {
+    let target = messages.with_untracked(|m| {
         m.iter()
-            .filter(|e| e.times.get_untracked().1 == 0)
+            .rev()
+            .find(|e| e.times.get_untracked().1 == 0 && !matches!(e.block, UiBlock::User { .. }))
             .map(|e| e.times)
-            .collect()
     });
-    for t in open {
-        t.update(|(_created, fin)| *fin = finished);
+    if let Some(t) = target {
+        t.update(|(_created, fin)| *fin = at);
     }
 }
 
-/// Push a new plain-text Tool block: one per tool event (tool_args, and
-/// tool_result each get their own block), identical in structure to how
-/// thinking/text blocks are created.
+/// Stamp the current turn's user block finish at `at` (its duration is the
+/// whole turn).
+fn finish_user(messages: &RwSignal<Vec<MsgEntry>>, at: u64) {
+    let target = messages.with_untracked(|m| {
+        m.iter()
+            .rev()
+            .find(|e| e.times.get_untracked().1 == 0 && matches!(e.block, UiBlock::User { .. }))
+            .map(|e| e.times)
+    });
+    if let Some(t) = target {
+        t.update(|(_created, fin)| *fin = at);
+    }
+}
+
+/// Push a new plain-text Tool block. Closes the previous open non-user block
+/// so it spans only up to this point.
 fn push_tool(messages: &RwSignal<Vec<MsgEntry>>, next_id: &RwSignal<u64>, now: u64, text: String) {
+    close_open_assistant(messages, now);
     let id = alloc_id(next_id);
     let times = RwSignal::new((now, 0));
+    messages.update(|m| {
+        m.push(MsgEntry {
+            id,
+            times,
+            block: UiBlock::Tool {
+                text: RwSignal::new(text),
+            },
+        });
+    });
+}
+
+/// Push a Tool block with explicit server-measured timestamps (used for the
+/// tool-result, whose duration is the actual invocation time).
+fn push_tool_at(
+    messages: &RwSignal<Vec<MsgEntry>>,
+    next_id: &RwSignal<u64>,
+    created: u64,
+    finished: u64,
+    text: String,
+) {
+    let id = alloc_id(next_id);
+    let times = RwSignal::new((created, finished));
     messages.update(|m| {
         m.push(MsgEntry {
             id,
@@ -503,10 +560,9 @@ fn block_child(entry: &MsgEntry) -> AnyView {
         }
         UiBlock::Text { text } => view! { <MarkdownText text=*text/> }.into_any(),
         UiBlock::Tool { text } => {
-            // A plain text block: identical inline-closure mechanism to
-            // thinking/text, which update live while the old card never did.
+            // Same style as thinking; the header's "Tool" label distinguishes it.
             let t = *text;
-            view! { <div class="thinking tool-block">{move || t.get()}</div> }.into_any()
+            view! { <div class="thinking">{move || t.get()}</div> }.into_any()
         }
         UiBlock::User { content } => {
             view! { <div class="msg user">{content.clone()}</div> }.into_any()
@@ -546,32 +602,36 @@ fn fmt_clock(ms: u64) -> String {
     )
 }
 
-/// Muted per-card timestamp: local clock on creation plus a duration when
-/// finishing took a measurable amount of time. Hover shows the full ISO.
-/// Duration-aware label: injected clock formatter keeps this testable off-wasm.
-fn time_label(created: u64, finished: u64, fmt_clock: impl Fn(u64) -> String) -> Option<String> {
-    if created == 0 {
-        return None;
-    }
-    let mut label = fmt_clock(created);
-    if finished > created + 1000 {
-        let dur = (finished - created) as f64 / 1000.0;
-        label.push_str(&format!(" · {dur:.1}s"));
-    }
-    Some(label)
+/// Milliseconds since creation to finish, formatted as `{:.3}s`.
+fn fmt_duration(created: u64, finished: u64) -> String {
+    format!("{:.3}s", finished.saturating_sub(created) as f64 / 1000.0)
 }
 
-fn time_footer(times: RwSignal<(u64, u64)>) -> AnyView {
+/// Header line: the start time, then an optional kind label (Thinking / Tool).
+fn time_head(kind: Option<&str>, times: RwSignal<(u64, u64)>) -> AnyView {
+    let label = kind.map(str::to_owned);
     view! {
-        <div class="msg-time" title=move || {
+        <div class="msg-head" title=move || {
             let (created, _) = times.get_untracked();
             if created == 0 { String::new() } else { js_sys::Date::new(&(created as f64).into()).to_iso_string().into() }
         }>
-            {move || {
-                let (created, finished) = times.get();
-                time_label(created, finished, fmt_clock)
-            }}
+            <span class="msg-start">{move || {
+                let (created, _) = times.get();
+                if created == 0 { String::new() } else { fmt_clock(created) }
+            }}</span>
+            {move || label.clone().map(|k| view! { <span class="msg-kind">{k}</span> })}
         </div>
+    }
+    .into_any()
+}
+
+/// Footer line: the duration, always visible once the block is stamped.
+fn time_tail(times: RwSignal<(u64, u64)>) -> AnyView {
+    view! {
+        <div class="msg-dur">{move || {
+            let (created, finished) = times.get();
+            if created == 0 { String::new() } else { fmt_duration(created, finished) }
+        }}</div>
     }
     .into_any()
 }
@@ -579,18 +639,25 @@ fn time_footer(times: RwSignal<(u64, u64)>) -> AnyView {
 /// Render one log entry as its own card. The list is flat and keyed by entry
 /// id: streaming mounts new cards while already-mounted ones keep their
 /// signals, so streamed text grows in place and tool cards update live.
+/// Every card carries a header (start time, then a kind label) and a footer
+/// (duration); the user's duration spans the whole turn.
 fn entry_view(entry: &MsgEntry) -> AnyView {
+    let kind = match &entry.block {
+        UiBlock::Thinking { .. } => Some("Thinking"),
+        UiBlock::Tool { .. } => Some("Tool"),
+        _ => None,
+    };
+    let head = time_head(kind, entry.times);
+    let tail = time_tail(entry.times);
+    let child = block_child(entry);
     match &entry.block {
         UiBlock::User { .. } => {
-            let child = block_child(entry);
-            let footer = time_footer(entry.times);
-            view! { <div class="msg user">{child} {footer}</div> }.into_any()
+            view! { <div class="msg user">{head} {child} {tail}</div> }.into_any()
         }
-        UiBlock::Thinking { .. } | UiBlock::Text { .. } | UiBlock::Tool { .. } => {
-            let child = block_child(entry);
-            let footer = time_footer(entry.times);
-            view! { <div class="msg assistant">{child} {footer}</div> }.into_any()
+        _ => view! {
+            <div class="msg assistant">{head} {child} {tail}</div>
         }
+        .into_any(),
     }
 }
 
@@ -1126,7 +1193,8 @@ mod tests {
             UiBlock::Thinking { text } => assert_eq!(text.get_untracked(), "let me think"),
             other => panic!("expected thinking, got {other:?}"),
         }
-        assert_eq!(entries[0].times.get_untracked(), (1000, 0));
+        // The thinking block is closed when text begins (interval duration).
+        assert_eq!(entries[0].times.get_untracked(), (1000, 1100));
         assert_eq!(entries[1].id, 2);
         match &entries[1].block {
             UiBlock::Text { text } => assert_eq!(text.get_untracked(), "Hello"),
@@ -1135,30 +1203,40 @@ mod tests {
     }
 
     #[test]
-    fn finish_open_blocks_stamps_only_open_entries() {
+    fn close_open_assistant_and_finish_user_stamp_their_targets() {
         let messages = RwSignal::new(Vec::<MsgEntry>::new());
         messages.set(vec![
             MsgEntry {
                 id: 1,
                 times: RwSignal::new((10, 0)),
-                block: text_block_signal(),
+                block: UiBlock::User {
+                    content: "hi".into(),
+                },
             },
             MsgEntry {
                 id: 2,
-                times: RwSignal::new((20, 25)),
+                times: RwSignal::new((20, 0)),
+                block: text_block_signal(),
+            },
+            MsgEntry {
+                id: 3,
+                times: RwSignal::new((30, 35)),
                 block: text_block_signal(),
             },
         ]);
 
-        finish_open_blocks(&messages, 99);
-
+        // Closes only the open non-user block; leaves the finished one and the
+        // user block alone.
+        close_open_assistant(&messages, 50);
         let entries = messages.get_untracked();
-        assert_eq!(entries[0].times.get_untracked(), (10, 99));
-        assert_eq!(
-            entries[1].times.get_untracked(),
-            (20, 25),
-            "already finished untouched"
-        );
+        assert_eq!(entries[0].times.get_untracked(), (10, 0), "user untouched");
+        assert_eq!(entries[1].times.get_untracked(), (20, 50));
+        assert_eq!(entries[2].times.get_untracked(), (30, 35));
+
+        // finish_user stamps the user block (turn duration).
+        finish_user(&messages, 90);
+        let entries = messages.get_untracked();
+        assert_eq!(entries[0].times.get_untracked(), (10, 90));
     }
 
     fn history_fixture() -> Value {
@@ -1252,15 +1330,12 @@ mod tests {
     }
 
     #[test]
-    fn time_label_composition() {
-        let fmt = |ms: u64| format!("c{ms}");
-        assert_eq!(time_label(0, 0, fmt), None);
-        assert_eq!(time_label(1000, 1500, fmt), Some("c1000".to_string()));
-        let long = time_label(1000, 3000, fmt).unwrap();
-        assert!(
-            long.starts_with("c1000") && long.ends_with("2.0s"),
-            "{long}"
-        );
+    fn fmt_duration_renders_always_with_ms_precision() {
+        assert_eq!(fmt_duration(0, 0), "0.000s");
+        assert_eq!(fmt_duration(1000, 2500), "1.500s");
+        assert_eq!(fmt_duration(1000, 2045), "1.045s");
+        // finished before created is clamped to zero.
+        assert_eq!(fmt_duration(2000, 1500), "0.000s");
     }
 
     #[test]
@@ -1316,13 +1391,19 @@ mod tests {
             1200,
             &ev(
                 "tool_result",
-                r#"{"id":"c1","result_preview":"12:00","is_error":true}"#,
+                r#"{"id":"c1","result_preview":"12:00","is_error":true,"created_at_ms":1500,"finished_at_ms":1900}"#,
             ),
         );
 
         // tool_use + tool_args merge into one block; tool_result gets its own.
         let entries = st.messages.get_untracked();
         assert_eq!(entries.len(), 2, "one block for use+args, one for result");
+
+        // tool-use duration = time to yield (tool_use -> tool_args): 100ms.
+        assert_eq!(entries[0].times.get_untracked(), (1000, 1100));
+        // tool-result duration = the server-measured invocation span: 400ms.
+        assert_eq!(entries[1].times.get_untracked(), (1500, 1900));
+
         let texts: Vec<String> = entries
             .iter()
             .map(|e| match &e.block {
@@ -1419,37 +1500,14 @@ mod tests {
             other => panic!("expected Done, got {other:?}"),
         };
         // send() performs the finishing pass after receiving Done.
-        finish_open_blocks(&st.messages, finished_ms);
+        close_open_assistant(&st.messages, finished_ms);
+        finish_user(&st.messages, finished_ms);
         let entries = st.messages.get_untracked();
         assert_eq!(entries.len(), 1);
         assert!(
             entries[0].times.get_untracked().1 > 0,
             "open block stamped finished"
         );
-    }
-
-    #[test]
-    fn apply_stream_event_ignores_empty_chunks() {
-        let st = chat_signals();
-        // A real chunk builds a text block.
-        apply_stream_event(&st, 100, &ev("chunk", "\"Hello\""));
-        assert_eq!(st.messages.get_untracked().len(), 1);
-
-        // An empty chunk after a tool card must NOT spawn a phantom text block.
-        apply_stream_event(&st, 200, &ev("tool_use", r#"{"id":"c1","name":"time"}"#));
-        assert_eq!(st.messages.get_untracked().len(), 2);
-
-        apply_stream_event(&st, 300, &ev("chunk", "\"\""));
-        assert_eq!(
-            st.messages.get_untracked().len(),
-            2,
-            "empty chunk added a phantom block"
-        );
-        // The last entry is still the tool block, not an empty text block.
-        assert!(matches!(
-            st.messages.get_untracked().last().map(|e| &e.block),
-            Some(UiBlock::Tool { .. })
-        ));
     }
 
     #[test]

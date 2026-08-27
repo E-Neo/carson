@@ -241,6 +241,24 @@ async fn tool_turn_persists_ordered_blocks() {
     );
     // Assistant-side blocks carry the LLM usage of their turn.
     assert!(call.input_tokens > 0 || call.output_tokens > 0);
+
+    // Duration invariants: every block spans created -> finished, and the
+    // user message covers the whole turn.
+    for b in &session.messages {
+        assert!(
+            b.created_at_ms <= b.finished_at_ms,
+            "{} created {} > finished {}",
+            b.kind,
+            b.created_at_ms,
+            b.finished_at_ms
+        );
+    }
+    let user = session.messages.iter().find(|b| b.kind == "user").unwrap();
+    let last = session.messages.last().unwrap();
+    assert!(
+        user.finished_at_ms >= last.finished_at_ms,
+        "user turn should span at least as long as the last block"
+    );
 }
 
 /// StoredBlock round-trips through the DB with its metadata intact.

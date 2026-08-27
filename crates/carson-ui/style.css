@@ -517,27 +517,30 @@ body {
 /* Tighten consecutive assistant cards into a subtle stack */
 .msg.assistant + .msg.assistant { margin-top: -8px; }
 
-/* ---------- per-card timestamps ---------- */
-.msg-time {
-  margin-top: 4px;
-  text-align: right;
+/* ---------- card header & footer ---------- */
+.msg-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.msg-start {
   color: var(--text-dim);
   font-size: 11px;
   font-family: var(--mono);
 }
 
-/* ---------- tool blocks ---------- */
-.tool-block {
-  color: var(--text);
-  border-left: 3px solid var(--accent);
-  background: var(--bg-input);
-}
-.tool-block::before {
-  display: block;
-  content: "⬥ tool";
+.msg-kind {
+  color: var(--accent);
   font-size: 11px;
   letter-spacing: 0.05em;
-  text-transform: uppercase;
-  color: var(--accent);
-  margin-bottom: 4px;
+}
+
+.msg-dur {
+  margin-top: 4px;
+  text-align: right;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-family: var(--mono);
 }

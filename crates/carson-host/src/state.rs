@@ -205,25 +205,40 @@ impl crate::bindings::carson::agent::llm::Host for State {
         let Some(stream) = self.streams.get_mut(&handle) else {
             return Err(LlmError::Internal("unknown stream handle".into()));
         };
-        match stream.rx.recv() {
-            Ok(DriverEvent::Text(text)) => Ok(Some(Chunk {
-                text: Some(text),
-                ..chunk()
-            })),
-            Ok(DriverEvent::Thinking(text)) => Ok(Some(Chunk {
-                thinking: Some(text),
-                ..chunk()
-            })),
-            Ok(DriverEvent::ToolCallStart(tc)) => Ok(Some(Chunk {
-                tool_call_start: Some(to_wit_tool_call(tc)),
-                ..chunk()
-            })),
-            Ok(DriverEvent::ToolCallEnd(tc)) => Ok(Some(Chunk {
-                tool_call_end: Some(to_wit_tool_call(tc)),
-                ..chunk()
-            })),
-            Ok(DriverEvent::Failed(err)) => Err(to_llm_error(err)),
-            Err(_) => Ok(None),
+        // Skip empty text/thinking deltas so the guest never sees a phantom
+        // empty chunk (which would otherwise surface as a blank block and
+        // persist as an empty message).
+        loop {
+            match stream.rx.recv() {
+                Ok(DriverEvent::Text(text)) if text.is_empty() => continue,
+                Ok(DriverEvent::Thinking(text)) if text.is_empty() => continue,
+                Ok(DriverEvent::Text(text)) => {
+                    return Ok(Some(Chunk {
+                        text: Some(text),
+                        ..chunk()
+                    }));
+                }
+                Ok(DriverEvent::Thinking(text)) => {
+                    return Ok(Some(Chunk {
+                        thinking: Some(text),
+                        ..chunk()
+                    }));
+                }
+                Ok(DriverEvent::ToolCallStart(tc)) => {
+                    return Ok(Some(Chunk {
+                        tool_call_start: Some(to_wit_tool_call(tc)),
+                        ..chunk()
+                    }));
+                }
+                Ok(DriverEvent::ToolCallEnd(tc)) => {
+                    return Ok(Some(Chunk {
+                        tool_call_end: Some(to_wit_tool_call(tc)),
+                        ..chunk()
+                    }));
+                }
+                Ok(DriverEvent::Failed(err)) => return Err(to_llm_error(err)),
+                Err(_) => return Ok(None),
+            }
         }
     }
 
@@ -474,5 +489,28 @@ mod tests {
     fn stream_next_unknown_handle_errors() {
         let mut state = test_state(&[]);
         assert!(matches!(state.stream_next(999), Err(LlmError::Internal(_))));
+    }
+
+    #[test]
+    fn stream_next_skips_empty_text_and_thinking() {
+        let mut state = test_state(&[]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.streams.insert(
+            777,
+            StreamHandle {
+                rx,
+                usage: Arc::new(Mutex::new(None)),
+            },
+        );
+        // Empty text/thinking deltas are dropped; the next non-empty chunk is
+        // the one the guest sees.
+        tx.send(DriverEvent::Text("".into())).unwrap();
+        tx.send(DriverEvent::Thinking("".into())).unwrap();
+        tx.send(DriverEvent::Text("hi".into())).unwrap();
+        let chunk = state.stream_next(777).unwrap().unwrap();
+        assert_eq!(chunk.text.as_deref(), Some("hi"));
+        // Stream closed afterwards.
+        drop(tx);
+        assert!(state.stream_next(777).unwrap().is_none());
     }
 }
