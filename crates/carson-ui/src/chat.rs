@@ -18,10 +18,22 @@ struct ChatParams {
 /// exactly like the persisted log.
 #[derive(Clone, Debug)]
 enum UiBlock {
-    User { content: String },
-    Thinking { text: RwSignal<String> },
-    Text { text: RwSignal<String> },
-    ToolUse { card: RwSignal<ToolCard> },
+    User {
+        content: String,
+    },
+    Thinking {
+        text: RwSignal<String>,
+    },
+    Text {
+        text: RwSignal<String>,
+    },
+    /// A tool interaction as a plain text block. It is driven by the exact
+    /// same `RwSignal<String>` + inline-closure mechanism as thinking/text
+    /// (which update live), rather than the old card with per-field closures
+    /// that never subscribed during streaming.
+    Tool {
+        text: RwSignal<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -30,15 +42,6 @@ struct MsgEntry {
     /// (created_ms, finished_ms); finished == 0 while the turn streams.
     times: RwSignal<(u64, u64)>,
     block: UiBlock,
-}
-
-#[derive(Clone, Default)]
-struct ToolCard {
-    id: String,
-    name: String,
-    arguments: String,
-    result: Option<String>,
-    is_error: bool,
 }
 
 fn now_ms() -> u64 {
@@ -118,36 +121,41 @@ fn build_history(v: &Value, next_id: &RwSignal<u64>) -> Vec<MsgEntry> {
                     text: RwSignal::new(text_of(m)),
                 },
             }),
-            "tool-use" => out.push(MsgEntry {
-                id: alloc_id(next_id),
-                times: RwSignal::new((
-                    m["created_at_ms"].as_u64().unwrap_or(0),
-                    m["finished_at_ms"].as_u64().unwrap_or(0),
-                )),
-                block: UiBlock::ToolUse {
-                    card: RwSignal::new(ToolCard {
-                        id: str_of(m, "tool_call_id"),
-                        name: str_of(m, "tool_name"),
-                        arguments: str_of(m, "arguments"),
-                        ..Default::default()
-                    }),
-                },
-            }),
-            "tool-result" => {
-                let tid = str_of(m, "tool_call_id");
-                let preview = truncate(&str_of(m, "text"), 500);
-                let is_error = m.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
-                for e in out.iter().rev() {
-                    if let UiBlock::ToolUse { card } = &e.block
-                        && card.get_untracked().id == tid
-                    {
-                        card.update(|c| {
-                            c.result = Some(preview.clone());
-                            c.is_error = is_error;
-                        });
-                        break;
-                    }
+            "tool-use" => {
+                let mut text = str_of(m, "tool_name");
+                let args = str_of(m, "arguments");
+                if !args.is_empty() {
+                    text.push(' ');
+                    text.push_str(&args);
                 }
+                out.push(MsgEntry {
+                    id: alloc_id(next_id),
+                    times: RwSignal::new((
+                        m["created_at_ms"].as_u64().unwrap_or(0),
+                        m["finished_at_ms"].as_u64().unwrap_or(0),
+                    )),
+                    block: UiBlock::Tool {
+                        text: RwSignal::new(text),
+                    },
+                });
+            }
+            "tool-result" => {
+                let preview = truncate(&str_of(m, "text"), 500);
+                let marker = if m.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false) {
+                    "→ error: "
+                } else {
+                    "→ "
+                };
+                out.push(MsgEntry {
+                    id: alloc_id(next_id),
+                    times: RwSignal::new((
+                        m["created_at_ms"].as_u64().unwrap_or(0),
+                        m["finished_at_ms"].as_u64().unwrap_or(0),
+                    )),
+                    block: UiBlock::Tool {
+                        text: RwSignal::new(format!("{marker}{preview}")),
+                    },
+                });
             }
             _ => {}
         }
@@ -192,9 +200,8 @@ async fn load_history(
 }
 
 /// Append stream text to the trailing block of this kind, opening a new block
-/// when the kind changes (thinking -> tool-use -> text ...). The display
-/// order therefore matches the stream exactly, and thinking after a tool call
-/// is no longer dropped.
+/// when the kind changes (thinking -> text -> ...). The display order
+/// therefore matches the stream exactly.
 fn stream_text(
     messages: &RwSignal<Vec<MsgEntry>>,
     next_id: &RwSignal<u64>,
@@ -265,82 +272,80 @@ fn apply_stream_event(st: &ChatSignals, now: u64, ev: &sse::SseEvent) -> EventOu
     match ev.event.as_str() {
         "chunk" => {
             let text = serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
-            stream_text(
-                &messages,
-                &next_id,
-                now,
-                last_is_text,
-                || UiBlock::Text {
-                    text: RwSignal::new(String::new()),
-                },
-                |block| match block {
-                    UiBlock::Text { text } => Some(*text),
-                    _ => None,
-                },
-                &text,
-            );
-            st.scroll_tick.update(|t| *t += 1);
+            // Skip empty chunks: they used to spawn a phantom empty text
+            // block whenever the last block was a tool card, littering the
+            // log with blank bubbles.
+            if !text.is_empty() {
+                stream_text(
+                    &messages,
+                    &next_id,
+                    now,
+                    last_is_text,
+                    || UiBlock::Text {
+                        text: RwSignal::new(String::new()),
+                    },
+                    |block| match block {
+                        UiBlock::Text { text } => Some(*text),
+                        _ => None,
+                    },
+                    &text,
+                );
+                st.scroll_tick.update(|t| *t += 1);
+            }
             EventOutcome::Silent
         }
         "thinking" => {
             let text = serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
-            stream_text(
-                &messages,
-                &next_id,
-                now,
-                last_is_thinking,
-                || UiBlock::Thinking {
-                    text: RwSignal::new(String::new()),
-                },
-                |block| match block {
-                    UiBlock::Thinking { text } => Some(*text),
-                    _ => None,
-                },
-                &text,
-            );
-            st.scroll_tick.update(|t| *t += 1);
+            if !text.is_empty() {
+                stream_text(
+                    &messages,
+                    &next_id,
+                    now,
+                    last_is_thinking,
+                    || UiBlock::Thinking {
+                        text: RwSignal::new(String::new()),
+                    },
+                    |block| match block {
+                        UiBlock::Thinking { text } => Some(*text),
+                        _ => None,
+                    },
+                    &text,
+                );
+                st.scroll_tick.update(|t| *t += 1);
+            }
             EventOutcome::Silent
         }
         "tool_use" => {
-            if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
-                let id = alloc_id(&next_id);
-                let times = RwSignal::new((now, 0));
-                let card = RwSignal::new(ToolCard {
-                    id: str_of(&v, "id"),
-                    name: str_of(&v, "name"),
-                    ..Default::default()
-                });
-                messages.update(|m| {
-                    m.push(MsgEntry {
-                        id,
-                        times,
-                        block: UiBlock::ToolUse { card },
-                    });
-                });
+            let v = parse_event_object(&ev.data);
+            let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("");
+            if !name.is_empty() {
+                push_tool(&messages, &next_id, now, name.to_string());
             }
             st.scroll_tick.update(|t| *t += 1);
             EventOutcome::Silent
         }
         "tool_args" => {
-            if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
-                let tid = str_of(&v, "id");
-                let args = str_of(&v, "arguments");
-                for_each_card(&messages, &tid, &|card| {
-                    card.arguments = args.clone();
-                });
+            let v = parse_event_object(&ev.data);
+            let args = v.get("arguments").and_then(|x| x.as_str()).unwrap_or("");
+            if !args.is_empty() {
+                // Append into the tool_use block so tool use + arguments form
+                // one block (the result gets its own block).
+                append_last_tool(&messages, &format!(" {args}"));
             }
             EventOutcome::Silent
         }
         "tool_result" => {
-            if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
-                let tid = str_of(&v, "id");
-                let preview = truncate(&str_of(&v, "result_preview"), 500);
-                let is_error = v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
-                for_each_card(&messages, &tid, &|card| {
-                    card.result = Some(preview.clone());
-                    card.is_error = is_error;
-                });
-            }
+            let v = parse_event_object(&ev.data);
+            let preview = v
+                .get("result_preview")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let marker = if v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false) {
+                "→ error: "
+            } else {
+                "→ "
+            };
+            push_tool(&messages, &next_id, now, format!("{marker}{preview}"));
             EventOutcome::Silent
         }
         "status" => {
@@ -438,21 +443,46 @@ fn finish_open_blocks(messages: &RwSignal<Vec<MsgEntry>>, finished: u64) {
     }
 }
 
-fn for_each_card(messages: &RwSignal<Vec<MsgEntry>>, id: &str, f: &impl Fn(&mut ToolCard)) {
-    // Phase 1 (untracked read): collect the matching card signals.
-    let targets: Vec<RwSignal<ToolCard>> = messages.with_untracked(|m| {
-        m.iter()
-            .rev()
-            .filter_map(|e| match &e.block {
-                UiBlock::ToolUse { card } if card.get_untracked().id == id => Some(*card),
-                _ => None,
-            })
-            .take(1)
-            .collect()
+/// Push a new plain-text Tool block: one per tool event (tool_args, and
+/// tool_result each get their own block), identical in structure to how
+/// thinking/text blocks are created.
+fn push_tool(messages: &RwSignal<Vec<MsgEntry>>, next_id: &RwSignal<u64>, now: u64, text: String) {
+    let id = alloc_id(next_id);
+    let times = RwSignal::new((now, 0));
+    messages.update(|m| {
+        m.push(MsgEntry {
+            id,
+            times,
+            block: UiBlock::Tool {
+                text: RwSignal::new(text),
+            },
+        });
     });
-    // Phase 2: mutate outside the messages borrow.
-    for card in targets {
-        card.update(f);
+}
+
+/// Append text to the most recent `Tool` block (the tool_use block the
+/// current call just opened), so use + arguments stay together.
+fn append_last_tool(messages: &RwSignal<Vec<MsgEntry>>, text: &str) {
+    let target = messages.with_untracked(|m| {
+        m.iter().rev().find_map(|e| match &e.block {
+            UiBlock::Tool { text } => Some(*text),
+            _ => None,
+        })
+    });
+    if let Some(t) = target {
+        t.update(|s| s.push_str(text));
+    }
+}
+
+/// The SSE layer frames every payload as a JSON string, so an object payload
+/// (tool events) arrives as a JSON string literal containing JSON text: e.g.
+/// `data: "{\"id\":\"c1\",...}"`. Unwrap that outer layer so field access
+/// sees the actual object.
+fn parse_event_object(data: &str) -> Value {
+    match serde_json::from_str::<Value>(data) {
+        Ok(Value::String(inner)) => serde_json::from_str(&inner).unwrap_or_default(),
+        Ok(v) => v,
+        Err(_) => Value::Null,
     }
 }
 
@@ -472,30 +502,11 @@ fn block_child(entry: &MsgEntry) -> AnyView {
                 .into_any()
         }
         UiBlock::Text { text } => view! { <MarkdownText text=*text/> }.into_any(),
-        UiBlock::ToolUse { card } => {
-            let c = *card;
-            let name = move || c.get().name.clone();
-            let args = move || {
-                let a = c.get().arguments.clone();
-                (!a.is_empty()).then_some(a)
-            };
-            let result = move || {
-                let state = c.get();
-                state.result.map(|r| (r, state.is_error))
-            };
-            view! {
-                <div class="tool-card-inline">
-                    <div class="tc-name">{name}</div>
-                    {move || args().map(|a| view! { <div class="tc-args">{a}</div> })}
-                    {move || {
-                        result().map(|(r, is_err)| {
-                            let cls = if is_err { "tc-result tc-error" } else { "tc-result" };
-                            view! { <div class=cls>{r}</div> }
-                        })
-                    }}
-                </div>
-            }
-            .into_any()
+        UiBlock::Tool { text } => {
+            // A plain text block: identical inline-closure mechanism to
+            // thinking/text, which update live while the old card never did.
+            let t = *text;
+            view! { <div class="thinking tool-block">{move || t.get()}</div> }.into_any()
         }
         UiBlock::User { content } => {
             view! { <div class="msg user">{content.clone()}</div> }.into_any()
@@ -504,7 +515,11 @@ fn block_child(entry: &MsgEntry) -> AnyView {
 }
 
 /// Pure transition for one scroll event: returns `(at_latest, follow)`.
-/// Echoes of our own pins (inside the suppression window) are ignored.
+///
+/// Our own pins (inside the suppression window) are ignored entirely.
+/// Following only resumes on a genuine away -> near transition: starting a
+/// drag while already at the bottom must never resurrect auto-scroll, or
+/// mobile/touch streams would yank the view back on the first tiny move.
 fn scroll_update(
     now: f64,
     pinned_until: f64,
@@ -515,7 +530,9 @@ fn scroll_update(
     if now < pinned_until {
         return (at_latest, follow);
     }
-    if near { (true, true) } else { (false, follow) }
+    let new_at_latest = near;
+    let new_follow = if !at_latest && near { true } else { follow };
+    (new_at_latest, new_follow)
 }
 
 fn fmt_clock(ms: u64) -> String {
@@ -569,7 +586,7 @@ fn entry_view(entry: &MsgEntry) -> AnyView {
             let footer = time_footer(entry.times);
             view! { <div class="msg user">{child} {footer}</div> }.into_any()
         }
-        UiBlock::Thinking { .. } | UiBlock::Text { .. } | UiBlock::ToolUse { .. } => {
+        UiBlock::Thinking { .. } | UiBlock::Text { .. } | UiBlock::Tool { .. } => {
             let child = block_child(entry);
             let footer = time_footer(entry.times);
             view! { <div class="msg assistant">{child} {footer}</div> }.into_any()
@@ -1163,8 +1180,9 @@ mod tests {
         let next_id = RwSignal::new(1u64);
         let entries = build_history(&history_fixture(), &next_id);
 
-        // tool-result attaches to the existing card instead of adding one.
-        assert_eq!(entries.len(), 4);
+        // Each tool event becomes its own block: tool-use (name + arguments)
+        // and tool-result, both plain text blocks like thinking/text.
+        assert_eq!(entries.len(), 5);
         assert!(
             entries
                 .iter()
@@ -1176,15 +1194,16 @@ mod tests {
         assert_eq!(entries[0].times.get_untracked(), (1000, 1000));
 
         match &entries[2].block {
-            UiBlock::ToolUse { card } => {
-                let c = card.get_untracked();
-                assert_eq!(c.id, "c1");
-                assert_eq!(c.name, "time");
-                assert_eq!(c.arguments, "{}");
-                assert_eq!(c.result.as_deref(), Some("12:00:00"));
-                assert!(!c.is_error);
+            UiBlock::Tool { text } => {
+                assert_eq!(text.get_untracked(), "time {}", "name + arguments");
             }
-            other => panic!("expected tool-use, got {other:?}"),
+            other => panic!("expected tool block, got {other:?}"),
+        }
+        match &entries[3].block {
+            UiBlock::Tool { text } => {
+                assert_eq!(text.get_untracked(), "→ 12:00:00", "separate result block");
+            }
+            other => panic!("expected tool block, got {other:?}"),
         }
     }
 
@@ -1195,13 +1214,11 @@ mod tests {
         v["messages"][3]["is_error"] = json!(true);
         let next_id = RwSignal::new(1u64);
         let entries = build_history(&v, &next_id);
-        match &entries[2].block {
-            UiBlock::ToolUse { card } => {
-                let c = card.get_untracked();
-                assert_eq!(c.result.as_deref(), Some("boom"));
-                assert!(c.is_error);
+        match &entries[3].block {
+            UiBlock::Tool { text } => {
+                assert_eq!(text.get_untracked(), "→ error: boom");
             }
-            other => panic!("expected tool-use, got {other:?}"),
+            other => panic!("expected tool-result block, got {other:?}"),
         }
     }
 
@@ -1224,6 +1241,14 @@ mod tests {
     #[test]
     fn scroll_update_resumes_follow_on_genuine_bottom_hit() {
         assert_eq!(scroll_update(1000.0, 0.0, true, false, false), (true, true));
+    }
+
+    #[test]
+    fn scroll_update_never_resurrects_on_drag_start_at_bottom() {
+        // Starting a touch drag while already at the latest (follow off, but
+        // at_latest still true) must not re-engage follow on the first tiny
+        // near-bottom scroll event.
+        assert_eq!(scroll_update(1000.0, 0.0, true, false, true), (true, false));
     }
 
     #[test]
@@ -1275,25 +1300,12 @@ mod tests {
     }
 
     #[test]
-    fn apply_stream_event_creates_and_fills_tool_cards() {
+    fn apply_stream_event_creates_and_fills_tool_blocks() {
         let st = chat_signals();
         assert!(matches!(
             apply_stream_event(&st, 1000, &ev("tool_use", r#"{"id":"c1","name":"time"}"#)),
             EventOutcome::Silent
         ));
-
-        // First card's identity lands immediately.
-        let entries = st.messages.get_untracked();
-        assert_eq!(entries.len(), 1);
-        match &entries[0].block {
-            UiBlock::ToolUse { card } => {
-                assert_eq!(card.get_untracked().id, "c1");
-                assert_eq!(card.get_untracked().name, "time");
-            }
-            other => panic!("expected tool-use, got {other:?}"),
-        }
-
-        // Arguments stream in, then the result (error-flagged) attaches.
         apply_stream_event(
             &st,
             1100,
@@ -1307,16 +1319,68 @@ mod tests {
                 r#"{"id":"c1","result_preview":"12:00","is_error":true}"#,
             ),
         );
+
+        // tool_use + tool_args merge into one block; tool_result gets its own.
         let entries = st.messages.get_untracked();
-        match &entries[0].block {
-            UiBlock::ToolUse { card } => {
-                let c = card.get_untracked();
-                assert_eq!(c.arguments, "{}");
-                assert_eq!(c.result.as_deref(), Some("12:00"));
-                assert!(c.is_error);
-            }
-            other => panic!("expected tool-use, got {other:?}"),
-        }
+        assert_eq!(entries.len(), 2, "one block for use+args, one for result");
+        let texts: Vec<String> = entries
+            .iter()
+            .map(|e| match &e.block {
+                UiBlock::Tool { text } => text.get_untracked(),
+                other => panic!("expected tool block, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["time {}".to_string(), "→ error: 12:00".to_string()],
+            "tool_use+tool_args share a block, tool_result is separate"
+        );
+    }
+
+    /// The SSE layer double-encodes object payloads as a JSON string literal
+    /// (parsed by `parse_event_object`), so `ev.data` is a JSON *string*
+    /// whose content is the tool object. Rebuild that exact wire shape with
+    /// `serde_json::to_string` and verify fields survive.
+    #[test]
+    fn apply_stream_event_decodes_double_encoded_tool_payloads() {
+        // Wrap an object once to get its JSON text, then wrap again to
+        // reproduce the SSE framing: a JSON string containing JSON text.
+        let wire =
+            |obj: Value| serde_json::to_string(&serde_json::to_string(&obj).unwrap()).unwrap();
+        let st = chat_signals();
+        apply_stream_event(
+            &st,
+            1000,
+            &ev("tool_use", &wire(json!({"id": "c1", "name": "time"}))),
+        );
+        apply_stream_event(
+            &st,
+            1100,
+            &ev("tool_args", &wire(json!({"id": "c1", "arguments": "{}"}))),
+        );
+        apply_stream_event(
+            &st,
+            1200,
+            &ev(
+                "tool_result",
+                &wire(json!({"id": "c1", "result_preview": "12:00", "is_error": false})),
+            ),
+        );
+
+        let entries = st.messages.get_untracked();
+        assert_eq!(entries.len(), 2, "one block for use+args, one for result");
+        let texts: Vec<String> = entries
+            .iter()
+            .map(|e| match &e.block {
+                UiBlock::Tool { text } => text.get_untracked(),
+                other => panic!("expected tool block, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["time {}".to_string(), "→ 12:00".to_string()],
+            "double-encoded payloads still decode into readable blocks"
+        );
     }
 
     #[test]
@@ -1362,6 +1426,30 @@ mod tests {
             entries[0].times.get_untracked().1 > 0,
             "open block stamped finished"
         );
+    }
+
+    #[test]
+    fn apply_stream_event_ignores_empty_chunks() {
+        let st = chat_signals();
+        // A real chunk builds a text block.
+        apply_stream_event(&st, 100, &ev("chunk", "\"Hello\""));
+        assert_eq!(st.messages.get_untracked().len(), 1);
+
+        // An empty chunk after a tool card must NOT spawn a phantom text block.
+        apply_stream_event(&st, 200, &ev("tool_use", r#"{"id":"c1","name":"time"}"#));
+        assert_eq!(st.messages.get_untracked().len(), 2);
+
+        apply_stream_event(&st, 300, &ev("chunk", "\"\""));
+        assert_eq!(
+            st.messages.get_untracked().len(),
+            2,
+            "empty chunk added a phantom block"
+        );
+        // The last entry is still the tool block, not an empty text block.
+        assert!(matches!(
+            st.messages.get_untracked().last().map(|e| &e.block),
+            Some(UiBlock::Tool { .. })
+        ));
     }
 
     #[test]
