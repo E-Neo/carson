@@ -7,6 +7,7 @@ edition.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 bytes = "1"
+carson-shell = { path = "../carson-shell" }
 futures-util.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 rusqlite = { version = "0.40", features = ["bundled"] }

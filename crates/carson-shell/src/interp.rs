@@ -260,6 +260,17 @@ impl Interp<'_> {
             }
             name if EXTERNAL_COMMANDS.contains(&name) => self.run_exec(argv, io, local_env),
             _ => {
+                // Path-based dispatch: `/bin/<cmd>` (and `<cmd>` reached through
+                // `PATH=/bin`) runs the matching coreutils command.
+                let base = std::path::Path::new(name)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(name);
+                if EXTERNAL_COMMANDS.contains(&base) {
+                    let mut resolved = argv.to_vec();
+                    resolved[0] = base.to_string();
+                    return self.run_exec(&resolved, io, local_env);
+                }
                 self.emit_str(&io.stderr, &format!("bash: {name}: command not found\n"));
                 127
             }

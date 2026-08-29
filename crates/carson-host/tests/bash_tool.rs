@@ -152,3 +152,63 @@ fn sandbox_sharing_and_isolation() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn vfs_layout_bin_tmp_home() {
+    let runner = bash_runner();
+    let (out, err, code) = run_bash(&runner, "ls /bin");
+    assert_eq!(code, 0, "stderr: {err}");
+    for cmd in ["ls", "cat", "sort", "wc", "date"] {
+        assert!(out.lines().any(|l| l == cmd), "expected {cmd} in /bin, got:\n{out}");
+    }
+
+    let (out, err, code) = run_bash(&runner, "test -d /tmp && test -d /home/carson && echo ok");
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out, "ok\n");
+
+    // /tmp is an ordinary directory and persists across calls.
+    assert_eq!(run_bash(&runner, "echo x > /tmp/t.txt").0, "");
+    let (out, _, code) = run_bash(&runner, "cat /tmp/t.txt");
+    assert_eq!(code, 0);
+    assert_eq!(out, "x\n");
+}
+
+#[test]
+fn bin_commands_runnable_by_path() {
+    let runner = bash_runner();
+    let (out, err, code) = run_bash(&runner, "/bin/ls /bin | head -2");
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(!out.is_empty(), "expected listing, got {out:?}");
+
+    let (out, err, code) = run_bash(&runner, "echo hi | /bin/cat");
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out, "hi\n");
+}
+
+#[test]
+fn env_defaults_and_home_cwd() {
+    let runner = bash_runner();
+    let (out, err, code) = run_bash(&runner, "echo $HOME $USER $LOGNAME $PATH");
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out, "/home/carson carson carson /bin\n");
+
+    // Default cwd is the carson home.
+    let (out, err, code) = run_bash(&runner, "pwd");
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out, "/home/carson\n");
+}
+
+#[test]
+fn every_coreutils_command_runs_without_trapping() {
+    let runner = bash_runner();
+    // A trap inside a coreutils instance surfaces as exit 126 from the shell;
+    // a normal util error (wrong args, missing file, ...) is a real exit code.
+    for cmd in carson_shell::EXTERNAL_COMMANDS {
+        let script = format!("{cmd} --version");
+        let (out, err, code) = run_bash(&runner, &script);
+        assert!(
+            code != 126,
+            "{cmd} trapped: out={out:?} err={err:?}"
+        );
+    }
+}

@@ -60,10 +60,12 @@ pub fn builtin_tools() -> Vec<ToolDef> {
             id: builtin_id("bash"),
             name: "bash".into(),
             description: concat!(
-                "Run bash scripts in a sandboxed working directory. ",
+                "Run bash scripts in a sandboxed virtual filesystem rooted at / with ",
+                "/bin (coreutils commands, runnable via /bin/<cmd> or PATH=/bin), ",
+                "/tmp and /home/carson (the home, also the default cwd). ",
                 "Builtins: cd, pwd, echo, printf, export, unset, set, env, test, true, false, exit. ",
-                "Commands: ls, cat, cp, mv, rm, mkdir, touch, date. ",
-                "Arguments: {command, cwd?, env?}."
+                "Commands: most GNU coreutils (ls, cat, cp, mv, rm, mkdir, touch, date, ",
+                "head, tail, sort, wc, ...). Arguments: {command, cwd?, env?}."
             )
             .into(),
             parameters: serde_json::json!({

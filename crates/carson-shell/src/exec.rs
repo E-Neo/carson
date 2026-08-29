@@ -6,8 +6,16 @@ use std::collections::HashMap;
 
 /// Commands the shell may hand to [`Exec`]. Everything else is `command not
 /// found`. These run as separate sandboxed programs with their own stdio.
-pub const EXTERNAL_COMMANDS: &[&str] =
-    &["ls", "cat", "cp", "mv", "rm", "mkdir", "touch", "env", "date"];
+/// Kept in sync with the `dispatch()` arms in `crates/carson-tools/src/bin/
+/// coreutils.rs`; the same list seeds the `/bin` directory of every sandbox.
+pub const EXTERNAL_COMMANDS: &[&str] = &[
+    "base32", "base64", "basename", "cat", "cksum", "comm", "cp", "csplit", "cut", "date",
+    "dirname", "expand", "factor", "fmt", "fold", "head", "join", "link", "ln", "ls", "md5sum",
+    "mkdir", "mktemp", "mv", "nl", "numfmt", "od", "paste", "pathchk", "pr", "printf", "ptx",
+    "pwd", "readlink", "realpath", "rm", "rmdir", "seq", "sha1sum", "sha224sum", "sha256sum",
+    "sha384sum", "sha512sum", "shuf", "sort", "split", "sum", "tail", "tee", "touch", "tr",
+    "truncate", "tsort", "unexpand", "uniq", "wc", "yes",
+];
 
 /// A command runner that executes `prog` with its own captured stdio.
 pub trait Exec {

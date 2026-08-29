@@ -62,7 +62,7 @@ impl Guest for BashTool {
             .as_str()
             .ok_or(ToolError::Failed)?
             .to_string();
-        let cwd = args["cwd"].as_str().unwrap_or("/");
+        let cwd = args["cwd"].as_str().unwrap_or("/home/carson");
         let mut env: HashMap<String, String> = std::env::vars().collect();
         if let Some(extra) = args["env"].as_object() {
             for (k, v) in extra {
@@ -72,7 +72,7 @@ impl Guest for BashTool {
                 );
             }
         }
-        const ROOT: &str = "/sandbox";
+        const ROOT: &str = "/";
         let mut exec = HostExec;
         let result = carson_shell::run_script_with_cwd(&command, &env, ROOT, cwd, &mut exec);
         let (stdout, stderr, exit_code) = match result {

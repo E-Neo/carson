@@ -169,13 +169,13 @@ async fn spawn_coreutils(
     let stdout = MemoryOutputPipe::new(SHELL_PIPE_CAPACITY);
     let stderr = MemoryOutputPipe::new(SHELL_PIPE_CAPACITY);
 
-let mut builder = WasiCtxBuilder::new();
+    let mut builder = WasiCtxBuilder::new();
     builder.args(argv);
-    for (k, v) in env {
-        builder.env(k, v);
-    }
+    apply_env_defaults(&mut builder, env.iter().map(|(k, v)| (k, v)));
+    builder.env("CARSON_CWD", resolve_guest_cwd(cwd));
     // The sandbox root is the guest root: relative paths and absolute `/...`
-    // paths both resolve against the same directory the shell uses.
+    // paths both resolve against the same directory the shell uses. /bin,
+    // /tmp and /home/carson are real subdirs of it.
     builder
         .preopened_dir(root, "/", FsPerms::ReadWrite)
         .map_err(|e| format!("preopen: {e}"))?;
@@ -366,6 +366,36 @@ fn sandbox_dir(id: &str) -> PathBuf {
         .join(sanitize(id))
 }
 
+/// Lay out the sandbox's virtual filesystem: `/bin` (one placeholder per
+/// available coreutils command, so `ls /bin` lists them), `/tmp` and
+/// `/home/carson`. Idempotent; run whenever a sandbox directory is prepared.
+fn ensure_vfs(root: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(root.join("bin"))?;
+    std::fs::create_dir_all(root.join("tmp"))?;
+    std::fs::create_dir_all(root.join("home").join("carson"))?;
+    for cmd in carson_shell::EXTERNAL_COMMANDS {
+        let entry = root.join("bin").join(cmd);
+        if !entry.exists() {
+            std::fs::write(entry, "")?;
+        }
+    }
+    Ok(())
+}
+
+/// Defaults for the shell process environment; explicit tool env overrides.
+fn apply_env_defaults<'a>(
+    builder: &mut WasiCtxBuilder,
+    env: impl IntoIterator<Item = (&'a String, &'a String)>,
+) {
+    builder.env("HOME", "/home/carson");
+    builder.env("USER", "carson");
+    builder.env("LOGNAME", "carson");
+    builder.env("PATH", "/bin");
+    for (k, v) in env {
+        builder.env(k, v);
+    }
+}
+
 pub(crate) fn sanitize(id: &str) -> String {
     id.chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
@@ -439,6 +469,7 @@ async fn run_shell(
     args: &str,
 ) -> Result<String, String> {
     std::fs::create_dir_all(root).map_err(|e| format!("create sandbox: {e}"))?;
+    ensure_vfs(root).map_err(|e| format!("lay out vfs: {e}"))?;
     let mut linker = Linker::<ShellCtx>::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| e.to_string())?;
     BashWorld::add_to_linker::<ShellCtx, wasmtime::component::HasSelf<ShellCtx>>(
@@ -448,13 +479,14 @@ async fn run_shell(
     .map_err(|e| e.to_string())?;
 
     let mut builder = WasiCtxBuilder::new();
-    for (key, value) in env {
-        builder.env(key, value);
-    }
+    apply_env_defaults(&mut builder, env.iter().map(|(k, v)| (k, v)));
+    // The sandbox root is the guest root: relative and absolute `/...` paths
+    // resolve against the same directory the shell uses. /bin, /tmp and
+    // /home/carson are real subdirs of it.
     builder
-        .preopened_dir(root, "sandbox", FsPerms::ReadWrite)
+        .preopened_dir(root, "/", FsPerms::ReadWrite)
         .map_err(|e| format!("preopen: {e}"))?;
-    builder.initial_cwd("/sandbox");
+    builder.initial_cwd("/");
     let wasi = builder.build();
     let mut store = Store::new(
         engine,

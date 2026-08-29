@@ -20,6 +20,7 @@ fn main() {
     let mut watch_inputs: Vec<PathBuf> = [
         "crates/carson-agent",
         "crates/carson-tools",
+        "crates/carson-shell",
         "wit",
         "crates/carson-tools/wit",
     ]
