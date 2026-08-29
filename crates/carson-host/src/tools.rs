@@ -341,20 +341,32 @@ impl ToolRunner {
     }
 
     pub fn run(&self, id: &str, args_json: &str) -> Option<Result<String, String>> {
+        self.run_in(id, args_json, None)
+    }
+
+    /// Run a tool in a specific sandbox directory. The bash tool preopens
+    /// `root` for its interpreter and every exec'd coreutils instance; plain
+    /// tools ignore it. `None` falls back to the registered default.
+    pub fn run_in(
+        &self,
+        id: &str,
+        args_json: &str,
+        root: Option<&std::path::Path>,
+    ) -> Option<Result<String, String>> {
         let sandbox = self.sandboxes.read().unwrap().get(id).cloned()?;
-        Some(invoke_tool(&self.engine, &sandbox, args_json))
+        Some(invoke_tool(&self.engine, &sandbox, args_json, root))
     }
 }
 
-/// The directory a shell tool's sandbox lives in. One directory per tool id;
-/// every exec'd coreutils instance sees the same files.
+/// The directory a shell tool's sandbox lives in by default. One directory per
+/// tool id; every exec'd coreutils instance sees the same files.
 fn sandbox_dir(id: &str) -> PathBuf {
     std::env::temp_dir()
         .join("carson-sandbox")
         .join(sanitize(id))
 }
 
-fn sanitize(id: &str) -> String {
+pub(crate) fn sanitize(id: &str) -> String {
     id.chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect()
@@ -364,6 +376,7 @@ fn invoke_tool(
     engine: &Arc<Engine>,
     sandbox: &ToolSandbox,
     args_json: &str,
+    session_root: Option<&std::path::Path>,
 ) -> Result<String, String> {
     match &sandbox.kind {
         SandboxKind::Plain(component) => {
@@ -379,12 +392,14 @@ fn invoke_tool(
         SandboxKind::Shell {
             component,
             coreutils,
-            root,
+            root: default_root,
         } => {
             let engine = engine.clone();
             let component = component.clone();
             let coreutils = coreutils.clone();
-            let root = root.clone();
+            let root = session_root
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| default_root.clone());
             let env = sandbox.env.clone();
             let args = args_json.to_string();
             blocking_thread(move || async move {
@@ -423,6 +438,7 @@ async fn run_shell(
     env: &HashMap<String, String>,
     args: &str,
 ) -> Result<String, String> {
+    std::fs::create_dir_all(root).map_err(|e| format!("create sandbox: {e}"))?;
     let mut linker = Linker::<ShellCtx>::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| e.to_string())?;
     BashWorld::add_to_linker::<ShellCtx, wasmtime::component::HasSelf<ShellCtx>>(

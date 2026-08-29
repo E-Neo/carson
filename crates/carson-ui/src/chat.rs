@@ -1,7 +1,7 @@
 use crate::api;
 use crate::shell::{DragRail, DrawerBackdrop, MenuButton, sidebar_width};
 use crate::sse;
-use crate::types::SessionSummary;
+use crate::types::{SandboxSummary, SessionSummary};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::hooks::{use_navigate, use_params};
@@ -718,6 +718,14 @@ pub fn ChatPage() -> impl IntoView {
     let next_id = RwSignal::new(1u64);
     let drawer_open = RwSignal::new(false);
 
+    // Per-session settings drawer.
+    let settings_open = RwSignal::new(false);
+    let sandboxes = RwSignal::new(Vec::<SandboxSummary>::new());
+    let name_edit = RwSignal::new(String::new());
+    let rename_alias = RwSignal::new(String::new());
+    let new_sandbox_name = RwSignal::new(String::new());
+    let selected_sandbox = RwSignal::new(None::<String>);
+
     // Auto-scroll: follow the stream only while `follow` is engaged. Any
     // user intent (wheel / touch / scrollbar grab) disengages it immediately
     // and synchronously, so streaming never fights the user. Scrolling back
@@ -916,15 +924,125 @@ pub fn ChatPage() -> impl IntoView {
         }
     };
 
-    let new_chat = move || go_to.set(Some("/chat".to_string()));
+    // --- session settings ---------------------------------------------------
 
-    let active_agent = Memo::new(move |_| {
-        sessions
+    let open_settings = move || {
+        if active.get().is_none() {
+            return;
+        }
+        name_edit.set(
+            sessions
+                .get()
+                .iter()
+                .find(|s| Some(&s.id) == active.get().as_ref())
+                .and_then(|s| s.name.clone())
+                .unwrap_or_default(),
+        );
+        settings_open.set(true);
+        let sandboxes = sandboxes;
+        spawn_local(async move {
+            load_sandboxes_async(sandboxes).await;
+        });
+    };
+
+    let save_session_name = move || {
+        if let Some(id) = active.get() {
+            let name = name_edit.get();
+            let sessions = sessions;
+            spawn_local(async move {
+                let _ = api::put(&format!("/api/sessions/{id}"), &json!({ "name": name })).await;
+                refresh_sessions_async(sessions).await;
+            });
+        }
+    };
+
+    let switch_sandbox = move |sid: String| {
+        if let Some(id) = active.get() {
+            let sessions = sessions;
+            spawn_local(async move {
+                let _ = api::put(
+                    &format!("/api/sessions/{id}"),
+                    &json!({ "sandbox_id": sid }),
+                )
+                .await;
+                refresh_sessions_async(sessions).await;
+            });
+        }
+    };
+
+    let create_new_sandbox = move || {
+        if let Some(id) = active.get() {
+            let name = new_sandbox_name.get();
+            if name.trim().is_empty() {
+                return;
+            }
+            new_sandbox_name.set(String::new());
+            let sessions = sessions;
+            let sandboxes = sandboxes;
+            spawn_local(async move {
+                if let Ok((_, v)) = api::post("/api/sandboxes", &json!({ "name": name })).await
+                    && let Some(sid) = v.get("id").and_then(|x| x.as_str())
+                {
+                    let _ = api::put(
+                        &format!("/api/sessions/{id}"),
+                        &json!({ "sandbox_id": sid }),
+                    )
+                    .await;
+                    load_sandboxes_async(sandboxes).await;
+                    refresh_sessions_async(sessions).await;
+                }
+            });
+        }
+    };
+
+    let rename_alias_save = move || {
+        if let Some(sid) = selected_sandbox.get() {
+            let name = rename_alias.get();
+            let sandboxes = sandboxes;
+            spawn_local(async move {
+                let _ = api::put(&format!("/api/sandboxes/{sid}"), &json!({ "name": name })).await;
+                load_sandboxes_async(sandboxes).await;
+            });
+        }
+    };
+
+    let current_sandbox_name = Memo::new(move |_| {
+        let sid = sessions
             .get()
             .iter()
             .find(|s| Some(&s.id) == active.get().as_ref())
-            .map(|s| s.agent.clone())
-            .unwrap_or_default()
+            .and_then(|s| s.sandbox_id.clone())
+            .unwrap_or_default();
+        if sid.is_empty() {
+            return String::from("(none)");
+        }
+        sandboxes
+            .get()
+            .iter()
+            .find(|b| b.id == sid)
+            .map(|b| b.name.clone())
+            .unwrap_or_else(|| sid)
+    });
+
+    let new_chat = move || go_to.set(Some("/chat".to_string()));
+
+    // Toolbar title: alias (when set) plus session id and agent.
+    let active_title = Memo::new(move |_| {
+        let list = sessions.get();
+        let Some(sess) = list
+            .iter()
+            .find(|s| Some(&s.id) == active.get().as_ref())
+        else {
+            return String::new();
+        };
+        let id = short_id(&sess.id);
+        let agent = &sess.agent;
+        match sess.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            Some(name) if agent.is_empty() => format!("{name} · {id}"),
+            Some(name) => format!("{name} · {id} · {agent}"),
+            None if agent.is_empty() => format!("Session {id}"),
+            None => format!("Session {id} · {agent}"),
+        }
     });
 
     view! {
@@ -952,7 +1070,10 @@ pub fn ChatPage() -> impl IntoView {
                                         "session-item"
                                     }
                                 };
-                                let label = format!("{} · {}", short_id(&session.id), session.agent);
+                                let label = match &session.name {
+                                    Some(name) if !name.is_empty() => name.clone(),
+                                    _ => format!("{} · {}", short_id(&session.id), session.agent),
+                                };
                                 let id_del = session.id.clone();
                                 let id_sel = session.id.clone();
                                 view! {
@@ -984,15 +1105,9 @@ pub fn ChatPage() -> impl IntoView {
                             view! {
                                 <div class="toolbar">
                                     <div class="title">
-                                        {move || {
-                                            let id = active.get().map(|i| short_id(&i)).unwrap_or_default();
-                                            if active_agent.get().is_empty() {
-                                                format!("Session {id}")
-                                            } else {
-                                                format!("Session {id} · {}", active_agent.get())
-                                            }
-                                        }}
+                                        {move || active_title.get()}
                                     </div>
+                                    <button class="btn" on:click=move |_| open_settings()>"Settings"</button>
                                     <button class="btn" disabled=move || !running.get() on:click=move |_| stop_session()>
                                         "Stop"
                                     </button>
@@ -1108,6 +1223,99 @@ pub fn ChatPage() -> impl IntoView {
                     }}
                 </main>
                 <DrawerBackdrop open=drawer_open/>
+                {move || {
+                    settings_open.get().then(|| {
+                        view! {
+                            <>
+                                <div
+                                    class="settings-backdrop"
+                                    on:click=move |_| settings_open.set(false)
+                                ></div>
+                                <aside class="settings-panel">
+                                    <div class="settings-head">
+                                        <h3>"Session settings"</h3>
+                                        <button class="btn" on:click=move |_| settings_open.set(false)>
+                                            "Close"
+                                        </button>
+                                    </div>
+                                    <div class="settings-body">
+                                        <label>"Name"</label>
+                                        <div class="settings-row">
+                                            <input
+                                                placeholder="Session name"
+                                                prop:value=move || name_edit.get()
+                                                on:input=move |ev| name_edit.set(event_target_value(&ev))
+                                            />
+                                            <button class="btn primary" on:click=move |_| save_session_name()>
+                                                "Save"
+                                            </button>
+                                        </div>
+                                        <label>"Sandbox"</label>
+                                        <div class="settings-hint">
+                                            "Current: "{move || current_sandbox_name.get()}
+                                        </div>
+                                        <div class="sandbox-list">
+                                            <For
+                                                each=move || sandboxes.get()
+                                                key=|s: &SandboxSummary| s.id.clone()
+                                                children=move |sb: SandboxSummary| {
+                                                    let id = sb.id.clone();
+                                                    let name = sb.name.clone();
+                                                    let click_id = id.clone();
+                                                    let click_name = name.clone();
+                                                    let selected = move || {
+                                                        selected_sandbox.get().as_ref() == Some(&id)
+                                                    };
+                                                    let cls = move || {
+                                                        if selected() { "sandbox-item active" } else { "sandbox-item" }
+                                                    };
+                                                    view! {
+                                                        <div
+                                                            class=cls
+                                                            on:click=move |_| {
+                                                                selected_sandbox.set(Some(click_id.clone()));
+                                                                rename_alias.set(click_name.clone());
+                                                                switch_sandbox(click_id.clone());
+                                                            }
+                                                        >
+                                                            <span class="sandbox-name">{sb.name.clone()}</span>
+                                                            <span class="sandbox-id">{short_id(&sb.id)}</span>
+                                                        </div>
+                                                    }
+                                                }
+                                            />
+                                        </div>
+                                        <div class="settings-row">
+                                            <input
+                                                placeholder="Rename selected sandbox"
+                                                prop:value=move || rename_alias.get()
+                                                on:input=move |ev| rename_alias.set(event_target_value(&ev))
+                                            />
+                                            <button
+                                                class="btn"
+                                                disabled=move || selected_sandbox.get().is_none()
+                                                on:click=move |_| rename_alias_save()
+                                            >
+                                                "Rename"
+                                            </button>
+                                        </div>
+                                        <label>"New sandbox"</label>
+                                        <div class="settings-row">
+                                            <input
+                                                placeholder="Workspace name"
+                                                prop:value=move || new_sandbox_name.get()
+                                                on:input=move |ev| new_sandbox_name.set(event_target_value(&ev))
+                                            />
+                                            <button class="btn primary" on:click=move |_| create_new_sandbox()>
+                                                "Create"
+                                            </button>
+                                        </div>
+                                    </div>
+                                </aside>
+                            </>
+                        }
+                    })
+                }}
             </div>
         }
 }
@@ -1119,6 +1327,18 @@ async fn refresh_sessions_async(sessions: RwSignal<Vec<SessionSummary>>) {
         sessions.set(
             list.iter()
                 .filter_map(|s| serde_json::from_value::<SessionSummary>(s.clone()).ok())
+                .collect(),
+        );
+    }
+}
+
+async fn load_sandboxes_async(sandboxes: RwSignal<Vec<SandboxSummary>>) {
+    if let Ok((_, v)) = api::get("/api/sandboxes").await
+        && let Some(list) = v.get("sandboxes").and_then(|x| x.as_array())
+    {
+        sandboxes.set(
+            list.iter()
+                .filter_map(|s| serde_json::from_value::<SandboxSummary>(s.clone()).ok())
                 .collect(),
         );
     }

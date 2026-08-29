@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
@@ -101,10 +102,19 @@ pub struct HostContext {
     pub hub: Arc<Hub>,
     pub drivers: Arc<RwLock<HashMap<String, Arc<dyn LlmDriver>>>>,
     pub tool_runner: Arc<ToolRunner>,
+    /// Parent directory of every sandbox: `$CARSON_HOME/sandbox`.
+    pub sandbox_base: PathBuf,
+    /// Live `session_id -> sandbox_id` links, seeded on create/restore and
+    /// updated when a session switches sandbox.
+    pub sandbox_links: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl HostContext {
     pub fn new() -> Result<Self> {
+        Self::with_sandbox_base(std::env::temp_dir().join("carson-sandbox"))
+    }
+
+    pub fn with_sandbox_base(sandbox_base: impl Into<PathBuf>) -> Result<Self> {
         let engine = Engine::new(&wasmtime::Config::new())?;
         let component = Component::new(&engine, EMBEDDED_AGENT)?;
         let hub = Hub::new();
@@ -115,6 +125,8 @@ impl HostContext {
             hub,
             drivers: Arc::new(RwLock::new(HashMap::new())),
             tool_runner,
+            sandbox_base: sandbox_base.into(),
+            sandbox_links: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -198,6 +210,10 @@ pub async fn snapshot_session(db: &Arc<Db>, instance: &AgentInstance, session_id
         id: session_id.to_string(),
         agent_name: instance.agent_name.clone(),
         agent_version_id: instance.agent_version.clone(),
+        // Name and sandbox are session metadata managed by the API layer via
+        // their own update calls; the message snapshot must not clobber them.
+        name: None,
+        sandbox_id: None,
         summary: state.summary,
         usage: Usage {
             input_tokens: state.usage.input_tokens,
@@ -255,6 +271,8 @@ pub async fn build_instance(ctx: &HostContext, def: &AgentDef) -> Result<AgentIn
         hub: ctx.hub.clone(),
         drivers: ctx.drivers.clone(),
         tool_runner: ctx.tool_runner.clone(),
+        sandbox_base: ctx.sandbox_base.clone(),
+        sandbox_links: ctx.sandbox_links.clone(),
         caps: Capabilities::from_ids(def.capabilities.clone()),
         stop: Arc::new(AtomicBool::new(false)),
         streams: HashMap::new(),

@@ -13,7 +13,7 @@ use crate::drivers::{
     Usage,
 };
 use crate::hub::Hub;
-use crate::tools::{Capabilities, ToolRunner};
+use crate::tools::{Capabilities, ToolRunner, sanitize};
 
 pub struct StreamHandle {
     rx: mpsc::Receiver<DriverEvent>,
@@ -26,6 +26,8 @@ pub struct State {
     pub hub: Arc<Hub>,
     pub drivers: Arc<RwLock<HashMap<String, Arc<dyn LlmDriver>>>>,
     pub tool_runner: Arc<ToolRunner>,
+    pub sandbox_base: std::path::PathBuf,
+    pub sandbox_links: Arc<RwLock<HashMap<String, String>>>,
     pub caps: Capabilities,
     pub stop: Arc<AtomicBool>,
     pub streams: HashMap<u64, StreamHandle>,
@@ -282,8 +284,14 @@ impl crate::bindings::carson::agent::tools::Host for State {
     }
 
     /// The model invokes by bare name; resolve it through this instance's
-    /// capabilities to exactly one tool id, then run that sandbox.
-    fn invoke(&mut self, name: String, arguments_json: String) -> Result<String, ToolError> {
+    /// capabilities to exactly one tool id, then run that sandbox in the
+    /// session's sandbox directory.
+    fn invoke(
+        &mut self,
+        name: String,
+        arguments_json: String,
+        session_id: String,
+    ) -> Result<String, ToolError> {
         let specs = self.tool_runner.specs();
         let Some(id) = self
             .caps
@@ -292,7 +300,18 @@ impl crate::bindings::carson::agent::tools::Host for State {
         else {
             return Err(ToolError::PermissionDenied);
         };
-        match self.tool_runner.run(&id, &arguments_json) {
+        let sandbox_id = self
+            .sandbox_links
+            .read()
+            .unwrap()
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_else(|| session_id.clone());
+        let root = self.sandbox_base.join(sanitize(&sandbox_id));
+        if std::fs::create_dir_all(&root).is_err() {
+            return Err(ToolError::Failed);
+        }
+        match self.tool_runner.run_in(&id, &arguments_json, Some(&root)) {
             Some(Ok(output)) => Ok(output),
             Some(Err(_)) => Err(ToolError::Failed),
             None => Err(ToolError::NotFound),
@@ -344,12 +363,15 @@ mod tests {
             .unwrap();
         let mut drivers: HashMap<String, Arc<dyn LlmDriver>> = HashMap::new();
         drivers.insert("mock".into(), Arc::new(crate::drivers::EchoDriver));
+        let temp = std::env::temp_dir().join(format!("carson-state-test-{}", std::process::id()));
         State {
             wasi: WasiCtxBuilder::new().build(),
             table: ResourceTable::new(),
             hub: Hub::new(),
             drivers: Arc::new(RwLock::new(drivers)),
             tool_runner,
+            sandbox_base: temp,
+            sandbox_links: Arc::new(RwLock::new(HashMap::new())),
             caps: Capabilities::from_ids(tool_ids.iter().map(|s| s.to_string()).collect()),
             stop: Arc::new(AtomicBool::new(false)),
             streams: HashMap::new(),
@@ -434,7 +456,7 @@ mod tests {
         // No capabilities: bare name is not permitted at all.
         let mut state = test_state(&[]);
         assert_eq!(
-            state.invoke("time".into(), "{}".into()),
+            state.invoke("time".into(), "{}".into(), "s1".into()),
             Err(ToolError::PermissionDenied)
         );
 
@@ -442,7 +464,7 @@ mod tests {
         // name-based fallback.
         let mut state = test_state(&["nope"]);
         assert_eq!(
-            state.invoke("time".into(), "{}".into()),
+            state.invoke("time".into(), "{}".into(), "s1".into()),
             Err(ToolError::PermissionDenied)
         );
 
@@ -450,7 +472,7 @@ mod tests {
         let mut state = test_state(&[&time_id]);
         assert!(
             state
-                .invoke("time".into(), "{}".into())
+                .invoke("time".into(), "{}".into(), "s1".into())
                 .map(|out| out.contains("\"time\""))
                 .unwrap_or(false)
         );

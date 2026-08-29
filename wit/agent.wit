@@ -88,7 +88,7 @@ interface tools {
     }
 
     list-tools: func() -> list<tool-definition>;
-    invoke: func(name: string, arguments-json: string) -> result<string, tool-error>;
+    invoke: func(name: string, arguments-json: string, session-id: string) -> result<string, tool-error>;
 }
 
 interface agent {

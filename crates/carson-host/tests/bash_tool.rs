@@ -118,3 +118,37 @@ fn env_and_cwd() {
     let v: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["stdout"].as_str().unwrap(), "hi\n/\n");
 }
+
+#[test]
+fn sandbox_sharing_and_isolation() {
+    let runner = bash_runner();
+    let base = std::env::temp_dir().join(format!("carson-sb-test-{}", std::process::id()));
+    let root_a = base.join("a");
+    let root_b = base.join("b");
+    let run_in = |root: &std::path::Path, script: &str| -> (String, String, i64) {
+        let args = json!({ "command": script }).to_string();
+        let out = runner
+            .run_in("bash", &args, Some(root))
+            .expect("bash registered")
+            .expect("bash invocation");
+        let v: Value = serde_json::from_str(&out).expect("bash json result");
+        (
+            v["stdout"].as_str().unwrap_or_default().to_string(),
+            v["stderr"].as_str().unwrap_or_default().to_string(),
+            v["exit_code"].as_i64().unwrap_or(-1),
+        )
+    };
+
+    // A shared sandbox: a file written in one call is visible in the next.
+    assert_eq!(run_in(&root_a, "echo data > f.txt").0, "");
+    let (out, _, code) = run_in(&root_a, "cat f.txt");
+    assert_eq!(code, 0);
+    assert_eq!(out, "data\n");
+
+    // A different sandbox is isolated: the file is not there.
+    let (_, err, code) = run_in(&root_b, "cat f.txt");
+    assert_eq!(code, 1, "stderr: {err}");
+    assert!(err.contains("f.txt"), "stderr: {err}");
+
+    let _ = std::fs::remove_dir_all(&base);
+}

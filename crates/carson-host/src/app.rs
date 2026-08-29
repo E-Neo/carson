@@ -25,6 +25,8 @@ pub struct AppState {
 pub struct SessionEntry {
     pub agent_name: String,
     pub agent_version_id: String,
+    pub name: Option<String>,
+    pub sandbox_id: String,
     pub instance: Arc<AgentInstance>,
 }
 

@@ -497,9 +497,12 @@ async fn tools_are_grouped_and_bundled_tools_are_immutable() {
     assert_eq!(status, 200, "{body}");
     let v: Value = serde_json::from_str(&body).unwrap();
     let builtins = v["builtins"].as_array().unwrap();
-    assert_eq!(builtins.len(), 1);
-    assert_eq!(builtins[0]["name"], "time");
-    let time_tool_id = builtins[0]["id"].as_str().unwrap().to_string();
+    assert!(builtins.len() >= 2, "time and bash builtins, got {builtins:?}");
+    let time_tool_id = builtins
+        .iter()
+        .find(|b| b["name"] == "time")
+        .map(|b| b["id"].as_str().unwrap().to_string())
+        .expect("time builtin listed");
     let _ = time_tool_id;
     assert_eq!(v["customs"].as_array().unwrap().len(), 0);
 

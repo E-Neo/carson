@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
     let db_path = home.join("carson.db");
     let db = Db::open(&db_path)?;
 
-    let ctx = Arc::new(HostContext::new()?);
+    let ctx = Arc::new(HostContext::with_sandbox_base(home.join("sandbox"))?);
 
     for provider in db.list_providers()? {
         match host::openai_driver(&provider) {
@@ -152,11 +152,39 @@ async fn main() -> Result<()> {
             tracing::warn!(id = %persisted.id, error = %err, "failed to restore session");
             continue;
         }
+        // Sessions created before sandboxes existed have no sandbox; backfill
+        // one (private by default, keyed by the session id).
+        let sandbox_id = persisted
+            .sandbox_id
+            .clone()
+            .unwrap_or_else(|| persisted.id.clone());
+        if app_state
+            .db
+            .sandbox_name(&sandbox_id)
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            let _ = app_state
+                .db
+                .insert_sandbox(&sandbox_id, &format!("Sandbox {}", &sandbox_id[..8]));
+        }
+        if persisted.sandbox_id.is_none() {
+            let _ = app_state.db.set_session_sandbox(&persisted.id, &sandbox_id);
+        }
+        app_state
+            .ctx
+            .sandbox_links
+            .write()
+            .unwrap()
+            .insert(persisted.id.clone(), sandbox_id.clone());
         app_state.sessions.lock().await.insert(
             persisted.id.clone(),
             carson_host::app::SessionEntry {
                 agent_name: persisted.agent_name.clone(),
                 agent_version_id: persisted.agent_version_id.clone(),
+                name: persisted.name.clone(),
+                sandbox_id,
                 instance,
             },
         );

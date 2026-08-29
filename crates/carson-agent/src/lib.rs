@@ -622,7 +622,7 @@ fn run_loop(session: &mut Session) -> Result<(), Error> {
             }
 
             let invoke_started = now_ms();
-            let (result, is_error) = match tools::invoke(&tc.name, &tc.arguments_json) {
+            let (result, is_error) = match tools::invoke(&tc.name, &tc.arguments_json, &session.id) {
                 Ok(output) => (output, false),
                 Err(tools::ToolError::PermissionDenied) => ("permission denied".to_string(), true),
                 Err(tools::ToolError::NotFound) => (format!("tool not found: {}", tc.name), true),

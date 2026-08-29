@@ -47,11 +47,19 @@ CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     agent_name TEXT NOT NULL,
     agent_version_id TEXT NOT NULL,
+    name TEXT,
+    sandbox_id TEXT,
     summary TEXT,
     input_tokens INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
     cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sandboxes (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -76,6 +84,36 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Add a column to an existing table if it is not present yet. SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`, so existing databases are upgraded here.
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<_, _>>()?;
+    if !columns.iter().any(|c| c == column) {
+        conn.execute_batch(ddl)?;
+    }
+    Ok(())
+}
+
+/// Apply schema upgrades to an already-created connection.
+fn migrate(conn: &Connection) -> Result<()> {
+    add_column_if_missing(
+        conn,
+        "sessions",
+        "name",
+        "ALTER TABLE sessions ADD COLUMN name TEXT",
+    )?;
+    add_column_if_missing(
+        conn,
+        "sessions",
+        "sandbox_id",
+        "ALTER TABLE sessions ADD COLUMN sandbox_id TEXT",
+    )?;
+    Ok(())
 }
 
 /// One entry of the persisted conversation block log (mirrors the WIT `block`).
@@ -132,9 +170,23 @@ pub struct PersistedSession {
     pub id: String,
     pub agent_name: String,
     pub agent_version_id: String,
+    /// User-facing session name; `None` until the user renames it.
+    pub name: Option<String>,
+    /// The sandbox this session's tools operate in; backfilled on restore for
+    /// sessions created before sandboxes existed.
+    pub sandbox_id: Option<String>,
     pub summary: Option<String>,
     pub usage: Usage,
     pub messages: Vec<StoredBlock>,
+}
+
+/// One sandbox in the pool. `id` is also the directory name under
+/// `$CARSON_HOME/sandbox/<id>`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Sandbox {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
 }
 
 /// Columns of one message row, kept together for the load query.
@@ -188,6 +240,7 @@ impl Db {
             Connection::open(path).with_context(|| format!("open database {}", path.display()))?;
         conn.execute_batch(SCHEMA)
             .with_context(|| format!("initialize schema in {}", path.display()))?;
+        migrate(&conn).with_context(|| format!("migrate schema in {}", path.display()))?;
         Ok(Arc::new(Self {
             conn: Mutex::new(conn),
         }))
@@ -198,6 +251,7 @@ impl Db {
     pub fn open_in_memory() -> Result<Arc<Self>> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Arc::new(Self {
             conn: Mutex::new(conn),
         }))
@@ -401,16 +455,19 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO sessions (id, agent_name, agent_version_id, summary, input_tokens, \
-             cache_read_tokens, cache_creation_tokens, output_tokens, created_at, updated_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9) \
-             ON CONFLICT(id) DO UPDATE SET agent_name=?2, agent_version_id=?3, summary=?4, \
-             input_tokens=?5, cache_read_tokens=?6, cache_creation_tokens=?7, output_tokens=?8, \
-             updated_at=?9",
+            "INSERT INTO sessions (id, agent_name, agent_version_id, name, sandbox_id, summary, \
+             input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, created_at, \
+             updated_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11) \
+             ON CONFLICT(id) DO UPDATE SET agent_name=?2, agent_version_id=?3, summary=?6, \
+             input_tokens=?7, cache_read_tokens=?8, cache_creation_tokens=?9, output_tokens=?10, \
+             updated_at=?11",
             params![
                 session.id,
                 session.agent_name,
                 session.agent_version_id,
+                session.name,
+                session.sandbox_id,
                 session.summary,
                 session.usage.input_tokens,
                 session.usage.cache_read_tokens,
@@ -452,8 +509,8 @@ impl Db {
     pub fn load_sessions(&self) -> Result<Vec<PersistedSession>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT s.id, s.agent_name, s.agent_version_id, s.summary, s.input_tokens, \
-             s.cache_read_tokens, s.cache_creation_tokens, s.output_tokens, \
+            "SELECT s.id, s.agent_name, s.agent_version_id, s.name, s.sandbox_id, s.summary, \
+             s.input_tokens, s.cache_read_tokens, s.cache_creation_tokens, s.output_tokens, \
              m.seq, m.agent_version_id, m.kind, m.content, m.input_tokens, \
              m.cache_read_tokens, m.cache_creation_tokens, \
              m.output_tokens, m.created_at, m.finished_at \
@@ -461,17 +518,17 @@ impl Db {
              ORDER BY s.rowid, m.seq",
         )?;
         let rows = stmt.query_map([], |row| {
-            let block = if row.get::<_, Option<i64>>(8)?.is_some() {
+            let block = if row.get::<_, Option<i64>>(10)?.is_some() {
                 Some(MessageRow(StoredBlock {
-                    agent_version_id: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
-                    kind: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
-                    text: row.get(11)?,
-                    input_tokens: row.get::<_, i64>(12)? as u32,
-                    cache_read_tokens: row.get::<_, i64>(13)? as u32,
-                    cache_creation_tokens: row.get::<_, i64>(14)? as u32,
-                    output_tokens: row.get::<_, i64>(15)? as u32,
-                    created_at_ms: row.get::<_, Option<i64>>(16)?.unwrap_or(0) as u64,
-                    finished_at_ms: row.get::<_, Option<i64>>(17)?.unwrap_or(0) as u64,
+                    agent_version_id: row.get::<_, Option<String>>(11)?.unwrap_or_default(),
+                    kind: row.get::<_, Option<String>>(12)?.unwrap_or_default(),
+                    text: row.get(13)?,
+                    input_tokens: row.get::<_, i64>(14)? as u32,
+                    cache_read_tokens: row.get::<_, i64>(15)? as u32,
+                    cache_creation_tokens: row.get::<_, i64>(16)? as u32,
+                    output_tokens: row.get::<_, i64>(17)? as u32,
+                    created_at_ms: row.get::<_, Option<i64>>(18)?.unwrap_or(0) as u64,
+                    finished_at_ms: row.get::<_, Option<i64>>(19)?.unwrap_or(0) as u64,
                 }))
             } else {
                 None
@@ -481,10 +538,12 @@ impl Db {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
-                row.get::<_, i64>(4)? as u32,
-                row.get::<_, i64>(5)? as u32,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
                 row.get::<_, i64>(6)? as u32,
                 row.get::<_, i64>(7)? as u32,
+                row.get::<_, i64>(8)? as u32,
+                row.get::<_, i64>(9)? as u32,
                 block,
             ))
         })?;
@@ -497,6 +556,8 @@ impl Db {
                 id,
                 agent_name,
                 agent_version_id,
+                name,
+                sandbox_id,
                 summary,
                 input,
                 cache_read,
@@ -511,6 +572,8 @@ impl Db {
                         id: id.clone(),
                         agent_name,
                         agent_version_id,
+                        name,
+                        sandbox_id,
                         summary,
                         usage: Usage {
                             input_tokens: input,
@@ -537,6 +600,75 @@ impl Db {
         tx.execute("DELETE FROM messages WHERE session_id = ?1", params![id])?;
         tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// All sandboxes in the pool, ordered by name.
+    pub fn list_sandboxes(&self) -> Result<Vec<Sandbox>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id, name, created_at FROM sandboxes ORDER BY name")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Sandbox {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Create a sandbox and return it.
+    pub fn insert_sandbox(&self, id: &str, name: &str) -> Result<Sandbox> {
+        let now = now_ms();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sandboxes (id, name, created_at, updated_at) VALUES (?1,?2,?3,?3)",
+            params![id, name, now],
+        )?;
+        Ok(Sandbox {
+            id: id.to_string(),
+            name: name.to_string(),
+            created_at: now,
+        })
+    }
+
+    /// Rename a sandbox's display alias.
+    pub fn rename_sandbox(&self, id: &str, name: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sandboxes SET name = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, name, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// The display name of a sandbox, if it exists.
+    pub fn sandbox_name(&self, id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT name FROM sandboxes WHERE id = ?1")?;
+        let mut rows = stmt.query_map(params![id], |row| row.get::<_, String>(0))?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Update a session's display name. `None` clears it.
+    pub fn set_session_name(&self, id: &str, name: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET name = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, name, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Point a session at a different sandbox.
+    pub fn set_session_sandbox(&self, id: &str, sandbox_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET sandbox_id = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, sandbox_id, now_ms()],
+        )?;
         Ok(())
     }
 }
@@ -584,6 +716,8 @@ mod tests {
             id: id.into(),
             agent_name: agent_name.into(),
             agent_version_id: version.into(),
+            name: None,
+            sandbox_id: Some(id.into()),
             summary: Some("summary".into()),
             usage: Usage {
                 input_tokens: 10,

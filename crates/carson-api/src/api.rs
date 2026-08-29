@@ -25,6 +25,25 @@ use utoipa_swagger_ui::SwaggerUi;
 #[derive(Deserialize, ToSchema)]
 pub struct CreateSessionReq {
     agent: String,
+    /// Link the session to an existing sandbox; omitted creates a fresh one.
+    #[serde(default)]
+    sandbox_id: Option<String>,
+}
+
+/// Rename a session and/or point it at a different sandbox. Omitted fields
+/// leave the corresponding setting unchanged.
+#[derive(Deserialize, ToSchema)]
+pub struct SessionUpdateReq {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    sandbox_id: Option<String>,
+}
+
+/// Create or rename a sandbox by its display alias.
+#[derive(Deserialize, ToSchema)]
+pub struct SandboxReq {
+    name: String,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -80,6 +99,12 @@ pub(crate) struct ResetPath {
 #[derive(TypedPath, Deserialize)]
 #[typed_path("/api/sessions/{id}/compact")]
 pub(crate) struct CompactPath {
+    id: String,
+}
+
+#[derive(TypedPath, Deserialize)]
+#[typed_path("/api/sandboxes/{id}")]
+pub(crate) struct SandboxPath {
     id: String,
 }
 
@@ -377,7 +402,12 @@ pub fn router(state: AppState) -> Router {
         .route(ToolIdPath::PATH, put(update_tool).delete(delete_tool))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .route("/api/sessions", post(create_session).get(list_sessions))
-        .route(SessionPath::PATH, get(get_session).delete(destroy_session))
+        .route(
+            SessionPath::PATH,
+            get(get_session).put(update_session).delete(destroy_session),
+        )
+        .route("/api/sandboxes", get(list_sandboxes).post(create_sandbox))
+        .route(SandboxPath::PATH, put(rename_sandbox))
         .route(MessagePath::PATH, post(send_message))
         .route(StreamPath::PATH, post(send_stream))
         .route(StopPath::PATH, post(stop_session))
@@ -1084,7 +1114,14 @@ pub(crate) async fn list_sessions(State(st): State<AppState>) -> Response {
         .lock()
         .await
         .iter()
-        .map(|(id, entry)| json!({"id": id, "agent": entry.agent_name}))
+        .map(|(id, entry)| {
+            json!({
+                "id": id,
+                "agent": entry.agent_name,
+                "name": entry.name,
+                "sandbox_id": entry.sandbox_id,
+            })
+        })
         .collect();
     json_ok(json!({"sessions": sessions, "total": sessions.len()}))
 }
@@ -1114,6 +1151,21 @@ pub(crate) async fn create_session(
     let session_id = uuid::Uuid::new_v4().to_string();
     let config = pool.config();
 
+    // Resolve the session's sandbox: link an existing one or mint a fresh
+    // sandbox. The directory itself is created lazily on first tool use.
+    let sandbox_id = match &req.sandbox_id {
+        Some(id) if st.db.sandbox_name(id).ok().flatten().is_some() => id.clone(),
+        Some(_) => return json_err(StatusCode::NOT_FOUND, "sandbox not found"),
+        None => {
+            let id = uuid::Uuid::new_v4().to_string();
+            let name = format!("Sandbox {}", &id[..8]);
+            if let Err(err) = st.db.insert_sandbox(&id, &name) {
+                return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}"));
+            }
+            id
+        }
+    };
+
     instance.stop.store(false, Ordering::SeqCst);
     let mut store = instance.store.lock().await;
     let guest = instance.agent.carson_agent_agent();
@@ -1125,19 +1177,28 @@ pub(crate) async fn create_session(
 
     match result {
         Ok((Ok(()),)) => {
+            st.ctx
+                .sandbox_links
+                .write()
+                .unwrap()
+                .insert(session_id.clone(), sandbox_id.clone());
             st.sessions.lock().await.insert(
                 session_id.clone(),
                 SessionEntry {
                     agent_name: def.name.clone(),
                     agent_version_id: def.id.clone(),
+                    name: None,
+                    sandbox_id: sandbox_id.clone(),
                     instance: instance.clone(),
                 },
             );
             host::snapshot_session(&st.db, &instance, &session_id).await;
+            let _ = st.db.set_session_sandbox(&session_id, &sandbox_id);
             json_created(json!({
                 "session_id": session_id,
                 "agent": def.name,
                 "agent_version_id": def.id,
+                "sandbox_id": sandbox_id,
             }))
         }
         Ok((Err(err),)) => json_err(
@@ -1217,10 +1278,122 @@ pub(crate) async fn get_session(State(st): State<AppState>, path: SessionPath) -
         "session_id": id,
         "agent": entry.agent_name,
         "agent_version_id": entry.agent_version_id,
+        "name": entry.name,
+        "sandbox_id": entry.sandbox_id,
         "model": model,
         "message_count": messages.len(),
         "messages": messages,
     }))
+}
+
+/// Destroy a session.
+#[utoipa::path(
+    delete,
+    path = "/api/sessions/{id}",
+    params(
+        ("id" = String, Path, description = "Session id")
+    ),
+    responses(
+        (status = 200, description = "Session deleted", body = SessionCommandResponse),
+        (status = 404, description = "Session not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn update_session(
+    State(st): State<AppState>,
+    path: SessionPath,
+    Json(req): Json<SessionUpdateReq>,
+) -> Response {
+    let id = path.id;
+    let mut entry = {
+        let sessions = st.sessions.lock().await;
+        match sessions.get(&id) {
+            Some(e) => e.clone(),
+            None => return json_err(StatusCode::NOT_FOUND, "session not found"),
+        }
+    };
+    if let Some(name) = &req.name {
+        let name = if name.trim().is_empty() {
+            None
+        } else {
+            Some(name.trim().to_string())
+        };
+        if st.db.set_session_name(&id, name.as_deref()).is_err() {
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, "failed to rename session");
+        }
+        entry.name = name;
+    }
+    if let Some(sandbox_id) = &req.sandbox_id {
+        if st.db.sandbox_name(sandbox_id).ok().flatten().is_none() {
+            return json_err(StatusCode::NOT_FOUND, "sandbox not found");
+        }
+        if st.db.set_session_sandbox(&id, sandbox_id).is_err() {
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, "failed to switch sandbox");
+        }
+        st.ctx
+            .sandbox_links
+            .write()
+            .unwrap()
+            .insert(id.clone(), sandbox_id.clone());
+        entry.sandbox_id = sandbox_id.clone();
+    }
+    st.sessions.lock().await.insert(id.clone(), entry.clone());
+    json_ok(json!({
+        "session_id": id,
+        "name": entry.name,
+        "sandbox_id": entry.sandbox_id,
+    }))
+}
+
+/// List every sandbox in the pool.
+#[utoipa::path(
+    get,
+    path = "/api/sandboxes",
+    responses((status = 200, description = "Sandbox list"))
+)]
+pub(crate) async fn list_sandboxes(State(st): State<AppState>) -> Response {
+    match st.db.list_sandboxes() {
+        Ok(list) => json_ok(json!({"sandboxes": list, "total": list.len()})),
+        Err(err) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
+    }
+}
+
+/// Create a new sandbox with the given display name.
+#[utoipa::path(
+    post,
+    path = "/api/sandboxes",
+    request_body = SandboxReq,
+    responses((status = 201, description = "Sandbox created"))
+)]
+pub(crate) async fn create_sandbox(
+    State(st): State<AppState>,
+    Json(req): Json<SandboxReq>,
+) -> Response {
+    let id = uuid::Uuid::new_v4().to_string();
+    match st.db.insert_sandbox(&id, &req.name) {
+        Ok(sb) => json_created(json!({"id": sb.id, "name": sb.name})),
+        Err(err) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
+    }
+}
+
+/// Rename a sandbox's display alias.
+#[utoipa::path(
+    put,
+    path = "/api/sandboxes/{id}",
+    request_body = SandboxReq,
+    responses((status = 200, description = "Sandbox renamed"))
+)]
+pub(crate) async fn rename_sandbox(
+    State(st): State<AppState>,
+    path: SandboxPath,
+    Json(req): Json<SandboxReq>,
+) -> Response {
+    if st.db.sandbox_name(&path.id).ok().flatten().is_none() {
+        return json_err(StatusCode::NOT_FOUND, "sandbox not found");
+    }
+    if st.db.rename_sandbox(&path.id, &req.name).is_err() {
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, "failed to rename sandbox");
+    }
+    json_ok(json!({"id": path.id, "name": req.name}))
 }
 
 /// Destroy a session.
@@ -1248,6 +1421,7 @@ pub(crate) async fn destroy_session(State(st): State<AppState>, path: SessionPat
         .await;
     drop(store);
     let _ = st.db.delete_session(&id);
+    st.ctx.sandbox_links.write().unwrap().remove(&id);
     json_ok(json!({"status": "deleted", "session_id": id}))
 }
 
@@ -1387,6 +1561,8 @@ async fn sync_session_agent(st: &AppState, id: &str, entry: &SessionEntry) -> Se
     let updated = SessionEntry {
         agent_name: def.name.clone(),
         agent_version_id: def.id.clone(),
+        name: entry.name.clone(),
+        sandbox_id: entry.sandbox_id.clone(),
         instance,
     };
     st.sessions
