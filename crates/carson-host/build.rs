@@ -34,8 +34,12 @@ fn main() {
     }
 
     let out_dir = embed_target.join("wasm32-wasip2").join(&profile);
-    const ARTIFACTS: [(&str, &str); 2] =
-        [("carson_agent", "carson_agent.wasm"), ("time", "time.wasm")];
+    const ARTIFACTS: [(&str, &str); 4] = [
+        ("carson_agent", "carson_agent.wasm"),
+        ("time", "time.wasm"),
+        ("bash", "bash.wasm"),
+        ("coreutils", "coreutils.wasm"),
+    ];
 
     // Reuse existing artifacts unless some watched input is newer than all of them.
     let up_to_date = match newest_mtime(&watch_inputs) {
@@ -80,6 +84,8 @@ fn main() {
     for (name, env_key) in [
         ("carson_agent", "CARSON_AGENT_WASM"),
         ("time", "CARSON_TOOL_TIME_WASM"),
+        ("bash", "CARSON_TOOL_BASH_WASM"),
+        ("coreutils", "CARSON_TOOL_COREUTILS_WASM"),
     ] {
         let path = &artifacts[name];
         println!("cargo:rustc-env={env_key}={}", path.display());

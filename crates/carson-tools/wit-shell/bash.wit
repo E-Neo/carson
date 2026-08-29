@@ -1,0 +1,36 @@
+package carson:shell;
+
+/// Connection between the bash interpreter and the sandboxed command runner
+/// (uutils coreutils as a separate wasm instance).
+interface exec {
+    record exec-result {
+        stdout: list<u8>,
+        stderr: list<u8>,
+        status: u32,
+    }
+
+    /// Run `prog` with its own sandboxed instance. `cwd` is the shell's
+    /// current directory relative to the sandbox root.
+    run: func(
+        prog: string,
+        argv: list<string>,
+        env: list<tuple<string, string>>,
+        cwd: string,
+        stdin: list<u8>,
+    ) -> result<exec-result, string>;
+}
+
+/// The command runner: a wasm instance that executes one coreutils util with
+/// argv/env/cwd (and stdio) configured by the host.
+interface coreutils {
+    run: func() -> result<u32, string>;
+}
+
+world bash-world {
+    import exec;
+    export carson:tool/tool;
+}
+
+world coreutils-world {
+    export coreutils;
+}

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -6,9 +7,20 @@ use anyhow::Result;
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::filesystem::FsPerms;
+use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 
+use crate::bash_bindings::BashWorld;
+use crate::coreutils_bindings::CoreutilsWorld;
 use crate::registry::ToolDef;
 use crate::tool_bindings::ToolWorld;
+
+/// Cap on the captured stdout/stderr of a coreutils command.
+const SHELL_MAX_OUTPUT: usize = 32 * 1024;
+/// Hard per-stream bound for a running command; larger output aborts it.
+const SHELL_PIPE_CAPACITY: usize = 8 * 1024 * 1024;
+/// Abort a whole bash tool call after this long.
+const SHELL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A registered tool's public shape: bare provider-safe name plus metadata.
 /// Identity is the runner key (the tool's uuid), never the name.
@@ -72,10 +84,182 @@ impl WasiView for ToolCtx {
     }
 }
 
+/// State for instantiating the bash component: its own wasi plus the resources
+/// the `exec` import needs to spawn coreutils instances.
+struct ShellCtx {
+    wasi: WasiCtx,
+    table: ResourceTable,
+    engine: Arc<Engine>,
+    coreutils: Arc<Component>,
+    root: PathBuf,
+}
+
+impl WasiView for ShellCtx {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
+    }
+}
+
+type ExecResult = crate::bash_bindings::carson::shell::exec::ExecResult;
+
+impl crate::bash_bindings::carson::shell::exec::Host for ShellCtx {
+    fn run(
+        &mut self,
+        _prog: String,
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+        cwd: String,
+        stdin: Vec<u8>,
+    ) -> Result<ExecResult, String> {
+        let engine = self.engine.clone();
+        let coreutils = self.coreutils.clone();
+        let root = self.root.clone();
+        run_coreutils(&engine, &coreutils, &root, &argv, &env, &cwd, &stdin)
+    }
+}
+
+/// Run one coreutils command as a fresh wasm instance, capturing its stdio.
+/// The bash guest call is synchronous, so this blocks on a helper thread.
+fn run_coreutils(
+    engine: &Engine,
+    coreutils: &Component,
+    root: &std::path::Path,
+    argv: &[String],
+    env: &[(String, String)],
+    cwd: &str,
+    stdin: &[u8],
+) -> Result<ExecResult, String> {
+    let engine = engine.clone();
+    let coreutils = coreutils.clone();
+    let root = root.to_path_buf();
+    let argv = argv.to_vec();
+    let env = env.to_vec();
+    let cwd = cwd.to_string();
+    let stdin = stdin.to_vec();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build coreutils runtime");
+        let result = rt.block_on(async {
+            spawn_coreutils(&engine, &coreutils, &root, &argv, &env, &cwd, &stdin).await
+        });
+        let _ = tx.send(result);
+    });
+    rx.recv()
+        .unwrap_or_else(|_| Err("coreutils runner thread failed".to_string()))
+}
+
+async fn spawn_coreutils(
+    engine: &Engine,
+    coreutils: &Component,
+    root: &std::path::Path,
+    argv: &[String],
+    env: &[(String, String)],
+    cwd: &str,
+    stdin: &[u8],
+) -> Result<ExecResult, String> {
+    let mut linker = Linker::<ToolCtx>::new(engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| e.to_string())?;
+
+    let stdout = MemoryOutputPipe::new(SHELL_PIPE_CAPACITY);
+    let stderr = MemoryOutputPipe::new(SHELL_PIPE_CAPACITY);
+
+let mut builder = WasiCtxBuilder::new();
+    builder.args(argv);
+    for (k, v) in env {
+        builder.env(k, v);
+    }
+    // The sandbox root is the guest root: relative paths and absolute `/...`
+    // paths both resolve against the same directory the shell uses.
+    builder
+        .preopened_dir(root, "/", FsPerms::ReadWrite)
+        .map_err(|e| format!("preopen: {e}"))?;
+    builder.initial_cwd(resolve_guest_cwd(cwd));
+    builder.stdin(MemoryInputPipe::new(stdin.to_vec()));
+    builder.stdout(stdout.clone());
+    builder.stderr(stderr.clone());
+    let wasi = builder.build();
+
+    let mut store = Store::new(
+        engine,
+        ToolCtx {
+            wasi,
+            table: ResourceTable::new(),
+        },
+    );
+    let instance = CoreutilsWorld::instantiate_async(&mut store, coreutils, &linker)
+        .await
+        .map_err(|e| format!("instantiate coreutils: {e}"))?;
+    let (status,) = instance
+        .carson_shell_coreutils()
+        .func_run()
+        .call_async(&mut store, ())
+        .await
+        .map_err(|e| format!("coreutils call: {e}"))?;
+    let status = status.map_err(|e| format!("coreutils returned: {e}"))?;
+
+    let out = stdout.contents();
+    let err = stderr.contents();
+    Ok(ExecResult {
+        stdout: out[..out.len().min(SHELL_MAX_OUTPUT)].to_vec(),
+        stderr: err[..err.len().min(SHELL_MAX_OUTPUT)].to_vec(),
+        status,
+    })
+}
+
+/// The guest-visible cwd: a path under the sandbox root `/`.
+fn resolve_guest_cwd(cwd: &str) -> String {
+    let rel = cwd.trim_start_matches('/');
+    if rel.is_empty() {
+        return "/".to_string();
+    }
+    let mut guest = String::new();
+    for comp in PathBuf::from(rel).components() {
+        use std::path::Component;
+        match comp {
+            Component::Normal(s) => {
+                guest.push('/');
+                guest.push_str(&s.to_string_lossy());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if let Some(pos) = guest.rfind('/') {
+                    if pos > 0 {
+                        guest.truncate(pos);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if guest.is_empty() {
+        "/".to_string()
+    } else {
+        guest
+    }
+}
+
 /// A tool component, pre-compiled, plus the wasi grants its sandbox gets.
 struct ToolSandbox {
-    component: Arc<Component>,
+    kind: SandboxKind,
     env: HashMap<String, String>,
+}
+
+enum SandboxKind {
+    /// A plain tool: the whole component is instantiated per call.
+    Plain(Arc<Component>),
+    /// The bash tool: the interpreter component plus the coreutils component
+    /// the `exec` import spawns, under a shared sandbox directory.
+    Shell {
+        component: Arc<Component>,
+        coreutils: Arc<Component>,
+        root: PathBuf,
+    },
 }
 
 /// Registers tool components that run in their own wasm sandboxes. Tools are added and removed at
@@ -99,9 +283,38 @@ impl ToolRunner {
     pub fn register(&self, def: &ToolDef, wasm: &[u8]) -> Result<()> {
         let component = Arc::new(Component::new(&self.engine, wasm)?);
         let sandbox = Arc::new(ToolSandbox {
-            component,
+            kind: SandboxKind::Plain(component),
             env: def.env.clone(),
         });
+        self.insert(def, sandbox);
+        Ok(())
+    }
+
+    /// Register the interpreter component for the bash tool plus the coreutils
+    /// component its `exec` import spawns. Returns the sandbox directory.
+    pub fn register_shell(
+        &self,
+        def: &ToolDef,
+        bash_wasm: &[u8],
+        coreutils_wasm: &[u8],
+    ) -> Result<PathBuf> {
+        let component = Arc::new(Component::new(&self.engine, bash_wasm)?);
+        let coreutils = Arc::new(Component::new(&self.engine, coreutils_wasm)?);
+        let root = sandbox_dir(&def.id);
+        std::fs::create_dir_all(&root)?;
+        let sandbox = Arc::new(ToolSandbox {
+            kind: SandboxKind::Shell {
+                component,
+                coreutils,
+                root: root.clone(),
+            },
+            env: def.env.clone(),
+        });
+        self.insert(def, sandbox);
+        Ok(root)
+    }
+
+    fn insert(&self, def: &ToolDef, sandbox: Arc<ToolSandbox>) {
         let spec = ToolSpec {
             id: def.id.clone(),
             name: def.name.clone(),
@@ -113,7 +326,6 @@ impl ToolRunner {
             .unwrap()
             .insert(def.id.clone(), sandbox);
         self.specs.write().unwrap().insert(def.id.clone(), spec);
-        Ok(())
     }
 
     pub fn remove(&self, id: &str) -> bool {
@@ -134,26 +346,120 @@ impl ToolRunner {
     }
 }
 
+/// The directory a shell tool's sandbox lives in. One directory per tool id;
+/// every exec'd coreutils instance sees the same files.
+fn sandbox_dir(id: &str) -> PathBuf {
+    std::env::temp_dir()
+        .join("carson-sandbox")
+        .join(sanitize(id))
+}
+
+fn sanitize(id: &str) -> String {
+    id.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect()
+}
+
 fn invoke_tool(
     engine: &Arc<Engine>,
     sandbox: &ToolSandbox,
     args_json: &str,
 ) -> Result<String, String> {
-    let engine = engine.clone();
-    let component = sandbox.component.clone();
-    let env = sandbox.env.clone();
-    let args = args_json.to_string();
+    match &sandbox.kind {
+        SandboxKind::Plain(component) => {
+            let engine = engine.clone();
+            let component = component.clone();
+            let env = sandbox.env.clone();
+            let args = args_json.to_string();
+            blocking_thread(move || async move {
+                run_tool(&engine, &component, &env, &args).await
+            })
+            .map_err(|_| "tool thread failed".to_string())?
+        }
+        SandboxKind::Shell {
+            component,
+            coreutils,
+            root,
+        } => {
+            let engine = engine.clone();
+            let component = component.clone();
+            let coreutils = coreutils.clone();
+            let root = root.clone();
+            let env = sandbox.env.clone();
+            let args = args_json.to_string();
+            blocking_thread(move || async move {
+                run_shell(&engine, &component, &coreutils, &root, &env, &args).await
+            })
+            .map_err(|_| "bash tool thread failed".to_string())?
+        }
+    }
+}
+
+fn blocking_thread<O, Fut>(f: impl FnOnce() -> Fut + Send + 'static) -> Result<O, String>
+where
+    Fut: std::future::Future<Output = O> + Send + 'static,
+    O: Send + 'static,
+{
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("build tool runtime");
-        let result = rt.block_on(run_tool(&engine, &component, &env, &args));
+        let result = rt.block_on(f());
         let _ = tx.send(result);
     });
-    rx.recv()
-        .unwrap_or_else(|_| Err("tool thread failed".to_string()))
+    match rx.recv_timeout(SHELL_TIMEOUT) {
+        Ok(result) => Ok(result),
+        Err(_) => Err("tool timed out".to_string()),
+    }
+}
+
+async fn run_shell(
+    engine: &Engine,
+    component: &Component,
+    coreutils: &Component,
+    root: &std::path::Path,
+    env: &HashMap<String, String>,
+    args: &str,
+) -> Result<String, String> {
+    let mut linker = Linker::<ShellCtx>::new(engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| e.to_string())?;
+    BashWorld::add_to_linker::<ShellCtx, wasmtime::component::HasSelf<ShellCtx>>(
+        &mut linker,
+        |ctx: &mut ShellCtx| ctx,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let mut builder = WasiCtxBuilder::new();
+    for (key, value) in env {
+        builder.env(key, value);
+    }
+    builder
+        .preopened_dir(root, "sandbox", FsPerms::ReadWrite)
+        .map_err(|e| format!("preopen: {e}"))?;
+    builder.initial_cwd("/sandbox");
+    let wasi = builder.build();
+    let mut store = Store::new(
+        engine,
+        ShellCtx {
+            wasi,
+            table: ResourceTable::new(),
+            engine: Arc::new(engine.clone()),
+            coreutils: Arc::new(coreutils.clone()),
+            root: root.to_path_buf(),
+        },
+    );
+    let world = BashWorld::instantiate_async(&mut store, component, &linker)
+        .await
+        .map_err(|e| format!("instantiate bash: {e}"))?;
+    let (result,) = world
+        .carson_tool_tool()
+        .func_run()
+        .call_async(&mut store, (args,))
+        .await
+        .map_err(|e| format!("bash call: {e}"))?;
+    result.map_err(|_| "bash tool failed".to_string())
 }
 
 async fn run_tool(

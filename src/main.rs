@@ -103,8 +103,7 @@ async fn main() -> Result<()> {
     // Built-in tools ship with the binary and are seeded into the runner
     // under deterministic ids; custom tools load from the DB.
     for def in host::builtin_tools() {
-        let wasm = host::embedded_tool(&def.name).expect("embedded bytes for builtin");
-        match ctx.register_tool(&def, wasm) {
+        match ctx.register_builtin(&def) {
             Ok(()) => tracing::info!(tool = %def.name, id = %def.id, "loaded builtin tool"),
             Err(err) => {
                 tracing::warn!(tool = %def.name, error = %err, "failed to compile builtin tool")

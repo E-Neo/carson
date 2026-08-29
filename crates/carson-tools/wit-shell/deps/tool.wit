@@ -1,0 +1,9 @@
+package carson:tool;
+
+interface tool {
+    enum tool-error {
+        failed,
+    }
+
+    run: func(arguments-json: string) -> result<string, tool-error>;
+}

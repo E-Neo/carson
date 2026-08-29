@@ -22,10 +22,15 @@ pub const EMBEDDED_AGENT: &[u8] = include_bytes!(env!("CARSON_AGENT_WASM"));
 /// Built-in tool component, baked into the binary by `build.rs`.
 pub const EMBEDDED_TIME_TOOL: &[u8] = include_bytes!(env!("CARSON_TOOL_TIME_WASM"));
 
+/// The bash interpreter component and its coreutils runner.
+pub const EMBEDDED_BASH_TOOL: &[u8] = include_bytes!(env!("CARSON_TOOL_BASH_WASM"));
+pub const EMBEDDED_COREUTILS: &[u8] = include_bytes!(env!("CARSON_TOOL_COREUTILS_WASM"));
+
 /// Returns the embedded bytes for a built-in tool, if any.
 pub fn embedded_tool(name: &str) -> Option<&'static [u8]> {
     match name {
         "time" => Some(EMBEDDED_TIME_TOOL),
+        "bash" => Some(EMBEDDED_BASH_TOOL),
         _ => None,
     }
 }
@@ -42,13 +47,45 @@ pub fn builtin_id(name: &str) -> String {
 /// The bundled tools: code-defined, seeded into the runner at startup,
 /// immutable through the API. Names are bare and provider-safe.
 pub fn builtin_tools() -> Vec<ToolDef> {
-    vec![ToolDef {
-        id: builtin_id("time"),
-        name: "time".into(),
-        description: "Return the current UTC time in ISO 8601 format".into(),
-        parameters: serde_json::json!({"type": "object"}),
-        env: Default::default(),
-    }]
+    vec![
+        ToolDef {
+            id: builtin_id("time"),
+            name: "time".into(),
+            description: "Return the current UTC time in ISO 8601 format".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            env: Default::default(),
+        },
+        ToolDef {
+            id: builtin_id("bash"),
+            name: "bash".into(),
+            description: concat!(
+                "Run bash scripts in a sandboxed working directory. ",
+                "Builtins: cd, pwd, echo, printf, export, unset, set, env, test, true, false, exit. ",
+                "Commands: ls, cat, cp, mv, rm, mkdir, touch, date. ",
+                "Arguments: {command, cwd?, env?}."
+            )
+            .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "A bash one-liner or multi-line script",
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory relative to the sandbox root",
+                    },
+                    "env": {
+                        "type": "object",
+                        "description": "Extra environment variables for the script",
+                    },
+                },
+                "required": ["command"],
+            }),
+            env: Default::default(),
+        },
+    ]
 }
 
 /// Look up a built-in tool by its deterministic id.
@@ -98,6 +135,19 @@ impl HostContext {
 
     pub fn register_tool(&self, def: &ToolDef, wasm: &[u8]) -> Result<()> {
         self.tool_runner.register(def, wasm)
+    }
+
+    /// Register a built-in tool, wiring the interpreter for `bash` together
+    /// with its coreutils runner.
+    pub fn register_builtin(&self, def: &ToolDef) -> Result<()> {
+        if def.name == "bash" {
+            self.tool_runner
+                .register_shell(def, EMBEDDED_BASH_TOOL, EMBEDDED_COREUTILS)?;
+        } else {
+            let wasm = embedded_tool(&def.name).expect("embedded bytes for builtin");
+            self.tool_runner.register(def, wasm)?;
+        }
+        Ok(())
     }
 
     pub fn remove_tool(&self, name: &str) -> bool {

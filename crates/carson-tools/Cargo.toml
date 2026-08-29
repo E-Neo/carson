@@ -7,6 +7,24 @@ edition.workspace = true
 name = "time"
 path = "src/bin/time.rs"
 
+[[bin]]
+name = "bash"
+path = "src/bin/bash.rs"
+
+[[bin]]
+name = "coreutils"
+path = "src/bin/coreutils.rs"
+
 [dependencies]
+carson-shell = { path = "../carson-shell" }
 serde_json.workspace = true
+uu_cat = "0.10.0"
+uu_cp = "0.10.0"
+uu_date = "0.10.0"
+uu_ls = "0.10.0"
+uu_mkdir = "0.10.0"
+uu_mv = "0.10.0"
+uu_rm = "0.10.0"
+uu_touch = "0.10.0"
+uucore = "0.10.0"
 wit-bindgen = "0.61"

@@ -1,6 +1,8 @@
 pub mod app;
+pub mod bash_bindings;
 pub mod bindings;
 pub mod config;
+pub mod coreutils_bindings;
 pub mod db;
 pub mod drivers;
 pub mod host;
