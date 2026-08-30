@@ -281,7 +281,7 @@ impl ToolRunner {
 
     /// Register a tool component under its stable id.
     pub fn register(&self, def: &ToolDef, wasm: &[u8]) -> Result<()> {
-        let component = Arc::new(Component::new(&self.engine, wasm)?);
+        let component = Arc::new(crate::host::load_component(&self.engine, wasm)?);
         let sandbox = Arc::new(ToolSandbox {
             kind: SandboxKind::Plain(component),
             env: def.env.clone(),
@@ -298,8 +298,8 @@ impl ToolRunner {
         bash_wasm: &[u8],
         coreutils_wasm: &[u8],
     ) -> Result<PathBuf> {
-        let component = Arc::new(Component::new(&self.engine, bash_wasm)?);
-        let coreutils = Arc::new(Component::new(&self.engine, coreutils_wasm)?);
+        let component = Arc::new(crate::host::load_component(&self.engine, bash_wasm)?);
+        let coreutils = Arc::new(crate::host::load_component(&self.engine, coreutils_wasm)?);
         let root = sandbox_dir(&def.id);
         std::fs::create_dir_all(&root)?;
         let sandbox = Arc::new(ToolSandbox {

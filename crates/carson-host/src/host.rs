@@ -25,15 +25,20 @@ use crate::registry::{AgentDef, AgentInstance, AgentPool, AgentRegistry, Provide
 use crate::state::State;
 use crate::tools::{Capabilities, ToolRunner};
 
-/// The single agent module, baked into the binary by `build.rs`.
-pub const EMBEDDED_AGENT: &[u8] = include_bytes!(env!("CARSON_AGENT_WASM"));
+/// The single agent module, precompiled by `build.rs`; baked into the binary.
+pub const EMBEDDED_AGENT: &[u8] = include_bytes!(env!("CARSON_AGENT_CWASM"));
+// Force a rebuild whenever the embedded artifact content changes.
+const _: &str = env!("CARSON_AGENT_CWASM_FNV");
 
-/// Built-in tool component, baked into the binary by `build.rs`.
-pub const EMBEDDED_TIME_TOOL: &[u8] = include_bytes!(env!("CARSON_TOOL_TIME_WASM"));
+/// Built-in tool component, precompiled by `build.rs`.
+pub const EMBEDDED_TIME_TOOL: &[u8] = include_bytes!(env!("CARSON_TOOL_TIME_CWASM"));
+const _: &str = env!("CARSON_TOOL_TIME_CWASM_FNV");
 
 /// The bash interpreter component and its coreutils runner.
-pub const EMBEDDED_BASH_TOOL: &[u8] = include_bytes!(env!("CARSON_TOOL_BASH_WASM"));
-pub const EMBEDDED_COREUTILS: &[u8] = include_bytes!(env!("CARSON_TOOL_COREUTILS_WASM"));
+pub const EMBEDDED_BASH_TOOL: &[u8] = include_bytes!(env!("CARSON_TOOL_BASH_CWASM"));
+const _: &str = env!("CARSON_TOOL_BASH_CWASM_FNV");
+pub const EMBEDDED_COREUTILS: &[u8] = include_bytes!(env!("CARSON_TOOL_COREUTILS_CWASM"));
+const _: &str = env!("CARSON_TOOL_COREUTILS_CWASM_FNV");
 
 /// Returns the embedded bytes for a built-in tool, if any.
 pub fn embedded_tool(name: &str) -> Option<&'static [u8]> {
@@ -41,6 +46,17 @@ pub fn embedded_tool(name: &str) -> Option<&'static [u8]> {
         "time" => Some(EMBEDDED_TIME_TOOL),
         "bash" => Some(EMBEDDED_BASH_TOOL),
         _ => None,
+    }
+}
+
+/// Load a wasm component, preferring a precompiled `.cwasm` artifact (bundled
+/// tools) and falling back to a regular compile for raw wasm (uploaded tools).
+/// Bundled artifacts are compiled by the same wasmtime version and engine
+/// config, so `deserialize` is fast and always succeeds.
+pub fn load_component(engine: &Engine, bytes: &[u8]) -> Result<Component> {
+    match unsafe { Component::deserialize(engine, bytes) } {
+        Ok(component) => Ok(component),
+        Err(_) => Component::new(engine, bytes).map_err(Into::into),
     }
 }
 
@@ -126,7 +142,7 @@ impl HostContext {
 
     pub fn with_sandbox_base(sandbox_base: impl Into<PathBuf>) -> Result<Self> {
         let engine = Engine::new(&wasmtime::Config::new())?;
-        let component = Component::new(&engine, EMBEDDED_AGENT)?;
+        let component = load_component(&engine, EMBEDDED_AGENT)?;
         let hub = Hub::new();
         let tool_runner = Arc::new(ToolRunner::new(&engine));
         Ok(Self {

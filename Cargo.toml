@@ -39,6 +39,16 @@ members = [".", "crates/carson-agent", "crates/carson-tools", "crates/carson-hos
 version = "0.1.0"
 edition = "2024"
 
+# Embedded wasm (agent + tools) is always built optimized so it precompiles to
+# a small .cwasm and loads fast at startup, regardless of the host profile.
+[profile.wasm]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"

@@ -733,6 +733,9 @@ pub fn ChatPage() -> impl IntoView {
     let selected_sandbox = RwSignal::new(None::<String>);
     // Which session-item (if any) has its action menu open, plus where to anchor it.
 let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
+    // Inline rename of a session-item row.
+    let editing_session = RwSignal::new(None::<String>);
+    let rename_draft = RwSignal::new(String::new());
 
     // Auto-scroll: follow the stream only while `follow` is engaged. Any
     // user intent (wheel / touch / scrollbar grab) disengages it immediately
@@ -915,12 +918,6 @@ let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
         });
     };
 
-    let open_settings = move || {
-        if let Some(id) = active.get() {
-            open_settings_for(id);
-        }
-    };
-
     // Reset/compact targeted at the session the settings drawer is editing.
     let reset_target = move || {
         let id = settings_target();
@@ -951,7 +948,14 @@ let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
     let menu_rename = move || {
         if let Some((sid, _, _)) = menu_popover.get() {
             menu_popover.set(None);
-            open_settings_for(sid);
+            let current = sessions
+                .get()
+                .iter()
+                .find(|s| s.id == sid)
+                .and_then(|s| s.name.clone())
+                .unwrap_or_default();
+            rename_draft.set(current);
+            editing_session.set(Some(sid));
         }
     };
     let menu_settings = move || {
@@ -965,6 +969,20 @@ let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
             menu_popover.set(None);
             delete_session(sid);
         }
+    };
+
+    // Save/cancel the inline session rename in a session-item row.
+    let rename_inline_save = move |sid: String| {
+        editing_session.set(None);
+        let name = rename_draft.get();
+        let sessions = sessions;
+        spawn_local(async move {
+            let _ = api::put(&format!("/api/sessions/{sid}"), &json!({ "name": name })).await;
+            refresh_sessions_async(sessions).await;
+        });
+    };
+    let rename_inline_cancel = move || {
+        editing_session.set(None);
     };
 
     // --- session settings ---------------------------------------------------
@@ -1053,6 +1071,16 @@ let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
             .unwrap_or_else(|| sid)
     });
 
+    // The id of the sandbox the settings-target session currently uses.
+    let current_sandbox_id = Memo::new(move |_| {
+        let target = settings_target();
+        sessions
+            .get()
+            .iter()
+            .find(|s| s.id == target)
+            .and_then(|s| s.sandbox_id.clone())
+    });
+
     let new_chat = move || go_to.set(Some("/chat".to_string()));
 
     // Toolbar title: alias (when set) plus session id and agent.
@@ -1116,14 +1144,48 @@ let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
                                         }
                                     }
                                 };
-                                let nav_sid = sid.clone();
                                 let more_sid = sid.clone();
+                                let edit_sid = sid.clone();
+                                let edit_sid2 = sid.clone();
+                                let edit_sid3 = sid.clone();
+                                let edit_sid4 = sid.clone();
                                 view! {
                                     <div class=active_class>
-                                        <button class="name" on:click=move |_| {
-                                            menu_popover.set(None);
-                                            select_session(nav_sid.clone());
-                                        }>
+                                        <input
+                                            class="session-rename"
+                                            class:hidden=move || {
+                                                editing_session.get().as_ref() != Some(&edit_sid)
+                                            }
+                                            name="session-name"
+                                            aria-label="Session name"
+                                            prop:value=move || rename_draft.get()
+                                            on:input=move |ev| rename_draft.set(event_target_value(&ev))
+                                            on:keydown=move |ev| {
+                                                let key = ev.key();
+                                                if key == "Enter" {
+                                                    ev.prevent_default();
+                                                    rename_inline_save(edit_sid2.clone());
+                                                } else if key == "Escape" {
+                                                    ev.prevent_default();
+                                                    rename_inline_cancel();
+                                                }
+                                            }
+                                            on:blur=move |_| {
+                                                if editing_session.get().is_some() {
+                                                    rename_inline_save(edit_sid3.clone());
+                                                }
+                                            }
+                                        />
+                                        <button
+                                            class="name"
+                                            class:hidden=move || {
+                                                editing_session.get().as_ref() == Some(&edit_sid4)
+                                            }
+                                            on:click=move |_| {
+                                                menu_popover.set(None);
+                                                select_session(sid.clone());
+                                            }
+                                        >
                                             {label}
                                         </button>
                                         <button
@@ -1202,7 +1264,6 @@ let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
                                     <div class="title">
                                         {move || active_title.get()}
                                     </div>
-                                    <button class="btn" on:click=move |_| open_settings()>"Settings"</button>
                                     <button class="btn" disabled=move || !running.get() on:click=move |_| stop_session()>
                                         "Stop"
                                     </button>
@@ -1244,6 +1305,8 @@ let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
     }}
                                 <div class="composer">
                                     <textarea
+                                        name="message"
+                                        aria-label="Message"
                                         prop:value=move || input.get()
                                         on:input=move |ev| input.set(event_target_value(&ev))
                                         placeholder="Type a message, Enter to send"
@@ -1276,8 +1339,10 @@ let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
                                         } else {
                                             view! {
                                                 <div class="field">
-                                                    <label>"Agent"</label>
+                                                    <label for="agent-select">"Agent"</label>
                                                     <select
+                                                        id="agent-select"
+                                                        name="agent"
                                                         prop:value=move || selected_agent.get()
                                                         on:change=move |ev| selected_agent.set(event_target_value(&ev))
                                                     >
@@ -1327,9 +1392,11 @@ let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
                                         </button>
                                     </div>
                                     <div class="settings-body">
-                                        <label>"Name"</label>
+                                        <label for="session-name">"Name"</label>
                                         <div class="settings-row">
                                             <input
+                                                id="session-name"
+                                                name="session-name"
                                                 placeholder="Session name"
                                                 prop:value=move || name_edit.get()
                                                 on:input=move |ev| name_edit.set(event_target_value(&ev))
@@ -1348,26 +1415,52 @@ let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
                                                 key=|s: &SandboxSummary| s.id.clone()
                                                 children=move |sb: SandboxSummary| {
                                                     let id = sb.id.clone();
-                                                    let name = sb.name.clone();
+                                                    // Reactive: re-derives the name from the
+                                                    // sandboxes signal so renames re-render.
+                                                    let name_sid = id.clone();
+                                                    let name = move || {
+                                                        sandboxes
+                                                            .get()
+                                                            .iter()
+                                                            .find(|b| &b.id == &name_sid)
+                                                            .map(|b| b.name.clone())
+                                                            .unwrap_or_default()
+                                                    };
                                                     let click_id = id.clone();
-                                                    let click_name = name.clone();
-                                                    let selected = move || {
-                                                        selected_sandbox.get().as_ref() == Some(&id)
+                                                    let current_id = id.clone();
+                                                    let selected_id = id.clone();
+                                                    let is_current = move || {
+                                                        current_sandbox_id.get().as_ref() == Some(&current_id)
+                                                    };
+                                                    let is_selected = move || {
+                                                        selected_sandbox.get().as_ref() == Some(&selected_id)
                                                     };
                                                     let cls = move || {
-                                                        if selected() { "sandbox-item active" } else { "sandbox-item" }
+                                                        if is_current() {
+                                                            "sandbox-item current"
+                                                        } else if is_selected() {
+                                                            "sandbox-item active"
+                                                        } else {
+                                                            "sandbox-item"
+                                                        }
                                                     };
                                                     view! {
                                                         <div
                                                             class=cls
                                                             on:click=move |_| {
                                                                 selected_sandbox.set(Some(click_id.clone()));
-                                                                rename_alias.set(click_name.clone());
+                                                                let nm = sandboxes
+                                                                    .get()
+                                                                    .iter()
+                                                                    .find(|b| &b.id == &click_id)
+                                                                    .map(|b| b.name.clone())
+                                                                    .unwrap_or_default();
+                                                                rename_alias.set(nm);
                                                                 switch_sandbox(click_id.clone());
                                                             }
                                                         >
-                                                            <span class="sandbox-name">{sb.name.clone()}</span>
-                                                            <span class="sandbox-id">{short_id(&sb.id)}</span>
+                                                            <span class="sandbox-name">{name}</span>
+                                                            <span class="sandbox-id">{short_id(&id)}</span>
                                                         </div>
                                                     }
                                                 }
@@ -1375,6 +1468,8 @@ let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
                                         </div>
                                         <div class="settings-row">
                                             <input
+                                                id="sandbox-rename"
+                                                name="sandbox-rename"
                                                 placeholder="Rename selected sandbox"
                                                 prop:value=move || rename_alias.get()
                                                 on:input=move |ev| rename_alias.set(event_target_value(&ev))
@@ -1387,9 +1482,11 @@ let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
                                                 "Rename"
                                             </button>
                                         </div>
-                                        <label>"New sandbox"</label>
+                                        <label for="new-sandbox-name">"New sandbox"</label>
                                         <div class="settings-row">
                                             <input
+                                                id="new-sandbox-name"
+                                                name="new-sandbox-name"
                                                 placeholder="Workspace name"
                                                 prop:value=move || new_sandbox_name.get()
                                                 on:input=move |ev| new_sandbox_name.set(event_target_value(&ev))
@@ -1684,6 +1781,7 @@ mod tests {
             follow: RwSignal::new(true),
             at_latest: RwSignal::new(true),
             next_id: RwSignal::new(0u64),
+            on_turn_done: None,
         }
     }
 
