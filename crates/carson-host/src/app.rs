@@ -27,6 +27,9 @@ pub struct SessionEntry {
     pub agent_version_id: String,
     pub name: Option<String>,
     pub sandbox_id: String,
+    /// Last activity (message, rename or sandbox switch) in ms since epoch.
+    /// Drives the session list ordering.
+    pub updated_at: i64,
     pub instance: Arc<AgentInstance>,
 }
 

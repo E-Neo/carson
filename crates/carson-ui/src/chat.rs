@@ -249,6 +249,8 @@ struct ChatSignals {
     follow: RwSignal<bool>,
     at_latest: RwSignal<bool>,
     next_id: RwSignal<u64>,
+    /// Called after a turn completes so the session list reorders.
+    on_turn_done: Option<Callback<()>>,
 }
 
 /// What a single SSE frame asked the page to do beyond mutating blocks.
@@ -444,6 +446,9 @@ fn send(session_id: String, input: RwSignal<String>, st: ChatSignals) {
         st.running.set(false);
         if let Err(e) = result {
             st.error.set(Some(e));
+        }
+        if let Some(cb) = st.on_turn_done {
+            cb.run(());
         }
     });
 }
@@ -720,11 +725,14 @@ pub fn ChatPage() -> impl IntoView {
 
     // Per-session settings drawer.
     let settings_open = RwSignal::new(false);
+    let settings_session = RwSignal::new(None::<String>);
     let sandboxes = RwSignal::new(Vec::<SandboxSummary>::new());
     let name_edit = RwSignal::new(String::new());
     let rename_alias = RwSignal::new(String::new());
     let new_sandbox_name = RwSignal::new(String::new());
     let selected_sandbox = RwSignal::new(None::<String>);
+    // Which session-item (if any) has its action menu open, plus where to anchor it.
+let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
 
     // Auto-scroll: follow the stream only while `follow` is engaged. Any
     // user intent (wheel / touch / scrollbar grab) disengages it immediately
@@ -750,6 +758,12 @@ pub fn ChatPage() -> impl IntoView {
         follow,
         at_latest,
         next_id,
+        on_turn_done: Some(Callback::new(move |()| {
+            let sessions = sessions;
+            spawn_local(async move {
+                refresh_sessions_async(sessions).await;
+            });
+        })),
     };
 
     Effect::new(move |_| {
@@ -876,65 +890,21 @@ pub fn ChatPage() -> impl IntoView {
         }
     };
 
-    let reset_session = move || {
-        if let Some(id) = active.get() {
-            let messages = messages;
-            let error = error;
-            let scroll_tick = scroll_tick;
-            let follow = follow;
-            let at_latest = at_latest;
-            let next_id = next_id;
-            spawn_local(async move {
-                let _ = api::post(&format!("/api/sessions/{id}/reset"), &json!({})).await;
-                load_history(
-                    &id,
-                    &messages,
-                    &error,
-                    &scroll_tick,
-                    &follow,
-                    &at_latest,
-                    &next_id,
-                )
-                .await;
-            });
-        }
+    // The session the settings drawer edits (defaults to the active one).
+    let settings_target = move || {
+        settings_session
+            .get()
+            .or_else(|| active.get())
+            .unwrap_or_default()
     };
 
-    let compact_session = move || {
-        if let Some(id) = active.get() {
-            let messages = messages;
-            let error = error;
-            let scroll_tick = scroll_tick;
-            let follow = follow;
-            let at_latest = at_latest;
-            let next_id = next_id;
-            spawn_local(async move {
-                let _ = api::post(&format!("/api/sessions/{id}/compact"), &json!({})).await;
-                load_history(
-                    &id,
-                    &messages,
-                    &error,
-                    &scroll_tick,
-                    &follow,
-                    &at_latest,
-                    &next_id,
-                )
-                .await;
-            });
-        }
-    };
-
-    // --- session settings ---------------------------------------------------
-
-    let open_settings = move || {
-        if active.get().is_none() {
-            return;
-        }
+    let open_settings_for = move |sid: String| {
+        settings_session.set(Some(sid.clone()));
         name_edit.set(
             sessions
                 .get()
                 .iter()
-                .find(|s| Some(&s.id) == active.get().as_ref())
+                .find(|s| s.id == sid)
                 .and_then(|s| s.name.clone())
                 .unwrap_or_default(),
         );
@@ -945,8 +915,63 @@ pub fn ChatPage() -> impl IntoView {
         });
     };
 
-    let save_session_name = move || {
+    let open_settings = move || {
         if let Some(id) = active.get() {
+            open_settings_for(id);
+        }
+    };
+
+    // Reset/compact targeted at the session the settings drawer is editing.
+    let reset_target = move || {
+        let id = settings_target();
+        if id.is_empty() {
+            return;
+        }
+        let sessions = sessions;
+        spawn_local(async move {
+            let _ = api::post(&format!("/api/sessions/{id}/reset"), &json!({})).await;
+            refresh_sessions_async(sessions).await;
+        });
+    };
+
+    let compact_target = move || {
+        let id = settings_target();
+        if id.is_empty() {
+            return;
+        }
+        let sessions = sessions;
+        spawn_local(async move {
+            let _ = api::post(&format!("/api/sessions/{id}/compact"), &json!({})).await;
+            refresh_sessions_async(sessions).await;
+        });
+    };
+
+    // The floating action menu reads its session from the popover signal, so
+    // these handlers only capture Copy signals and sibling closures.
+    let menu_rename = move || {
+        if let Some((sid, _, _)) = menu_popover.get() {
+            menu_popover.set(None);
+            open_settings_for(sid);
+        }
+    };
+    let menu_settings = move || {
+        if let Some((sid, _, _)) = menu_popover.get() {
+            menu_popover.set(None);
+            open_settings_for(sid);
+        }
+    };
+    let menu_delete = move || {
+        if let Some((sid, _, _)) = menu_popover.get() {
+            menu_popover.set(None);
+            delete_session(sid);
+        }
+    };
+
+    // --- session settings ---------------------------------------------------
+
+    let save_session_name = move || {
+        let id = settings_target();
+        if !id.is_empty() {
             let name = name_edit.get();
             let sessions = sessions;
             spawn_local(async move {
@@ -956,13 +981,14 @@ pub fn ChatPage() -> impl IntoView {
         }
     };
 
-    let switch_sandbox = move |sid: String| {
-        if let Some(id) = active.get() {
+    let switch_sandbox = move |sandbox_id: String| {
+        let id = settings_target();
+        if !id.is_empty() {
             let sessions = sessions;
             spawn_local(async move {
                 let _ = api::put(
                     &format!("/api/sessions/{id}"),
-                    &json!({ "sandbox_id": sid }),
+                    &json!({ "sandbox_id": sandbox_id }),
                 )
                 .await;
                 refresh_sessions_async(sessions).await;
@@ -971,28 +997,30 @@ pub fn ChatPage() -> impl IntoView {
     };
 
     let create_new_sandbox = move || {
-        if let Some(id) = active.get() {
-            let name = new_sandbox_name.get();
-            if name.trim().is_empty() {
-                return;
-            }
-            new_sandbox_name.set(String::new());
-            let sessions = sessions;
-            let sandboxes = sandboxes;
-            spawn_local(async move {
-                if let Ok((_, v)) = api::post("/api/sandboxes", &json!({ "name": name })).await
-                    && let Some(sid) = v.get("id").and_then(|x| x.as_str())
-                {
-                    let _ = api::put(
-                        &format!("/api/sessions/{id}"),
-                        &json!({ "sandbox_id": sid }),
-                    )
-                    .await;
-                    load_sandboxes_async(sandboxes).await;
-                    refresh_sessions_async(sessions).await;
-                }
-            });
+        let id = settings_target();
+        if id.is_empty() {
+            return;
         }
+        let name = new_sandbox_name.get();
+        if name.trim().is_empty() {
+            return;
+        }
+        new_sandbox_name.set(String::new());
+        let sessions = sessions;
+        let sandboxes = sandboxes;
+        spawn_local(async move {
+            if let Ok((_, v)) = api::post("/api/sandboxes", &json!({ "name": name })).await
+                && let Some(sid) = v.get("id").and_then(|x| x.as_str())
+            {
+                let _ = api::put(
+                    &format!("/api/sessions/{id}"),
+                    &json!({ "sandbox_id": sid }),
+                )
+                .await;
+                load_sandboxes_async(sandboxes).await;
+                refresh_sessions_async(sessions).await;
+            }
+        });
     };
 
     let rename_alias_save = move || {
@@ -1007,10 +1035,11 @@ pub fn ChatPage() -> impl IntoView {
     };
 
     let current_sandbox_name = Memo::new(move |_| {
+        let target = settings_target();
         let sid = sessions
             .get()
             .iter()
-            .find(|s| Some(&s.id) == active.get().as_ref())
+            .find(|s| s.id == target)
             .and_then(|s| s.sandbox_id.clone())
             .unwrap_or_default();
         if sid.is_empty() {
@@ -1063,36 +1092,102 @@ pub fn ChatPage() -> impl IntoView {
                             key=|s: &SessionSummary| s.id.clone()
                             children=move |session: SessionSummary| {
                                 let sid = session.id.clone();
+                                let active_sid = sid.clone();
                                 let active_class = move || {
-                                    if active.get().as_ref() == Some(&sid) {
+                                    if active.get().as_ref() == Some(&active_sid) {
                                         "session-item active"
                                     } else {
                                         "session-item"
                                     }
                                 };
-                                let label = match &session.name {
-                                    Some(name) if !name.is_empty() => name.clone(),
-                                    _ => format!("{} · {}", short_id(&session.id), session.agent),
+                                // Reactive: re-derives from the sessions signal
+                                // so renames re-render without page switches.
+                                let label_sid = sid.clone();
+                                let label = move || {
+                                    let list = sessions.get();
+                                    let cur = list.iter().find(|s| &s.id == &label_sid);
+                                    match cur.and_then(|s| s.name.clone()) {
+                                        Some(name) if !name.is_empty() => name,
+                                        _ => {
+                                            let agent = cur
+                                                .map(|s| s.agent.clone())
+                                                .unwrap_or_default();
+                                            format!("{} · {agent}", short_id(&label_sid))
+                                        }
+                                    }
                                 };
-                                let id_del = session.id.clone();
-                                let id_sel = session.id.clone();
+                                let nav_sid = sid.clone();
+                                let more_sid = sid.clone();
                                 view! {
                                     <div class=active_class>
-                                        <button class="name" on:click=move |_| select_session(id_sel.clone())>
+                                        <button class="name" on:click=move |_| {
+                                            menu_popover.set(None);
+                                            select_session(nav_sid.clone());
+                                        }>
                                             {label}
                                         </button>
                                         <button
-                                            class="del"
-                                            title="Delete session"
-                                            on:click=move |_| delete_session(id_del.clone())
+                                            class="more"
+                                            title="Session actions"
+                                            on:click=move |ev| {
+                                                let open = menu_popover
+                                                    .get()
+                                                    .as_ref()
+                                                    .map(|(id, _, _)| id == &more_sid)
+                                                    .unwrap_or(false);
+                                                let x = ev.client_x() as f64;
+                                                let y = ev.client_y() as f64;
+                                                let next = if open {
+                                                    None
+                                                } else {
+                                                    Some((more_sid.clone(), x, y))
+                                                };
+                                                menu_popover.set(next);
+                                            }
                                         >
-                                            "x"
+                                            "⋯"
                                         </button>
                                     </div>
                                 }
                             }
                         />
                     </div>
+                    {move || {
+                        if menu_popover.get().is_some() {
+                            Some(view! {
+                                <>
+                                    <div
+                                        class="menu-backdrop"
+                                        on:click=move |_| menu_popover.set(None)
+                                    ></div>
+                                    <div
+                                        class="session-menu"
+                                        style:left=move || {
+                                            menu_popover
+                                                .get()
+                                                .map(|(_, x, _)| format!("{x}px"))
+                                                .unwrap_or_default()
+                                        }
+                                        style:top=move || {
+                                            menu_popover
+                                                .get()
+                                                .map(|(_, _, y)| format!("{y}px"))
+                                                .unwrap_or_default()
+                                        }
+                                    >
+                                        <button on:click=move |_| menu_rename()>"Rename"</button>
+                                        <button on:click=move |_| menu_settings()>"Settings"</button>
+                                        <button
+                                            class="danger"
+                                            on:click=move |_| menu_delete()
+                                        >"Delete"</button>
+                                    </div>
+                                </>
+                            })
+                        } else {
+                            None
+                        }
+                    }}
                     <a class="admin-link" href="/admin">"Admin"</a>
                 </aside>
 
@@ -1111,13 +1206,6 @@ pub fn ChatPage() -> impl IntoView {
                                     <button class="btn" disabled=move || !running.get() on:click=move |_| stop_session()>
                                         "Stop"
                                     </button>
-                                    <button class="btn" on:click=move |_| reset_session()>"Reset"</button>
-                                    <button class="btn" on:click=move |_| compact_session()>"Compact"</button>
-                                    <button class="btn danger" on:click=move |_| {
-                                        if let Some(id) = active.get() {
-                                            delete_session(id);
-                                        }
-                                    }>"Delete"</button>
                                 </div>
                                 <div
                                     class="messages"
@@ -1309,6 +1397,18 @@ pub fn ChatPage() -> impl IntoView {
                                             <button class="btn primary" on:click=move |_| create_new_sandbox()>
                                                 "Create"
                                             </button>
+                                        </div>
+                                        <label>"Danger zone"</label>
+                                        <div class="settings-row">
+                                            <button class="btn" on:click=move |_| reset_target()>"Reset"</button>
+                                            <button class="btn" on:click=move |_| compact_target()>"Compact"</button>
+                                            <button class="btn danger" on:click=move |_| {
+                                                let id = settings_target();
+                                                if !id.is_empty() {
+                                                    settings_open.set(false);
+                                                    delete_session(id);
+                                                }
+                                            }>"Delete"</button>
                                         </div>
                                     </div>
                                 </aside>

@@ -6,12 +6,28 @@ pub struct ParseError {
     pub msg: String,
 }
 
+/// The extracted body of one heredoc. `expand` is false when the delimiter was
+/// quoted (`<<'EOF'`), so the body is fed literally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeredocBody {
+    pub body: String,
+    pub expand: bool,
+}
+
 use super::lexer::{Tok, lex};
+
+/// The marker `<<<` target the preprocessor leaves in place of a heredoc.
+const HEREDOC_MARKER: &str = "CARSON_HEREDOC";
 
 /// Parse a complete script into a list of top-level commands.
 pub fn parse(src: &str) -> Result<List, ParseError> {
-    let toks = lex(src).map_err(|e| ParseError { msg: e.msg })?;
-    let mut p = Parser { toks, pos: 0 };
+    let (cleaned, heredocs) = extract_heredocs(src)?;
+    let toks = lex(&cleaned).map_err(|e| ParseError { msg: e.msg })?;
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        heredocs,
+    };
     let list = p.parse_list(&[], false)?;
     match p.peek() {
         Tok::Eof => Ok(list),
@@ -24,6 +40,216 @@ pub fn parse(src: &str) -> Result<List, ParseError> {
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
+    heredocs: Vec<HeredocBody>,
+}
+
+/// If `w` is a heredoc marker like `CARSON_HEREDOC3`, return the body index.
+fn heredoc_marker_index(w: &Word) -> Option<usize> {
+    let plain = w.plain()?;
+    let rest = plain.strip_prefix(HEREDOC_MARKER)?;
+    rest.parse::<usize>().ok()
+}
+
+/// Rewrite heredocs (`<<`, `<<-`) into here-string markers and return the
+/// script without the body lines plus the extracted bodies. Here-strings
+/// (`<<<`) are left alone for the lexer.
+///
+/// The scan is quote-aware. Each heredoc's body begins after the newline that
+/// ends the command line containing the redirect and runs until a line equal
+/// to the delimiter (`<<-` strips leading tabs). Multiple heredocs on one line
+/// consume their bodies in order.
+fn extract_heredocs(src: &str) -> Result<(String, Vec<HeredocBody>), ParseError> {
+    let chars: Vec<char> = src.chars().collect();
+    // (replace_start, replace_end, body_start, body_end, expand)
+    let mut edits: Vec<(usize, usize, usize, usize, bool)> = Vec::new();
+    let mut bodies: Vec<HeredocBody> = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+    let mut pending: Vec<(usize, usize, String, bool, bool)> = Vec::new(); // start,end,delim,expand,strip
+    while i < chars.len() {
+        let c = chars[i];
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else if q == '"' && c == '\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    i += 1;
+                }
+                '\\' => {
+                    i += 2;
+                }
+                '$' if i + 1 < chars.len() && chars[i + 1] == '(' => {
+                    // `$( ... )` is re-parsed later (command substitution), so
+                    // its heredocs must stay intact for that nested parse.
+                    // Skip the whole balanced region without rewriting.
+                    i += 2;
+                    let mut depth = 1usize;
+                    while i < chars.len() && depth > 0 {
+                        match chars[i] {
+                            '(' => depth += 1,
+                            ')' => depth -= 1,
+                            '\'' => {
+                                i += 1;
+                                while i < chars.len() && chars[i] != '\'' {
+                                    i += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                }
+                '<'
+                    if i + 1 < chars.len() && chars[i + 1] == '<' =>
+                {
+                    if i + 2 < chars.len() && chars[i + 2] == '<' {
+                        // `<<<` here-string: leave for the lexer.
+                        i += 3;
+                        continue;
+                    }
+                    let start = i;
+                    i += 2;
+                    let strip = i < chars.len() && chars[i] == '-';
+                    if strip {
+                        i += 1;
+                    }
+                    while i < chars.len() && matches!(chars[i], ' ' | '\t') {
+                        i += 1;
+                    }
+                    let (delim, expand) = if i < chars.len() && chars[i] == '\'' {
+                        i += 1;
+                        let s = i;
+                        while i < chars.len() && chars[i] != '\'' {
+                            i += 1;
+                        }
+                        let d: String = chars[s..i].iter().collect();
+                        if i < chars.len() {
+                            i += 1;
+                        }
+                        (d, false)
+                    } else if i < chars.len() && chars[i] == '"' {
+                        i += 1;
+                        let s = i;
+                        while i < chars.len() && chars[i] != '"' {
+                            i += 1;
+                        }
+                        let d: String = chars[s..i].iter().collect();
+                        if i < chars.len() {
+                            i += 1;
+                        }
+                        (d, false)
+                    } else {
+                        let s = i;
+                        while i < chars.len()
+                            && !chars[i].is_whitespace()
+                            && !matches!(
+                                chars[i],
+                                ';' | '&' | '|' | '(' | ')' | '<' | '>' | '`'
+                            )
+                        {
+                            i += 1;
+                        }
+                        let d: String = chars[s..i].iter().collect();
+                        (d, true)
+                    };
+                    if delim.is_empty() {
+                        return Err(ParseError {
+                            msg: "empty heredoc delimiter".into(),
+                        });
+                    }
+                    pending.push((start, i, delim, expand, strip));
+                }
+                '\n' if !pending.is_empty() => {
+                    let newline = i;
+                    let mut cursor = newline + 1;
+                    for (start, end, delim, expand, strip) in std::mem::take(&mut pending) {
+                        let (body, body_end) =
+                            scan_heredoc_body(&chars, cursor, &delim, strip)?;
+                        bodies.push(HeredocBody { body, expand });
+                        edits.push((start, end, cursor, body_end, expand));
+                        cursor = body_end;
+                    }
+                    i = cursor;
+                }
+                _ => {
+                    i += 1;
+                }
+            },
+        }
+    }
+    if !pending.is_empty() {
+        return Err(ParseError {
+            msg: "unterminated heredoc (missing newline)".into(),
+        });
+    }
+    if edits.is_empty() {
+        return Ok((src.to_string(), bodies));
+    }
+
+    // Rebuild the source, replacing each `<<DELIM` with a marker and dropping
+    // the body lines. Apply edits from the end so earlier offsets stay valid.
+    let mut out: Vec<char> = Vec::new();
+    let mut cursor = 0;
+    let mut body_index = 0;
+    for (start, end, body_start, body_end, _expand) in edits {
+        out.extend_from_slice(&chars[cursor..start]);
+        let marker: Vec<char> =
+            format!("<<<{HEREDOC_MARKER}{body_index}").chars().collect();
+        out.extend_from_slice(&marker);
+        out.extend_from_slice(&chars[end..body_start]);
+        body_index += 1;
+        cursor = body_end;
+    }
+    out.extend_from_slice(&chars[cursor..]);
+    Ok((out.iter().collect(), bodies))
+}
+
+/// Read a heredoc body starting at `from` until a line matching `delim`.
+/// Returns the body text (each line kept, delimiter line excluded) and the
+/// index just past the delimiter line's newline. `<<-` strips leading tabs
+/// from every body line and from the delimiter line.
+fn scan_heredoc_body(
+    chars: &[char],
+    from: usize,
+    delim: &str,
+    strip: bool,
+) -> Result<(String, usize), ParseError> {
+    let mut cursor = from;
+    let mut body: String = String::new();
+    while cursor <= chars.len() {
+        let line_end = chars[cursor..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map(|p| cursor + p)
+            .unwrap_or(chars.len());
+        let line: String = chars[cursor..line_end].iter().collect();
+        let stripped = if strip {
+            line.trim_start_matches('\t')
+        } else {
+            line.as_str()
+        };
+        if stripped == delim {
+            return Ok((body, (line_end + 1).min(chars.len())));
+        }
+        body.push_str(stripped);
+        if line_end < chars.len() {
+            body.push('\n');
+        }
+        if line_end >= chars.len() {
+            break;
+        }
+        cursor = line_end + 1;
+    }
+    Err(ParseError {
+        msg: format!("unterminated heredoc (delimiter `{delim}` not found)"),
+    })
 }
 
 const KEYWORDS: &[&str] = &["if", "then", "elif", "else", "fi", "for", "in", "do", "done", "while", "until", "{", "}"];
@@ -296,7 +522,9 @@ impl Parser {
                 }
                 Tok::Redir(r) => {
                     self.advance();
-                    let target = if matches!(r, super::lexer::RedirectTok::Dup { .. }) {
+                    // `2>&1` carries its target fd in the token; no word follows.
+                    let is_dup = matches!(r, super::lexer::RedirectTok::Dup { .. });
+                    let target = if is_dup {
                         Word::lit("")
                     } else {
                         match self.peek().clone() {
@@ -307,6 +535,24 @@ impl Parser {
                             _ => return Err(self.err("expected a file after redirect")),
                         }
                     };
+                    // A here-string whose target is a heredoc marker resolves
+                    // to the heredoc body extracted by the preprocessor.
+                    if matches!(r, super::lexer::RedirectTok::HereString { .. })
+                        && let Some(idx) = heredoc_marker_index(&target)
+                    {
+                        if let Some(hb) = self.heredocs.get(idx) {
+                            redirects.push(Redirect {
+                                fd: 0,
+                                op: RedirectOp::Heredoc {
+                                    body: hb.body.clone(),
+                                    expand: hb.expand,
+                                },
+                                target: Word::lit(""),
+                            });
+                            continue;
+                        }
+                        return Err(self.err("unknown heredoc marker"));
+                    }
                     redirects.push(make_redirect(r, target));
                 }
                 _ => break,
@@ -350,6 +596,11 @@ fn make_redirect(r: super::lexer::RedirectTok, target: Word) -> Redirect {
         RedirectTok::Dup { fd, to } => Redirect {
             fd,
             op: RedirectOp::Dup(to),
+            target,
+        },
+        RedirectTok::HereString { fd } => Redirect {
+            fd,
+            op: RedirectOp::HereString,
             target,
         },
     }

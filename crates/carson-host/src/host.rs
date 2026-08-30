@@ -12,6 +12,14 @@ use wasmtime_wasi::WasiCtxBuilder;
 use crate::bindings::AgentWorld;
 use crate::db::{Db, PersistedSession, StoredBlock};
 use crate::drivers::{LlmDriver, OpenAiCompatDriver, Usage};
+
+/// Host wall-clock time in milliseconds since the epoch.
+pub fn ms_since_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 use crate::hub::Hub;
 use crate::registry::{AgentDef, AgentInstance, AgentPool, AgentRegistry, ProviderDef, ToolDef};
 use crate::state::State;
@@ -216,6 +224,7 @@ pub async fn snapshot_session(db: &Arc<Db>, instance: &AgentInstance, session_id
         // their own update calls; the message snapshot must not clobber them.
         name: None,
         sandbox_id: None,
+        updated_at: ms_since_epoch(),
         summary: state.summary,
         usage: Usage {
             input_tokens: state.usage.input_tokens,

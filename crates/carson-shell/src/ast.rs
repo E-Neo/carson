@@ -51,7 +51,7 @@ pub struct Redirect {
     pub target: Word,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RedirectOp {
     /// `fd<word`
     In,
@@ -61,6 +61,11 @@ pub enum RedirectOp {
     Append,
     /// `fd>&N`: duplicate to another fd.
     Dup(u32),
+    /// `<<<word`: feed the expanded word plus a trailing newline to stdin.
+    HereString,
+    /// `<<delim` / `<<-delim`: feed the heredoc body to stdin. `expand` is
+    /// false when the delimiter was quoted, so the body is literal.
+    Heredoc { body: String, expand: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

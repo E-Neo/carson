@@ -175,6 +175,7 @@ pub struct PersistedSession {
     /// The sandbox this session's tools operate in; backfilled on restore for
     /// sessions created before sandboxes existed.
     pub sandbox_id: Option<String>,
+    pub updated_at: i64,
     pub summary: Option<String>,
     pub usage: Usage,
     pub messages: Vec<StoredBlock>,
@@ -511,6 +512,7 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT s.id, s.agent_name, s.agent_version_id, s.name, s.sandbox_id, s.summary, \
              s.input_tokens, s.cache_read_tokens, s.cache_creation_tokens, s.output_tokens, \
+             s.updated_at, \
              m.seq, m.agent_version_id, m.kind, m.content, m.input_tokens, \
              m.cache_read_tokens, m.cache_creation_tokens, \
              m.output_tokens, m.created_at, m.finished_at \
@@ -518,17 +520,17 @@ impl Db {
              ORDER BY s.rowid, m.seq",
         )?;
         let rows = stmt.query_map([], |row| {
-            let block = if row.get::<_, Option<i64>>(10)?.is_some() {
+            let block = if row.get::<_, Option<i64>>(11)?.is_some() {
                 Some(MessageRow(StoredBlock {
-                    agent_version_id: row.get::<_, Option<String>>(11)?.unwrap_or_default(),
-                    kind: row.get::<_, Option<String>>(12)?.unwrap_or_default(),
-                    text: row.get(13)?,
-                    input_tokens: row.get::<_, i64>(14)? as u32,
-                    cache_read_tokens: row.get::<_, i64>(15)? as u32,
-                    cache_creation_tokens: row.get::<_, i64>(16)? as u32,
-                    output_tokens: row.get::<_, i64>(17)? as u32,
-                    created_at_ms: row.get::<_, Option<i64>>(18)?.unwrap_or(0) as u64,
-                    finished_at_ms: row.get::<_, Option<i64>>(19)?.unwrap_or(0) as u64,
+                    agent_version_id: row.get::<_, Option<String>>(12)?.unwrap_or_default(),
+                    kind: row.get::<_, Option<String>>(13)?.unwrap_or_default(),
+                    text: row.get(14)?,
+                    input_tokens: row.get::<_, i64>(15)? as u32,
+                    cache_read_tokens: row.get::<_, i64>(16)? as u32,
+                    cache_creation_tokens: row.get::<_, i64>(17)? as u32,
+                    output_tokens: row.get::<_, i64>(18)? as u32,
+                    created_at_ms: row.get::<_, Option<i64>>(19)?.unwrap_or(0) as u64,
+                    finished_at_ms: row.get::<_, Option<i64>>(20)?.unwrap_or(0) as u64,
                 }))
             } else {
                 None
@@ -544,6 +546,7 @@ impl Db {
                 row.get::<_, i64>(7)? as u32,
                 row.get::<_, i64>(8)? as u32,
                 row.get::<_, i64>(9)? as u32,
+                row.get::<_, i64>(10)?,
                 block,
             ))
         })?;
@@ -563,6 +566,7 @@ impl Db {
                 cache_read,
                 cache_creation,
                 output,
+                updated_at,
                 block,
             ) = row?;
             let idx = match index_of.get(&id) {
@@ -574,6 +578,7 @@ impl Db {
                         agent_version_id,
                         name,
                         sandbox_id,
+                        updated_at,
                         summary,
                         usage: Usage {
                             input_tokens: input,
@@ -718,6 +723,7 @@ mod tests {
             agent_version_id: version.into(),
             name: None,
             sandbox_id: Some(id.into()),
+            updated_at: 5_000,
             summary: Some("summary".into()),
             usage: Usage {
                 input_tokens: 10,

@@ -10,6 +10,8 @@ pub enum RedirectTok {
     In { fd: u32 },
     Out { fd: u32, append: bool },
     Dup { fd: u32, to: u32 },
+    /// `<<<word`: here-string feeding `word\n` to stdin.
+    HereString { fd: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,7 +100,20 @@ impl Lexer {
             }
             '<' => {
                 self.pos += 1;
-                Ok(Tok::Redir(RedirectTok::In { fd: 0 }))
+                if self.eat('<') {
+                    // `<<` heredocs are rewritten away by the parser's
+                    // preprocessor; a bare `<<` here means a stray one.
+                    if self.eat('<') {
+                        Ok(Tok::Redir(RedirectTok::HereString { fd: 0 }))
+                    } else {
+                        Err(LexError {
+                            pos: self.pos,
+                            msg: "unterminated heredoc".into(),
+                        })
+                    }
+                } else {
+                    Ok(Tok::Redir(RedirectTok::In { fd: 0 }))
+                }
             }
             '>' => {
                 self.pos += 1;

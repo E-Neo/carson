@@ -1109,10 +1109,11 @@ pub(crate) async fn delete_tool(State(st): State<AppState>, path: ToolIdPath) ->
     )
 )]
 pub(crate) async fn list_sessions(State(st): State<AppState>) -> Response {
-    let sessions: Vec<Value> = st
-        .sessions
-        .lock()
-        .await
+    let mut sessions: Vec<(String, SessionEntry)> =
+        st.sessions.lock().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    // Most recently active first.
+    sessions.sort_by_key(|(_, e)| std::cmp::Reverse(e.updated_at));
+    let sessions: Vec<Value> = sessions
         .iter()
         .map(|(id, entry)| {
             json!({
@@ -1189,6 +1190,7 @@ pub(crate) async fn create_session(
                     agent_version_id: def.id.clone(),
                     name: None,
                     sandbox_id: sandbox_id.clone(),
+                    updated_at: host::ms_since_epoch(),
                     instance: instance.clone(),
                 },
             );
@@ -1311,6 +1313,7 @@ pub(crate) async fn update_session(
             None => return json_err(StatusCode::NOT_FOUND, "session not found"),
         }
     };
+    entry.updated_at = host::ms_since_epoch();
     if let Some(name) = &req.name {
         let name = if name.trim().is_empty() {
             None
@@ -1563,6 +1566,7 @@ async fn sync_session_agent(st: &AppState, id: &str, entry: &SessionEntry) -> Se
         agent_version_id: def.id.clone(),
         name: entry.name.clone(),
         sandbox_id: entry.sandbox_id.clone(),
+        updated_at: entry.updated_at,
         instance,
     };
     st.sessions
@@ -1653,6 +1657,7 @@ pub(crate) async fn send_stream(
     st.hub.register(&id, tx.clone());
     let hub = st.hub.clone();
     let db = st.db.clone();
+    let sessions = st.sessions.clone();
     let instance = entry.instance.clone();
     let task_id = id.clone();
 
@@ -1661,6 +1666,9 @@ pub(crate) async fn send_stream(
         let result =
             run_message_blocking(instance.clone(), task_id.clone(), req.content.clone()).await;
         host::snapshot_session(&db, &instance, &task_id).await;
+        if let Some(e) = sessions.lock().await.get_mut(&task_id) {
+            e.updated_at = host::ms_since_epoch();
+        }
         let usage = session_usage(&instance, &task_id).await;
         if let Err(err) = result {
             let _ = hub.send(
@@ -1722,6 +1730,7 @@ pub(crate) async fn send_message(
     st.hub.register(&id, tx.clone());
     let hub = st.hub.clone();
     let db = st.db.clone();
+    let sessions = st.sessions.clone();
     let instance = entry.instance.clone();
     let task_id = id.clone();
 
@@ -1730,6 +1739,9 @@ pub(crate) async fn send_message(
         let result =
             run_message_blocking(instance.clone(), task_id.clone(), req.content.clone()).await;
         host::snapshot_session(&db, &instance, &task_id).await;
+        if let Some(e) = sessions.lock().await.get_mut(&task_id) {
+            e.updated_at = host::ms_since_epoch();
+        }
         let usage = session_usage(&instance, &task_id).await;
         if let Err(err) = result {
             let _ = hub.send(

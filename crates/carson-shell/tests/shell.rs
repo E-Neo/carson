@@ -326,6 +326,43 @@ fn redirections() {
 }
 
 #[test]
+fn heredocs_and_here_strings() {
+    let h = Harness::new();
+
+    // Basic heredoc feeds the body to stdin.
+    let r = h.run("cat <<EOF\nhello\nEOF\n");
+    assert_eq!(r.out(), "hello");
+
+    // Multi-line body, both expansion and quoted-delimiter literal forms.
+    let r = h.run("x=world; cat <<EOF\na\nhi $x\nEOF\n");
+    assert_eq!(r.out(), "a\nhi world");
+    let r = h.run("x=world; cat <<'EOF'\nhi $x\nEOF\n");
+    assert_eq!(r.out(), "hi $x");
+
+    // <<- strips leading tabs from body and delimiter.
+    let r = h.run("cat <<-EOF\n\thello\n\tEOF\n");
+    assert_eq!(r.out(), "hello");
+
+    // Command substitution and $? expand inside an unquoted heredoc.
+    let r = h.run("cat <<EOF\n$(echo sub) $?\nEOF\n");
+    assert_eq!(r.out(), "sub 0");
+
+    // Heredoc feeding a pipeline.
+    let r = h.run("cat <<EOF | cat\na\nb\nEOF\n");
+    assert_eq!(r.out(), "a\nb");
+
+    // Heredoc inside command substitution.
+    let r = h.run("x=$(cat <<EOF\nhi\nEOF\n); echo $x");
+    assert_eq!(r.out(), "hi");
+
+    // Here-strings append a newline and expand the word.
+    let r = h.run("cat <<< hello");
+    assert_eq!(r.out(), "hello");
+    let r = h.run("x=abc; cat <<< \"$x\"");
+    assert_eq!(r.out(), "abc");
+}
+
+#[test]
 fn test_builtin() {
     let h = Harness::new();
     h.write("a.txt", "x");

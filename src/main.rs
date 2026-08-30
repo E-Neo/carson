@@ -185,6 +185,7 @@ async fn main() -> Result<()> {
                 agent_version_id: persisted.agent_version_id.clone(),
                 name: persisted.name.clone(),
                 sandbox_id,
+                updated_at: persisted.updated_at,
                 instance,
             },
         );

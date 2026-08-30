@@ -296,9 +296,9 @@ impl Interp<'_> {
     fn apply_redirects(&mut self, io: &Io, redirects: &[crate::ast::Redirect]) -> Result<Io, String> {
         let mut out = io.clone();
         for r in redirects {
-            let target = self.expand_word(&r.target).into_iter().next().unwrap_or_default();
-            match r.op {
+            match &r.op {
                 RedirectOp::In => {
+                    let target = self.expand_word(&r.target).into_iter().next().unwrap_or_default();
                     if r.fd == 0 {
                         out.stdin = In::File(self.state.resolve(&target));
                     } else {
@@ -306,8 +306,9 @@ impl Interp<'_> {
                     }
                 }
                 RedirectOp::Out | RedirectOp::Append => {
+                    let target = self.expand_word(&r.target).into_iter().next().unwrap_or_default();
                     let path = self.state.resolve(&target);
-                    let append = r.op == RedirectOp::Append;
+                    let append = matches!(r.op, RedirectOp::Append);
                     let o = Out::File { path, append };
                     match r.fd {
                         1 => out.stdout = o,
@@ -316,16 +317,120 @@ impl Interp<'_> {
                     }
                 }
                 RedirectOp::Dup(to) => {
-                    let src = out.out_fd(to).cloned().unwrap_or(Out::Err);
+                    let src = out.out_fd(*to).cloned().unwrap_or(Out::Err);
                     match r.fd {
                         1 => out.stdout = src,
                         2 => out.stderr = src,
                         f => return Err(format!("fd {f}: unsupported dup redirect")),
                     }
                 }
+                RedirectOp::HereString => {
+                    let s = self.expand_assignment(&r.target);
+                    let mut data = s.into_bytes();
+                    data.push(b'\n');
+                    out.stdin = In::Buffer(Rc::new(RefCell::new(data)));
+                }
+                RedirectOp::Heredoc { body, expand } => {
+                    let data = self.expand_heredoc(body, *expand);
+                    out.stdin = In::Buffer(Rc::new(RefCell::new(data)));
+                }
             }
         }
         Ok(out)
+    }
+
+    /// Expand a heredoc body. With an unquoted delimiter, `$VAR`, `$?`,
+    /// `${...}` and `$(...)` expand (no word splitting); otherwise the body is
+    /// literal. Backslash only escapes `$`, `` ` `` and `\`.
+    fn expand_heredoc(&mut self, body: &str, expand: bool) -> Vec<u8> {
+        if !expand {
+            return body.as_bytes().to_vec();
+        }
+        let chars: Vec<char> = body.chars().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '\\' => {
+                    if i + 1 < chars.len() && matches!(chars[i + 1], '$' | '`' | '\\') {
+                        out.push(chars[i + 1]);
+                        i += 2;
+                    } else {
+                        out.push('\\');
+                        i += 1;
+                    }
+                }
+                '$' => {
+                    let (piece, adv) = self.heredoc_dollar(&chars, i);
+                    out.push_str(&piece);
+                    i += adv;
+                }
+                c => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+        out.into_bytes()
+    }
+
+    /// Resolve one `$`-expansion inside a heredoc body: `$NAME`, `${NAME}`,
+    /// `$?` or `$(...)`. Returns the expanded text and how many chars to skip.
+    fn heredoc_dollar(&mut self, chars: &[char], i: usize) -> (String, usize) {
+        let Some(&c) = chars.get(i + 1) else {
+            return ("$".to_string(), 1);
+        };
+        match c {
+            '(' => {
+                let mut depth = 1usize;
+                let mut j = i + 2;
+                while j < chars.len() {
+                    match chars[j] {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        '\'' => {
+                            j += 1;
+                            while j < chars.len() && chars[j] != '\'' {
+                                j += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if j >= chars.len() {
+                    return ("$(unterminated".to_string(), 2);
+                }
+                let inner: String = chars[i + 2..j].iter().collect();
+                (self.command_sub(&inner), j - i + 1)
+            }
+            '{' => {
+                let mut j = i + 2;
+                while j < chars.len() && chars[j] != '}' {
+                    j += 1;
+                }
+                if j >= chars.len() {
+                    return ("${".to_string(), 2);
+                }
+                let name: String = chars[i + 2..j].iter().collect();
+                (self.var_value(&name), j - i + 1)
+            }
+            c if c.is_ascii_alphanumeric() || c == '_' => {
+                let mut j = i + 2;
+                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                let name: String = chars[i + 1..j].iter().collect();
+                (self.var_value(&name), j - i)
+            }
+            '?' | '#' | '0' => (self.var_value(&c.to_string()), 2),
+            _ => ("$".to_string(), 1),
+        }
     }
 
     /// Expand a word into argv fields, applying word splitting to unquoted
