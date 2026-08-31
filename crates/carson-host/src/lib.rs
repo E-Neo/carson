@@ -1,4 +1,5 @@
 pub mod app;
+pub mod auth;
 pub mod bash_bindings;
 pub mod bindings;
 pub mod config;

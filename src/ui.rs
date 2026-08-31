@@ -25,7 +25,7 @@ fn content_type(path: &str) -> &'static str {
     }
 }
 
-async fn serve_ui(uri: Uri, token: Option<&str>) -> Response {
+async fn serve_ui(uri: Uri) -> Response {
     let path = uri.path();
     if path.starts_with("/api") {
         return (
@@ -52,7 +52,7 @@ async fn serve_ui(uri: Uri, token: Option<&str>) -> Response {
             (index.contents(), "text/html; charset=utf-8")
         }
     };
-    let mut resp = (
+    (
         StatusCode::OK,
         [
             (CONTENT_TYPE, HeaderValue::from_static(ctype)),
@@ -63,19 +63,7 @@ async fn serve_ui(uri: Uri, token: Option<&str>) -> Response {
         ],
         bytes,
     )
-        .into_response();
-    // Hand the browser the API token as an HttpOnly cookie so its same-origin
-    // fetches (including SSE) are authorized without code changes.
-    if let Some(token) = token {
-        let cookie = format!(
-            "carson_token={token}; Path=/; SameSite=Lax; HttpOnly"
-        );
-        resp.headers_mut().insert(
-            axum::http::header::SET_COOKIE,
-            HeaderValue::from_str(&cookie).expect("cookie header"),
-        );
-    }
-    resp
+        .into_response()
 }
 
 /// Security headers for the UI (same-origin assets, wasm instantiation allowed).
@@ -94,11 +82,8 @@ async fn ui_security(req: Request, next: Next) -> Response {
     resp
 }
 
-pub fn router(token: Option<String>) -> Router {
+pub fn router() -> Router {
     Router::new()
-        .fallback(move |uri: Uri| {
-            let token = token.clone();
-            async move { serve_ui(uri, token.as_deref()).await }
-        })
+        .fallback(|uri: Uri| async move { serve_ui(uri).await })
         .layer(middleware::from_fn(ui_security))
 }

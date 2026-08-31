@@ -172,6 +172,194 @@ async fn del(app: &Router, uri: &str) -> (u16, Value) {
     (status, value)
 }
 
+async fn unauthorized(app: &Router, uri: &str) -> u16 {
+    app.clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// POST /api/auth/login and return (status, set-cookie header, body).
+async fn login(app: &Router, token: &str) -> (u16, String, String) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"token":"{token}"}}"#)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let cookie = resp
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_default();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, cookie, String::from_utf8_lossy(&bytes).to_string())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn docs_and_openapi_require_auth() {
+    let app = app().await;
+    for path in ["/api", "/api/", "/api/openapi.json"] {
+        let status = unauthorized(&app, path).await;
+        assert_eq!(status, 401, "expected {path} to require auth");
+    }
+    let resp = app
+        .clone()
+        .oneshot(
+            authorized(Request::builder())
+                .uri("/api/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn login_rejects_wrong_token_and_throttles() {
+    let app = app().await;
+    // Wrong token: 401, no cookie.
+    let (status, cookie, body) = login(&app, "wrong").await;
+    assert_eq!(status, 401, "{body}");
+    assert!(cookie.is_empty());
+    // Repeated failures eventually throttle.
+    let mut throttled = false;
+    for _ in 0..6 {
+        let (status, _, _) = login(&app, "wrong").await;
+        if status == 429 {
+            throttled = true;
+            break;
+        }
+    }
+    assert!(throttled, "expected 429 after repeated failures");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn login_issues_session_cookie_that_authorizes() {
+    let app = app().await;
+    let (status, cookie, body) = login(&app, TEST_TOKEN).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(cookie.contains("carson_session="), "{cookie}");
+    assert!(cookie.contains("HttpOnly"), "{cookie}");
+    assert!(cookie.contains("SameSite=Lax"), "{cookie}");
+    assert!(cookie.contains("Max-Age="), "{cookie}");
+
+    // The session cookie authorizes API calls like a bearer token.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/agents")
+                .header("cookie", cookie.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // Logout clears the cookie and revokes the session.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/logout")
+                .header("cookie", cookie.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert!(
+        resp.headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0"),
+        "logout must clear the cookie"
+    );
+
+    // The revoked cookie no longer authorizes.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/agents")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn me_reflects_auth_state() {
+    let app = app().await;
+    // Unauthenticated: 401.
+    let status = unauthorized(&app, "/api/auth/me").await;
+    assert_eq!(status, 401);
+    // Bearer token: authenticated.
+    let (status, body) = get(&app, "/api/auth/me").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"authenticated\":true"));
+    // Session cookie: authenticated.
+    let (_, cookie, _) = login(&app, TEST_TOKEN).await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/me")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_cookie_works_across_multiple_endpoints() {
+    let app = app().await;
+    let (_, cookie, _) = login(&app, TEST_TOKEN).await;
+    for uri in [
+        "/api/status",
+        "/api/config",
+        "/api/providers",
+        "/api/tools",
+        "/api/sandboxes",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("cookie", cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "GET {uri}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_ids_are_uuids() {
     let app = app().await;

@@ -1,4 +1,5 @@
 use js_sys::Promise;
+use leptos::prelude::Set;
 use serde_json::Value;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -28,6 +29,11 @@ async fn send(method: &str, path: &str, body: Option<&Value>) -> Result<(u16, Va
     let request = Request::new_with_str_and_init(path, &init)?;
     let resp = fetch(&request).await?;
     let status = resp.status();
+    // A 401 anywhere (except the login attempt itself) means the browser
+    // session expired or was revoked: drop back to the login screen.
+    if status == 401 && !path.starts_with("/api/auth/login") {
+        crate::auth().set(Some(false));
+    }
     let text = JsFuture::from(resp.text()?)
         .await?
         .as_string()

@@ -1251,6 +1251,16 @@ let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
                         }
                     }}
                     <a class="admin-link" href="/admin">"Admin"</a>
+                    <button
+                        class="logout-link"
+                        on:click=move |_| {
+                            spawn_local(async move {
+                                crate::logout().await;
+                            })
+                        }
+                    >
+                        "Log out"
+                    </button>
                 </aside>
 
                 <DragRail/>

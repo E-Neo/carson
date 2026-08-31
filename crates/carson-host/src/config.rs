@@ -2,21 +2,22 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub server: Server,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Server {
     pub ip: IpAddr,
     pub port: u16,
-    /// API bearer token. When `None`, `main` generates one, persists it, and
-    /// logs it; `CARSON_API_TOKEN` overrides the config value.
+    /// API bearer token (also the login password for the web UI). When absent,
+    /// `main` generates one, writes it back into `config.toml`, and logs it.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
 }
 
@@ -37,9 +38,14 @@ impl Server {
 }
 
 impl Config {
+    /// Load config, treating a missing file as defaults (the file is created
+    /// on first bootstrap when a token is generated).
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("read config {}", path.display()))?;
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+            Err(err) => return Err(err).with_context(|| format!("read config {}", path.display())),
+        };
         let cfg: Config =
             toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
         Ok(cfg)
@@ -77,8 +83,21 @@ port = 9000
     }
 
     #[test]
-    fn load_reports_missing_file() {
-        let err = Config::load(Path::new("/nonexistent/carson.toml")).unwrap_err();
-        assert!(err.to_string().contains("read config"));
+    fn load_missing_file_returns_defaults() {
+        let cfg = Config::load(Path::new("/nonexistent/carson.toml")).unwrap();
+        assert_eq!(cfg.server.bind().to_string(), "127.0.0.1:8000");
+    }
+
+    #[test]
+    fn roundtrip_serializes_token_back() {
+        let cfg = Config::default();
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!text.contains("token"), "absent token is not written: {text}");
+        let mut cfg = cfg;
+        cfg.server.token = Some("abc".into());
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("token = \"abc\""), "{text}");
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.server.token.as_deref(), Some("abc"));
     }
 }

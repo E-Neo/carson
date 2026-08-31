@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use crate::auth::AuthState;
 use crate::config::Config;
 use crate::db::Db;
 use crate::host::HostContext;
@@ -19,6 +20,8 @@ pub struct AppState {
     /// created it; agent edits never move existing sessions off their version.
     pub sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
     pub cfg: Arc<Config>,
+    /// In-memory browser login sessions (opaque cookie ids).
+    pub auth: Arc<AuthState>,
 }
 
 #[derive(Clone)]
@@ -46,5 +49,6 @@ pub fn build_app_state(
         db,
         sessions: Arc::new(Mutex::new(HashMap::new())),
         cfg: Arc::new(config),
+        auth: Arc::new(AuthState::new()),
     }
 }

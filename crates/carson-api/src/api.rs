@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, SET_COOKIE};
 use axum::http::{HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -12,6 +12,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use axum_extra::routing::TypedPath;
 use carson_host::app::{AppState, SessionEntry};
+use carson_host::auth::{SESSION_COOKIE, SESSION_COOKIE_MAX_AGE_MS};
 use carson_host::drivers::Usage;
 use carson_host::host;
 use carson_host::hub::{SseItem, sse_frame};
@@ -49,6 +50,19 @@ pub struct SandboxReq {
 #[derive(Deserialize, ToSchema)]
 pub struct MessageReq {
     content: String,
+}
+
+/// Login body: the configured `[server] token`.
+#[derive(Deserialize, ToSchema)]
+pub struct LoginRequest {
+    pub token: String,
+}
+
+/// Body of a successful `/api/auth/me`.
+#[derive(ToSchema)]
+#[schema(example = json!({"authenticated": true}))]
+pub struct MeResponse {
+    pub authenticated: bool,
 }
 
 /// Request body for registering or updating a custom tool. The wasm is
@@ -143,6 +157,9 @@ pub(crate) struct ToolIdPath {
         health,
         status,
         config_info,
+        login,
+        logout,
+        me,
         list_agents,
         create_agent,
         update_agent,
@@ -172,6 +189,8 @@ pub(crate) struct ToolIdPath {
         ToolReq,
         CreateSessionReq,
         MessageReq,
+        LoginRequest,
+        MeResponse,
         Usage,
         HealthResponse,
         StatusResponse,
@@ -400,7 +419,6 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/tools", get(list_tools).post(create_tool))
         .route(ToolIdPath::PATH, put(update_tool).delete(delete_tool))
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route(
             SessionPath::PATH,
@@ -413,11 +431,18 @@ pub fn router(state: AppState) -> Router {
         .route(StopPath::PATH, post(stop_session))
         .route(ResetPath::PATH, post(reset_session))
         .route(CompactPath::PATH, post(compact_session))
-        .layer(middleware::from_fn_with_state(state.clone(), security))
-        .with_state(state);
+        .route("/api/auth/login", post(login))
+        .route("/api/auth/logout", post(logout))
+        .route("/api/auth/me", get(me))
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024));
 
     let docs = Router::from(SwaggerUi::new("/api").url("/api/openapi.json", ApiDoc::openapi()));
-    api.merge(docs)
+
+    // Security wraps the merged router (api + swagger docs) so the openapi
+    // spec and docs page are protected too, not just the JSON endpoints.
+    api.merge(docs.with_state(state.clone()))
+        .layer(middleware::from_fn_with_state(state.clone(), security))
+        .with_state(state)
 }
 
 fn json_response(status: StatusCode, body: Value) -> Response {
@@ -441,22 +466,33 @@ fn json_err(status: StatusCode, message: &str) -> Response {
     json_response(status, json!({"error": message}))
 }
 
+/// Paths that never require authentication. Everything else under `/api/`
+/// needs a valid session cookie or a bearer token.
+const AUTH_EXEMPT: [&str; 3] = ["/api/auth/login", "/api/auth/logout", "/api/health"];
+
 async fn security(
     State(st): State<AppState>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
-    // The API is protected with a bearer token; the browser UI carries the
-    // same token in a cookie. Missing/mismatched tokens are rejected.
-    if let Some(expected) = st.cfg.server.token.as_deref() {
-        let uri = req.uri();
-        if uri.path().starts_with("/api/") && !authorized(&req, expected) {
-            return json_response(
-                StatusCode::UNAUTHORIZED,
-                json!({"error": "unauthorized"}),
-            );
-        }
+    // When a token is configured, every API path except the login/logout
+    // endpoints and health requires a valid browser session or bearer token.
+    let enforce = st
+        .cfg
+        .server
+        .token
+        .as_deref()
+        .map(|t| !t.is_empty())
+        .unwrap_or(false);
+    let path = req.uri().path();
+    let is_api = path == "/api" || path.starts_with("/api/");
+    if enforce
+        && is_api
+        && !AUTH_EXEMPT.contains(&path)
+        && !authorized_request(&req, &st)
+    {
+        return json_response(StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"}));
     }
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
@@ -473,15 +509,24 @@ async fn security(
     resp
 }
 
-/// Constant-time comparison of the provided bearer token against `expected`.
-fn authorized(req: &Request<Body>, expected: &str) -> bool {
-    let provided = header_bearer(req).or_else(|| cookie_token(req));
-    match provided {
-        Some(p) if p.len() == expected.len() => {
-            p.bytes().zip(expected.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
-        }
-        _ => false,
+/// A request is authorized when it carries a valid `carson_session` cookie
+/// (issued by a prior login) or a bearer token matching the configured token.
+fn authorized_request(req: &Request<Body>, st: &AppState) -> bool {
+    if let Some(sid) = session_cookie(req)
+        && st.auth.validate(&sid)
+    {
+        return true;
     }
+    let expected = st.cfg.server.token.as_deref().unwrap_or("");
+    match header_bearer(req) {
+        Some(provided) => constant_time_eq(&provided, expected),
+        None => false,
+    }
+}
+
+/// Constant-time comparison, safe against timing attacks.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn header_bearer(req: &Request<Body>) -> Option<String> {
@@ -494,13 +539,93 @@ fn header_bearer(req: &Request<Body>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn cookie_token(req: &Request<Body>) -> Option<String> {
+fn session_cookie(req: &Request<Body>) -> Option<String> {
     let jar = req.headers().get("cookie")?.to_str().ok()?;
     jar.split(';').find_map(|part| {
         let part = part.trim();
         let (name, value) = part.split_once('=')?;
-        (name.trim() == "carson_token").then(|| value.trim().to_string())
+        (name.trim() == SESSION_COOKIE).then(|| value.trim().to_string())
     })
+}
+
+/// Login with the configured `[server] token`; on success the browser receives
+/// an HttpOnly `carson_session` cookie so subsequent fetches are authorized.
+#[utoipa::path(
+    post,
+    path = "/api/auth/login",
+    request_body = LoginRequest,
+    responses(
+        (status = 200, description = "Logged in; a carson_session cookie is set", body = MeResponse),
+        (status = 401, description = "Invalid token", body = ErrorResponse),
+        (status = 429, description = "Too many failed attempts", body = ErrorResponse),
+        (status = 500, description = "No token configured", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn login(State(st): State<AppState>, Json(req): Json<LoginRequest>) -> Response {
+    let Some(expected) = st.cfg.server.token.as_deref().filter(|t| !t.is_empty()) else {
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, "no token configured");
+    };
+    if st.auth.is_throttled() {
+        return json_err(StatusCode::TOO_MANY_REQUESTS, "too many attempts; try again later");
+    }
+    if !constant_time_eq(&req.token, expected) {
+        st.auth.record_failure();
+        return json_err(StatusCode::UNAUTHORIZED, "invalid token");
+    }
+    st.auth.clear_failures();
+    let sid = st.auth.issue();
+    let max_age = SESSION_COOKIE_MAX_AGE_MS / 1000;
+    let cookie = format!(
+        "{SESSION_COOKIE}={sid}; Path=/; SameSite=Lax; HttpOnly; Max-Age={max_age}"
+    );
+    let mut resp = json_ok(json!({"authenticated": true}));
+    resp.headers_mut()
+        .insert(SET_COOKIE, HeaderValue::from_str(&cookie).expect("cookie header"));
+    resp
+}
+
+/// Destroy the session and clear the cookie.
+#[utoipa::path(
+    post,
+    path = "/api/auth/logout",
+    responses(
+        (status = 200, description = "Logged out", body = MeResponse)
+    )
+)]
+pub(crate) async fn logout(State(st): State<AppState>, req: Request<Body>) -> Response {
+    if let Some(sid) = session_cookie(&req) {
+        st.auth.revoke(&sid);
+    }
+    let cookie = format!("{SESSION_COOKIE}=; Path=/; SameSite=Lax; HttpOnly; Max-Age=0");
+    let mut resp = json_ok(json!({"authenticated": false}));
+    resp.headers_mut()
+        .insert(SET_COOKIE, HeaderValue::from_str(&cookie).expect("cookie header"));
+    resp
+}
+
+/// Whether the current request is authenticated. The security middleware
+/// already guards this path; it exists so the UI can probe on load.
+#[utoipa::path(
+    get,
+    path = "/api/auth/me",
+    responses(
+        (status = 200, description = "Authenticated", body = MeResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn me(State(st): State<AppState>, req: Request<Body>) -> Response {
+    let enforce = st
+        .cfg
+        .server
+        .token
+        .as_deref()
+        .map(|t| !t.is_empty())
+        .unwrap_or(false);
+    if !enforce || authorized_request(&req, &st) {
+        json_ok(json!({"authenticated": true}))
+    } else {
+        json_err(StatusCode::UNAUTHORIZED, "not authenticated")
+    }
 }
 
 /// Check service health.
@@ -1865,6 +1990,7 @@ mod tests {
             hub: Hub::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             cfg: Arc::new(config()),
+            auth: Arc::new(carson_host::auth::AuthState::new()),
         }
     }
 

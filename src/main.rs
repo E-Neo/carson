@@ -1,4 +1,3 @@
-use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,8 +24,7 @@ mod ui;
 
 /// The full app: JSON/SSE API (with strict CSP) merged with the embedded web UI.
 pub fn build_app(app_state: carson_host::app::AppState) -> Router {
-    let token = app_state.cfg.server.token.clone();
-    router(app_state).merge(ui::router(token))
+    router(app_state).merge(ui::router())
 }
 
 fn carson_home(cli_home: Option<PathBuf>) -> PathBuf {
@@ -39,34 +37,28 @@ fn carson_home(cli_home: Option<PathBuf>) -> PathBuf {
     PathBuf::from(".carson")
 }
 
-/// Resolve the API bearer token: `CARSON_API_TOKEN` env wins, then the
-/// configured `[server] token`, then a freshly generated token persisted to
-/// `$CARSON_HOME/api-token`. The token is always Some afterwards.
+/// Resolve the API token from `[server] token` in the config file only.
+/// When the file has no token yet, one is generated, written back into
+/// `config.toml`, and logged once so the operator can use it. The token is
+/// always Some afterwards. `$CARSON_HOME` never gains extra files.
 fn resolve_api_token(home: &std::path::Path, mut config: Config) -> Result<Config> {
-    let token = env::var("CARSON_API_TOKEN").ok().filter(|t| !t.is_empty()).or_else(|| {
-        config.server.token.clone().filter(|t| !t.is_empty())
-    });
-    let token = match token {
-        Some(t) => t,
-        None => {
-            let file = home.join("api-token");
-            let existing = std::fs::read_to_string(&file)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            match existing {
-                Some(t) => t,
-                None => {
-                    let generated = generate_token();
-                    std::fs::write(&file, format!("{generated}\n"))
-                        .with_context(|| format!("persist api token to {}", file.display()))?;
-                    generated
-                }
-            }
-        }
-    };
+    let path = home.join("config.toml");
+    if config
+        .server
+        .token
+        .as_deref()
+        .map(|t| !t.is_empty())
+        .unwrap_or(false)
+    {
+        tracing::info!("carson api token: loaded from config.toml");
+        return Ok(config);
+    }
+    let token = generate_token();
     config.server.token = Some(token.clone());
-    tracing::info!(api_token = %token, "carson api bearer token");
+    let text = toml::to_string_pretty(&config)
+        .with_context(|| format!("serialize config {}", path.display()))?;
+    std::fs::write(&path, text).with_context(|| format!("persist config {}", path.display()))?;
+    tracing::info!(api_token = %token, "carson api token: generated and written to config.toml");
     Ok(config)
 }
 
@@ -306,6 +298,7 @@ mod tests {
             hub: Hub::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             cfg: Arc::new(config()),
+            auth: Arc::new(carson_host::auth::AuthState::new()),
         };
         build_app(state)
     }
