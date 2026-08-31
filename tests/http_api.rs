@@ -14,8 +14,17 @@ use carson_host::drivers::EchoDriver;
 use carson_host::host::{HostContext, build_registry};
 use carson_host::registry::{AgentDef, ToolDef};
 
+const TEST_TOKEN: &str = "test-api-token";
+
 fn config() -> Config {
-    toml::from_str("[server]\nip = \"127.0.0.1\"\nport = 8000\n").unwrap()
+    toml::from_str(
+        "[server]\nip = \"127.0.0.1\"\nport = 8000\ntoken = \"test-api-token\"\n",
+    )
+    .unwrap()
+}
+
+fn authorized(req: axum::http::request::Builder) -> axum::http::request::Builder {
+    req.header("authorization", format!("Bearer {TEST_TOKEN}"))
 }
 
 fn coder_def() -> AgentDef {
@@ -82,7 +91,7 @@ async fn post(app: &Router, uri: &str, body: &str) -> (u16, Value) {
     let resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            authorized(Request::builder())
                 .method("POST")
                 .uri(uri)
                 .header("content-type", "application/json")
@@ -100,7 +109,7 @@ async fn post(app: &Router, uri: &str, body: &str) -> (u16, Value) {
 async fn get(app: &Router, uri: &str) -> (u16, String) {
     let resp = app
         .clone()
-        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .oneshot(authorized(Request::builder()).uri(uri).body(Body::empty()).unwrap())
         .await
         .unwrap();
     let status = resp.status().as_u16();
@@ -112,7 +121,7 @@ async fn post_raw(app: &Router, uri: &str, body: &str) -> (u16, String) {
     let resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            authorized(Request::builder())
                 .method("POST")
                 .uri(uri)
                 .header("content-type", "application/json")
@@ -130,7 +139,7 @@ async fn put(app: &Router, uri: &str, body: &str) -> (u16, Value) {
     let resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            authorized(Request::builder())
                 .method("PUT")
                 .uri(uri)
                 .header("content-type", "application/json")
@@ -149,7 +158,7 @@ async fn del(app: &Router, uri: &str) -> (u16, Value) {
     let resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            authorized(Request::builder())
                 .method("DELETE")
                 .uri(uri)
                 .body(Body::empty())
@@ -171,6 +180,34 @@ async fn session_ids_are_uuids() {
     let id = created["session_id"].as_str().unwrap();
     assert_eq!(id.len(), 36, "uuid format: {id}");
     assert!(created["agent_version_id"].as_str().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_requires_bearer_token() {
+    let app = app().await;
+    // No token: rejected.
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/api/agents").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+    // Wrong token: rejected.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .header("authorization", "Bearer nope")
+                .uri("/api/agents")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+    // Valid token: allowed.
+    let (status, _) = get(&app, "/api/agents").await;
+    assert_eq!(status, 200);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -238,7 +275,7 @@ async fn session_lifecycle_endpoints() {
     let resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            authorized(Request::builder())
                 .method("DELETE")
                 .uri(&uri)
                 .body(Body::empty())

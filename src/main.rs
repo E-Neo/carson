@@ -1,3 +1,4 @@
+use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,7 +25,8 @@ mod ui;
 
 /// The full app: JSON/SSE API (with strict CSP) merged with the embedded web UI.
 pub fn build_app(app_state: carson_host::app::AppState) -> Router {
-    router(app_state).merge(ui::router())
+    let token = app_state.cfg.server.token.clone();
+    router(app_state).merge(ui::router(token))
 }
 
 fn carson_home(cli_home: Option<PathBuf>) -> PathBuf {
@@ -35,6 +37,50 @@ fn carson_home(cli_home: Option<PathBuf>) -> PathBuf {
         return PathBuf::from(home).join(".carson");
     }
     PathBuf::from(".carson")
+}
+
+/// Resolve the API bearer token: `CARSON_API_TOKEN` env wins, then the
+/// configured `[server] token`, then a freshly generated token persisted to
+/// `$CARSON_HOME/api-token`. The token is always Some afterwards.
+fn resolve_api_token(home: &std::path::Path, mut config: Config) -> Result<Config> {
+    let token = env::var("CARSON_API_TOKEN").ok().filter(|t| !t.is_empty()).or_else(|| {
+        config.server.token.clone().filter(|t| !t.is_empty())
+    });
+    let token = match token {
+        Some(t) => t,
+        None => {
+            let file = home.join("api-token");
+            let existing = std::fs::read_to_string(&file)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            match existing {
+                Some(t) => t,
+                None => {
+                    let generated = generate_token();
+                    std::fs::write(&file, format!("{generated}\n"))
+                        .with_context(|| format!("persist api token to {}", file.display()))?;
+                    generated
+                }
+            }
+        }
+    };
+    config.server.token = Some(token.clone());
+    tracing::info!(api_token = %token, "carson api bearer token");
+    Ok(config)
+}
+
+fn generate_token() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    // 32 hex chars from a uuid v4 + a wall-clock mix (best effort local token).
+    format!("{}{:016x}", uuid::Uuid::new_v4().simple(), now)
+        .chars()
+        .take(48)
+        .collect()
 }
 
 /// Log every incoming request at `info`, http.server style.
@@ -72,6 +118,7 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&home).with_context(|| format!("create {}", home.display()))?;
 
     let config = Config::load(&home.join("config.toml"))?;
+    let config = resolve_api_token(&home, config)?;
 
     let db_path = home.join("carson.db");
     let db = Db::open(&db_path)?;

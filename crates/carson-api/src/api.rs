@@ -413,7 +413,7 @@ pub fn router(state: AppState) -> Router {
         .route(StopPath::PATH, post(stop_session))
         .route(ResetPath::PATH, post(reset_session))
         .route(CompactPath::PATH, post(compact_session))
-        .layer(middleware::from_fn(security))
+        .layer(middleware::from_fn_with_state(state.clone(), security))
         .with_state(state);
 
     let docs = Router::from(SwaggerUi::new("/api").url("/api/openapi.json", ApiDoc::openapi()));
@@ -441,8 +441,23 @@ fn json_err(status: StatusCode, message: &str) -> Response {
     json_response(status, json!({"error": message}))
 }
 
-async fn security(req: Request<Body>, next: Next) -> Response {
+async fn security(
+    State(st): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
+    // The API is protected with a bearer token; the browser UI carries the
+    // same token in a cookie. Missing/mismatched tokens are rejected.
+    if let Some(expected) = st.cfg.server.token.as_deref() {
+        let uri = req.uri();
+        if uri.path().starts_with("/api/") && !authorized(&req, expected) {
+            return json_response(
+                StatusCode::UNAUTHORIZED,
+                json!({"error": "unauthorized"}),
+            );
+        }
+    }
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
     headers.insert("x-request-id", HeaderValue::from_str(&request_id).unwrap());
@@ -456,6 +471,36 @@ async fn security(req: Request<Body>, next: Next) -> Response {
         HeaderValue::from_static("default-src 'self'"),
     );
     resp
+}
+
+/// Constant-time comparison of the provided bearer token against `expected`.
+fn authorized(req: &Request<Body>, expected: &str) -> bool {
+    let provided = header_bearer(req).or_else(|| cookie_token(req));
+    match provided {
+        Some(p) if p.len() == expected.len() => {
+            p.bytes().zip(expected.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+        }
+        _ => false,
+    }
+}
+
+fn header_bearer(req: &Request<Body>) -> Option<String> {
+    req.headers()
+        .get("authorization")?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .map(str::to_string)
+}
+
+fn cookie_token(req: &Request<Body>) -> Option<String> {
+    let jar = req.headers().get("cookie")?.to_str().ok()?;
+    jar.split(';').find_map(|part| {
+        let part = part.trim();
+        let (name, value) = part.split_once('=')?;
+        (name.trim() == "carson_token").then(|| value.trim().to_string())
+    })
 }
 
 /// Check service health.

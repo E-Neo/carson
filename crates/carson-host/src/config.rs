@@ -15,6 +15,9 @@ pub struct Config {
 pub struct Server {
     pub ip: IpAddr,
     pub port: u16,
+    /// API bearer token. When `None`, `main` generates one, persists it, and
+    /// logs it; `CARSON_API_TOKEN` overrides the config value.
+    pub token: Option<String>,
 }
 
 impl Default for Server {
@@ -22,6 +25,7 @@ impl Default for Server {
         Self {
             ip: "127.0.0.1".parse().expect("valid default ip"),
             port: 8000,
+            token: None,
         }
     }
 }
