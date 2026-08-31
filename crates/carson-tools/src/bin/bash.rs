@@ -31,10 +31,7 @@ impl Exec for HostExec {
         stdout: &mut Vec<u8>,
         stderr: &mut Vec<u8>,
     ) -> i32 {
-        let env: Vec<(String, String)> = env
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let env: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         match host_exec_run(prog, argv, &env, cwd, stdin) {
             Ok(result) => {
                 *stdout = result.stdout;
@@ -42,9 +39,8 @@ impl Exec for HostExec {
                 result.status as i32
             }
             Err(e) => {
-                stderr.extend_from_slice(
-                    format!("bash: {prog}: execution failed: {e}\n").as_bytes(),
-                );
+                stderr
+                    .extend_from_slice(format!("bash: {prog}: execution failed: {e}\n").as_bytes());
                 126
             }
         }
@@ -66,10 +62,7 @@ impl Guest for BashTool {
         let mut env: HashMap<String, String> = std::env::vars().collect();
         if let Some(extra) = args["env"].as_object() {
             for (k, v) in extra {
-                env.insert(
-                    k.clone(),
-                    v.as_str().unwrap_or_default().to_string(),
-                );
+                env.insert(k.clone(), v.as_str().unwrap_or_default().to_string());
             }
         }
         const ROOT: &str = "/";

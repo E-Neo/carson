@@ -92,7 +92,10 @@ port = 9000
     fn roundtrip_serializes_token_back() {
         let cfg = Config::default();
         let text = toml::to_string_pretty(&cfg).unwrap();
-        assert!(!text.contains("token"), "absent token is not written: {text}");
+        assert!(
+            !text.contains("token"),
+            "absent token is not written: {text}"
+        );
         let mut cfg = cfg;
         cfg.server.token = Some("abc".into());
         let text = toml::to_string_pretty(&cfg).unwrap();

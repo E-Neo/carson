@@ -106,9 +106,7 @@ fn extract_heredocs(src: &str) -> Result<(String, Vec<HeredocBody>), ParseError>
                         i += 1;
                     }
                 }
-                '<'
-                    if i + 1 < chars.len() && chars[i + 1] == '<' =>
-                {
+                '<' if i + 1 < chars.len() && chars[i + 1] == '<' => {
                     if i + 2 < chars.len() && chars[i + 2] == '<' {
                         // `<<<` here-string: leave for the lexer.
                         i += 3;
@@ -149,10 +147,7 @@ fn extract_heredocs(src: &str) -> Result<(String, Vec<HeredocBody>), ParseError>
                         let s = i;
                         while i < chars.len()
                             && !chars[i].is_whitespace()
-                            && !matches!(
-                                chars[i],
-                                ';' | '&' | '|' | '(' | ')' | '<' | '>' | '`'
-                            )
+                            && !matches!(chars[i], ';' | '&' | '|' | '(' | ')' | '<' | '>' | '`')
                         {
                             i += 1;
                         }
@@ -170,8 +165,7 @@ fn extract_heredocs(src: &str) -> Result<(String, Vec<HeredocBody>), ParseError>
                     let newline = i;
                     let mut cursor = newline + 1;
                     for (start, end, delim, expand, strip) in std::mem::take(&mut pending) {
-                        let (body, body_end) =
-                            scan_heredoc_body(&chars, cursor, &delim, strip)?;
+                        let (body, body_end) = scan_heredoc_body(&chars, cursor, &delim, strip)?;
                         bodies.push(HeredocBody { body, expand });
                         edits.push((start, end, cursor, body_end, expand));
                         cursor = body_end;
@@ -200,8 +194,7 @@ fn extract_heredocs(src: &str) -> Result<(String, Vec<HeredocBody>), ParseError>
     let mut body_index = 0;
     for (start, end, body_start, body_end, _expand) in edits {
         out.extend_from_slice(&chars[cursor..start]);
-        let marker: Vec<char> =
-            format!("<<<{HEREDOC_MARKER}{body_index}").chars().collect();
+        let marker: Vec<char> = format!("<<<{HEREDOC_MARKER}{body_index}").chars().collect();
         out.extend_from_slice(&marker);
         out.extend_from_slice(&chars[end..body_start]);
         body_index += 1;
@@ -252,7 +245,9 @@ fn scan_heredoc_body(
     })
 }
 
-const KEYWORDS: &[&str] = &["if", "then", "elif", "else", "fi", "for", "in", "do", "done", "while", "until", "{", "}"];
+const KEYWORDS: &[&str] = &[
+    "if", "then", "elif", "else", "fi", "for", "in", "do", "done", "while", "until", "{", "}",
+];
 
 impl Parser {
     fn peek(&self) -> &Tok {
@@ -350,7 +345,7 @@ impl Parser {
                     stages: vec![s],
                 },
                 (true, other) => {
-                    return Err(self.err(format!("cannot negate {}", describe(&other))))
+                    return Err(self.err(format!("cannot negate {}", describe(&other))));
                 }
             });
         }
@@ -360,7 +355,7 @@ impl Parser {
                 return Err(self.err(format!(
                     "unsupported command in pipeline: {}",
                     describe(&other)
-                )))
+                )));
             }
         };
         while matches!(self.peek(), Tok::Pipe) {
@@ -372,7 +367,7 @@ impl Parser {
                     return Err(self.err(format!(
                         "unsupported command in pipeline: {}",
                         describe(&other)
-                    )))
+                    )));
                 }
             }
         }
@@ -470,11 +465,7 @@ impl Parser {
         Ok(Command::For { var, words, body })
     }
 
-    fn parse_while(
-        &mut self,
-        stop_rparen: bool,
-        until: bool,
-    ) -> Result<Command, ParseError> {
+    fn parse_while(&mut self, stop_rparen: bool, until: bool) -> Result<Command, ParseError> {
         self.advance(); // while/until
         let cond = self.parse_list(&["do"], stop_rparen)?;
         if !self.consume_plain("do") {
@@ -590,7 +581,11 @@ fn make_redirect(r: super::lexer::RedirectTok, target: Word) -> Redirect {
         },
         RedirectTok::Out { fd, append } => Redirect {
             fd,
-            op: if append { RedirectOp::Append } else { RedirectOp::Out },
+            op: if append {
+                RedirectOp::Append
+            } else {
+                RedirectOp::Out
+            },
             target,
         },
         RedirectTok::Dup { fd, to } => Redirect {
@@ -611,7 +606,8 @@ fn valid_name(name: &str) -> bool {
     let Some(first) = chars.next() else {
         return false;
     };
-    (first.is_ascii_alphabetic() || first == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Split a leading `NAME=value` assignment word into (name, value-word).

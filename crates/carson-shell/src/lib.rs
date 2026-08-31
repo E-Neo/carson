@@ -24,6 +24,6 @@ pub mod lexer;
 pub mod parser;
 pub mod state;
 
-pub use exec::{Exec, NoExec, EXTERNAL_COMMANDS};
+pub use exec::{EXTERNAL_COMMANDS, Exec, NoExec};
 pub use interp::{Interp, ScriptResult, run_script, run_script_with_cwd};
 pub use state::ShellState;

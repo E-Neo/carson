@@ -6,9 +6,9 @@ use std::sync::RwLock;
 use anyhow::Result;
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Engine, Store};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi::filesystem::FsPerms;
 use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::bash_bindings::BashWorld;
 use crate::coreutils_bindings::CoreutilsWorld;
@@ -414,10 +414,8 @@ fn invoke_tool(
             let component = component.clone();
             let env = sandbox.env.clone();
             let args = args_json.to_string();
-            blocking_thread(move || async move {
-                run_tool(&engine, &component, &env, &args).await
-            })
-            .map_err(|_| "tool thread failed".to_string())?
+            blocking_thread(move || async move { run_tool(&engine, &component, &env, &args).await })
+                .map_err(|_| "tool thread failed".to_string())?
         }
         SandboxKind::Shell {
             component,

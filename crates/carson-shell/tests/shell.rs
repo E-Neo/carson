@@ -30,7 +30,9 @@ impl Exec for FakeExec {
                             Ok(bytes) => stdout.extend_from_slice(&bytes),
                             Err(e) => {
                                 let _ = e;
-                                stderr.extend_from_slice(format!("cat: {f}: no such file\n").as_bytes());
+                                stderr.extend_from_slice(
+                                    format!("cat: {f}: no such file\n").as_bytes(),
+                                );
                                 return 1;
                             }
                         }
@@ -258,11 +260,13 @@ fn if_elif_else() {
     assert_eq!(h.run("if true; then echo a; fi").out(), "a");
     assert_eq!(h.run("if false; then echo a; else echo b; fi").out(), "b");
     assert_eq!(
-        h.run("if false; then echo a; elif true; then echo b; else echo c; fi").out(),
+        h.run("if false; then echo a; elif true; then echo b; else echo c; fi")
+            .out(),
         "b"
     );
     assert_eq!(
-        h.run("if false; then echo a; elif false; then echo b; else echo c; fi").out(),
+        h.run("if false; then echo a; elif false; then echo b; else echo c; fi")
+            .out(),
         "c"
     );
 }
@@ -277,7 +281,11 @@ fn for_loop() {
 #[test]
 fn while_loop() {
     let h = Harness::new();
-    assert_eq!(h.run("n=2; while [ $n -gt 0 ]; do echo $n; n=0; done").out(), "2");
+    assert_eq!(
+        h.run("n=2; while [ $n -gt 0 ]; do echo $n; n=0; done")
+            .out(),
+        "2"
+    );
     assert_eq!(h.run("while false; do echo x; done").out(), "");
 }
 
@@ -425,7 +433,10 @@ fn brace_group() {
 #[test]
 fn comments_and_blank_lines() {
     let h = Harness::new();
-    assert_eq!(h.run("echo a # comment\n# full line\n echo b").out(), "a\nb");
+    assert_eq!(
+        h.run("echo a # comment\n# full line\n echo b").out(),
+        "a\nb"
+    );
     assert_eq!(h.run("echo a\n\n\necho b").out(), "a\nb");
 }
 

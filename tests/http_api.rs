@@ -17,10 +17,8 @@ use carson_host::registry::{AgentDef, ToolDef};
 const TEST_TOKEN: &str = "test-api-token";
 
 fn config() -> Config {
-    toml::from_str(
-        "[server]\nip = \"127.0.0.1\"\nport = 8000\ntoken = \"test-api-token\"\n",
-    )
-    .unwrap()
+    toml::from_str("[server]\nip = \"127.0.0.1\"\nport = 8000\ntoken = \"test-api-token\"\n")
+        .unwrap()
 }
 
 fn authorized(req: axum::http::request::Builder) -> axum::http::request::Builder {
@@ -109,7 +107,12 @@ async fn post(app: &Router, uri: &str, body: &str) -> (u16, Value) {
 async fn get(app: &Router, uri: &str) -> (u16, String) {
     let resp = app
         .clone()
-        .oneshot(authorized(Request::builder()).uri(uri).body(Body::empty()).unwrap())
+        .oneshot(
+            authorized(Request::builder())
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     let status = resp.status().as_u16();
@@ -376,7 +379,12 @@ async fn api_requires_bearer_token() {
     // No token: rejected.
     let resp = app
         .clone()
-        .oneshot(Request::builder().uri("/api/agents").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/agents")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 401);
@@ -722,7 +730,10 @@ async fn tools_are_grouped_and_bundled_tools_are_immutable() {
     assert_eq!(status, 200, "{body}");
     let v: Value = serde_json::from_str(&body).unwrap();
     let builtins = v["builtins"].as_array().unwrap();
-    assert!(builtins.len() >= 2, "time and bash builtins, got {builtins:?}");
+    assert!(
+        builtins.len() >= 2,
+        "time and bash builtins, got {builtins:?}"
+    );
     let time_tool_id = builtins
         .iter()
         .find(|b| b["name"] == "time")

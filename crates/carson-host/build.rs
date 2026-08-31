@@ -87,11 +87,7 @@ fn main() {
 
     // Deterministic emission order: identical content must produce identical output text.
     for (name, wasm_key, cwasm_key) in [
-        (
-            "carson_agent",
-            "CARSON_AGENT_WASM",
-            "CARSON_AGENT_CWASM",
-        ),
+        ("carson_agent", "CARSON_AGENT_WASM", "CARSON_AGENT_CWASM"),
         ("time", "CARSON_TOOL_TIME_WASM", "CARSON_TOOL_TIME_CWASM"),
         ("bash", "CARSON_TOOL_BASH_WASM", "CARSON_TOOL_BASH_CWASM"),
         (
@@ -132,7 +128,9 @@ fn precompile_if_stale(wasm: &Path, cwasm: &Path) {
         .unwrap_or_else(|e| panic!("precompile {}: {e}", wasm.display()));
     // Only rewrite when content actually differs, so the artifact mtime (and
     // therefore the rebuild fingerprint) stays stable when nothing changed.
-    let same = std::fs::read(cwasm).map(|existing| existing == compiled.as_slice()).unwrap_or(false);
+    let same = std::fs::read(cwasm)
+        .map(|existing| existing == compiled.as_slice())
+        .unwrap_or(false);
     if !same {
         std::fs::write(cwasm, &compiled)
             .unwrap_or_else(|e| panic!("write {}: {e}", cwasm.display()));

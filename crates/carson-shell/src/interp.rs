@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use crate::ast::{Command, RedirectOp, SimpleCommand, Word, WordPart};
-use crate::exec::{Exec, EXTERNAL_COMMANDS};
+use crate::exec::{EXTERNAL_COMMANDS, Exec};
 use crate::parser::parse;
-use crate::state::{read_in, write_out, In, Io, Out, ShellState, Streams};
+use crate::state::{In, Io, Out, ShellState, Streams, read_in, write_out};
 
 /// The outcome of one tool call.
 #[derive(Debug)]
@@ -127,11 +127,7 @@ impl Interp<'_> {
                     }
                 }
                 if *negated {
-                    if status == 0 {
-                        1
-                    } else {
-                        0
-                    }
+                    if status == 0 { 1 } else { 0 }
                 } else {
                     status
                 }
@@ -233,7 +229,12 @@ impl Interp<'_> {
         status
     }
 
-    pub(crate) fn dispatch(&mut self, argv: &[String], io: &Io, local_env: &HashMap<String, String>) -> i32 {
+    pub(crate) fn dispatch(
+        &mut self,
+        argv: &[String],
+        io: &Io,
+        local_env: &HashMap<String, String>,
+    ) -> i32 {
         let name = argv[0].as_str();
         match name {
             "echo" => self.builtin_echo(argv, io),
@@ -293,12 +294,20 @@ impl Interp<'_> {
         status
     }
 
-    fn apply_redirects(&mut self, io: &Io, redirects: &[crate::ast::Redirect]) -> Result<Io, String> {
+    fn apply_redirects(
+        &mut self,
+        io: &Io,
+        redirects: &[crate::ast::Redirect],
+    ) -> Result<Io, String> {
         let mut out = io.clone();
         for r in redirects {
             match &r.op {
                 RedirectOp::In => {
-                    let target = self.expand_word(&r.target).into_iter().next().unwrap_or_default();
+                    let target = self
+                        .expand_word(&r.target)
+                        .into_iter()
+                        .next()
+                        .unwrap_or_default();
                     if r.fd == 0 {
                         out.stdin = In::File(self.state.resolve(&target));
                     } else {
@@ -306,7 +315,11 @@ impl Interp<'_> {
                     }
                 }
                 RedirectOp::Out | RedirectOp::Append => {
-                    let target = self.expand_word(&r.target).into_iter().next().unwrap_or_default();
+                    let target = self
+                        .expand_word(&r.target)
+                        .into_iter()
+                        .next()
+                        .unwrap_or_default();
                     let path = self.state.resolve(&target);
                     let append = matches!(r.op, RedirectOp::Append);
                     let o = Out::File { path, append };
@@ -512,11 +525,15 @@ impl Interp<'_> {
             "#" => "0".to_string(),
             n => self.state.env.get(n).cloned().unwrap_or_default(),
         }
-    }    fn command_sub(&mut self, src: &str) -> String {
+    }
+    fn command_sub(&mut self, src: &str) -> String {
         let list = match parse(src) {
             Ok(l) => l,
             Err(e) => {
-                self.emit_str(&Out::Err, &format!("bash: syntax error in $(): {}\n", e.msg));
+                self.emit_str(
+                    &Out::Err,
+                    &format!("bash: syntax error in $(): {}\n", e.msg),
+                );
                 return String::new();
             }
         };

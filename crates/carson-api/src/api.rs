@@ -470,11 +470,7 @@ fn json_err(status: StatusCode, message: &str) -> Response {
 /// needs a valid session cookie or a bearer token.
 const AUTH_EXEMPT: [&str; 3] = ["/api/auth/login", "/api/auth/logout", "/api/health"];
 
-async fn security(
-    State(st): State<AppState>,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
+async fn security(State(st): State<AppState>, req: Request<Body>, next: Next) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
     // When a token is configured, every API path except the login/logout
     // endpoints and health requires a valid browser session or bearer token.
@@ -487,11 +483,7 @@ async fn security(
         .unwrap_or(false);
     let path = req.uri().path();
     let is_api = path == "/api" || path.starts_with("/api/");
-    if enforce
-        && is_api
-        && !AUTH_EXEMPT.contains(&path)
-        && !authorized_request(&req, &st)
-    {
+    if enforce && is_api && !AUTH_EXEMPT.contains(&path) && !authorized_request(&req, &st) {
         return json_response(StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"}));
     }
     let mut resp = next.run(req).await;
@@ -526,7 +518,11 @@ fn authorized_request(req: &Request<Body>, st: &AppState) -> bool {
 
 /// Constant-time comparison, safe against timing attacks.
 fn constant_time_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
 }
 
 fn header_bearer(req: &Request<Body>) -> Option<String> {
@@ -566,7 +562,10 @@ pub(crate) async fn login(State(st): State<AppState>, Json(req): Json<LoginReque
         return json_err(StatusCode::INTERNAL_SERVER_ERROR, "no token configured");
     };
     if st.auth.is_throttled() {
-        return json_err(StatusCode::TOO_MANY_REQUESTS, "too many attempts; try again later");
+        return json_err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many attempts; try again later",
+        );
     }
     if !constant_time_eq(&req.token, expected) {
         st.auth.record_failure();
@@ -575,12 +574,13 @@ pub(crate) async fn login(State(st): State<AppState>, Json(req): Json<LoginReque
     st.auth.clear_failures();
     let sid = st.auth.issue();
     let max_age = SESSION_COOKIE_MAX_AGE_MS / 1000;
-    let cookie = format!(
-        "{SESSION_COOKIE}={sid}; Path=/; SameSite=Lax; HttpOnly; Max-Age={max_age}"
-    );
+    let cookie =
+        format!("{SESSION_COOKIE}={sid}; Path=/; SameSite=Lax; HttpOnly; Max-Age={max_age}");
     let mut resp = json_ok(json!({"authenticated": true}));
-    resp.headers_mut()
-        .insert(SET_COOKIE, HeaderValue::from_str(&cookie).expect("cookie header"));
+    resp.headers_mut().insert(
+        SET_COOKIE,
+        HeaderValue::from_str(&cookie).expect("cookie header"),
+    );
     resp
 }
 
@@ -598,8 +598,10 @@ pub(crate) async fn logout(State(st): State<AppState>, req: Request<Body>) -> Re
     }
     let cookie = format!("{SESSION_COOKIE}=; Path=/; SameSite=Lax; HttpOnly; Max-Age=0");
     let mut resp = json_ok(json!({"authenticated": false}));
-    resp.headers_mut()
-        .insert(SET_COOKIE, HeaderValue::from_str(&cookie).expect("cookie header"));
+    resp.headers_mut().insert(
+        SET_COOKIE,
+        HeaderValue::from_str(&cookie).expect("cookie header"),
+    );
     resp
 }
 
@@ -1279,8 +1281,13 @@ pub(crate) async fn delete_tool(State(st): State<AppState>, path: ToolIdPath) ->
     )
 )]
 pub(crate) async fn list_sessions(State(st): State<AppState>) -> Response {
-    let mut sessions: Vec<(String, SessionEntry)> =
-        st.sessions.lock().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let mut sessions: Vec<(String, SessionEntry)> = st
+        .sessions
+        .lock()
+        .await
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     // Most recently active first.
     sessions.sort_by_key(|(_, e)| std::cmp::Reverse(e.updated_at));
     let sessions: Vec<Value> = sessions
@@ -1491,7 +1498,10 @@ pub(crate) async fn update_session(
             Some(name.trim().to_string())
         };
         if st.db.set_session_name(&id, name.as_deref()).is_err() {
-            return json_err(StatusCode::INTERNAL_SERVER_ERROR, "failed to rename session");
+            return json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to rename session",
+            );
         }
         entry.name = name;
     }
@@ -1500,7 +1510,10 @@ pub(crate) async fn update_session(
             return json_err(StatusCode::NOT_FOUND, "sandbox not found");
         }
         if st.db.set_session_sandbox(&id, sandbox_id).is_err() {
-            return json_err(StatusCode::INTERNAL_SERVER_ERROR, "failed to switch sandbox");
+            return json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to switch sandbox",
+            );
         }
         st.ctx
             .sandbox_links
@@ -1564,7 +1577,10 @@ pub(crate) async fn rename_sandbox(
         return json_err(StatusCode::NOT_FOUND, "sandbox not found");
     }
     if st.db.rename_sandbox(&path.id, &req.name).is_err() {
-        return json_err(StatusCode::INTERNAL_SERVER_ERROR, "failed to rename sandbox");
+        return json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to rename sandbox",
+        );
     }
     json_ok(json!({"id": path.id, "name": req.name}))
 }

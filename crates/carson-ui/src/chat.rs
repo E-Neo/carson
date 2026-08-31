@@ -732,7 +732,7 @@ pub fn ChatPage() -> impl IntoView {
     let new_sandbox_name = RwSignal::new(String::new());
     let selected_sandbox = RwSignal::new(None::<String>);
     // Which session-item (if any) has its action menu open, plus where to anchor it.
-let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
+    let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
     // Inline rename of a session-item row.
     let editing_session = RwSignal::new(None::<String>);
     let rename_draft = RwSignal::new(String::new());
@@ -1086,15 +1086,17 @@ let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
     // Toolbar title: alias (when set) plus session id and agent.
     let active_title = Memo::new(move |_| {
         let list = sessions.get();
-        let Some(sess) = list
-            .iter()
-            .find(|s| Some(&s.id) == active.get().as_ref())
-        else {
+        let Some(sess) = list.iter().find(|s| Some(&s.id) == active.get().as_ref()) else {
             return String::new();
         };
         let id = short_id(&sess.id);
         let agent = &sess.agent;
-        match sess.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        match sess
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
             Some(name) if agent.is_empty() => format!("{name} · {id}"),
             Some(name) => format!("{name} · {id} · {agent}"),
             None if agent.is_empty() => format!("Session {id}"),
@@ -1299,7 +1301,9 @@ let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
                                         follow.set(f);
                                     }
                                 >
-                                    <For each=move || messages.get() key=|e: &MsgEntry| e.id children=move |e| entry_view(&e)/>
+                                    <div class="messages-column">
+                                        <For each=move || messages.get() key=|e: &MsgEntry| e.id children=move |e| entry_view(&e)/>
+                                    </div>
                                 </div>
                                 {move || {
                                     (!follow.get() && !at_latest.get()).then(|| {
@@ -1314,23 +1318,25 @@ let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
                                     })
     }}
                                 <div class="composer">
-                                    <textarea
-                                        name="message"
-                                        aria-label="Message"
-                                        prop:value=move || input.get()
-                                        on:input=move |ev| input.set(event_target_value(&ev))
-                                        placeholder="Type a message, Enter to send"
-                                        on:keydown=move |ev| {
-                                            let key = ev.key();
-                                            if key == "Enter" && !ev.shift_key() {
-                                                ev.prevent_default();
-                                                do_send();
+                                    <div class="composer-inner">
+                                        <textarea
+                                            name="message"
+                                            aria-label="Message"
+                                            prop:value=move || input.get()
+                                            on:input=move |ev| input.set(event_target_value(&ev))
+                                            placeholder="Type a message, Enter to send"
+                                            on:keydown=move |ev| {
+                                                let key = ev.key();
+                                                if key == "Enter" && !ev.shift_key() {
+                                                    ev.prevent_default();
+                                                    do_send();
+                                                }
                                             }
-                                        }
-                                    ></textarea>
-                                    <button class="btn primary" disabled=move || running.get() on:click=move |_| do_send()>
-                                        "Send"
-                                    </button>
+                                        ></textarea>
+                                        <button class="btn primary" disabled=move || running.get() on:click=move |_| do_send()>
+                                            "Send"
+                                        </button>
+                                    </div>
                                 </div>
                                 <div class="statusbar">
                                     {move || status_line.get().map(|s| view! { <span class="status-line">{s}</span> })}

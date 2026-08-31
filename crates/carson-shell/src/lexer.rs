@@ -7,11 +7,21 @@ use crate::ast::{Word, WordPart};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedirectTok {
-    In { fd: u32 },
-    Out { fd: u32, append: bool },
-    Dup { fd: u32, to: u32 },
+    In {
+        fd: u32,
+    },
+    Out {
+        fd: u32,
+        append: bool,
+    },
+    Dup {
+        fd: u32,
+        to: u32,
+    },
     /// `<<<word`: here-string feeding `word\n` to stdin.
-    HereString { fd: u32 },
+    HereString {
+        fd: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,7 +80,9 @@ impl Lexer {
             }
             return self.next();
         }
-        if c.is_ascii_digit() && let Some(tok) = self.try_digit_redirect()? {
+        if c.is_ascii_digit()
+            && let Some(tok) = self.try_digit_redirect()?
+        {
             return Ok(tok);
         }
         match c {
@@ -118,7 +130,10 @@ impl Lexer {
             '>' => {
                 self.pos += 1;
                 if self.eat('>') {
-                    Ok(Tok::Redir(RedirectTok::Out { fd: 1, append: true }))
+                    Ok(Tok::Redir(RedirectTok::Out {
+                        fd: 1,
+                        append: true,
+                    }))
                 } else if self.eat('&') {
                     let to_start = self.pos;
                     while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
@@ -131,7 +146,10 @@ impl Lexer {
                         .unwrap_or(0);
                     Ok(Tok::Redir(RedirectTok::Dup { fd: 1, to }))
                 } else {
-                    Ok(Tok::Redir(RedirectTok::Out { fd: 1, append: false }))
+                    Ok(Tok::Redir(RedirectTok::Out {
+                        fd: 1,
+                        append: false,
+                    }))
                 }
             }
             _ => Ok(Tok::Word(self.scan_word()?)),
@@ -156,7 +174,11 @@ impl Lexer {
         while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
             self.pos += 1;
         }
-        let fd: u32 = self.src[start..self.pos].iter().collect::<String>().parse().unwrap_or(0);
+        let fd: u32 = self.src[start..self.pos]
+            .iter()
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0);
         let tok = match self.peek() {
             Some('>') => {
                 self.pos += 1;
@@ -195,8 +217,16 @@ impl Lexer {
             let Some(c) = self.peek() else {
                 break;
             };
-            if c == ' ' || c == '\t' || c == '\n' || c == ';' || c == '&' || c == '|'
-                || c == '(' || c == ')' || c == '<' || c == '>'
+            if c == ' '
+                || c == '\t'
+                || c == '\n'
+                || c == ';'
+                || c == '&'
+                || c == '|'
+                || c == '('
+                || c == ')'
+                || c == '<'
+                || c == '>'
             {
                 break;
             }

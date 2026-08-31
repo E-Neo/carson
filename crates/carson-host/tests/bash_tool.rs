@@ -159,7 +159,10 @@ fn vfs_layout_bin_tmp_home() {
     let (out, err, code) = run_bash(&runner, "ls /bin");
     assert_eq!(code, 0, "stderr: {err}");
     for cmd in ["ls", "cat", "sort", "wc", "date"] {
-        assert!(out.lines().any(|l| l == cmd), "expected {cmd} in /bin, got:\n{out}");
+        assert!(
+            out.lines().any(|l| l == cmd),
+            "expected {cmd} in /bin, got:\n{out}"
+        );
     }
 
     let (out, err, code) = run_bash(&runner, "test -d /tmp && test -d /home/carson && echo ok");
@@ -206,9 +209,6 @@ fn every_coreutils_command_runs_without_trapping() {
     for cmd in carson_shell::EXTERNAL_COMMANDS {
         let script = format!("{cmd} --version");
         let (out, err, code) = run_bash(&runner, &script);
-        assert!(
-            code != 126,
-            "{cmd} trapped: out={out:?} err={err:?}"
-        );
+        assert!(code != 126, "{cmd} trapped: out={out:?} err={err:?}");
     }
 }

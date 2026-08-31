@@ -2,8 +2,8 @@
 //! write to the active output sink.
 use std::collections::HashMap;
 
-use crate::state::{Io, ShellState};
 use crate::Interp;
+use crate::state::{Io, ShellState};
 
 /// Validate a shell variable name.
 pub(crate) fn valid_name(name: &str) -> bool {

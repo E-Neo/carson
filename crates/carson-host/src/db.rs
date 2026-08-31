@@ -611,8 +611,7 @@ impl Db {
     /// All sandboxes in the pool, ordered by name.
     pub fn list_sandboxes(&self) -> Result<Vec<Sandbox>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT id, name, created_at FROM sandboxes ORDER BY name")?;
+        let mut stmt = conn.prepare("SELECT id, name, created_at FROM sandboxes ORDER BY name")?;
         let rows = stmt.query_map([], |row| {
             Ok(Sandbox {
                 id: row.get(0)?,
@@ -651,8 +650,7 @@ impl Db {
     /// The display name of a sandbox, if it exists.
     pub fn sandbox_name(&self, id: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT name FROM sandboxes WHERE id = ?1")?;
+        let mut stmt = conn.prepare("SELECT name FROM sandboxes WHERE id = ?1")?;
         let mut rows = stmt.query_map(params![id], |row| row.get::<_, String>(0))?;
         Ok(rows.next().transpose()?)
     }
