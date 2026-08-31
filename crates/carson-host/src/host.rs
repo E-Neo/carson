@@ -27,18 +27,20 @@ use crate::tools::{Capabilities, ToolRunner};
 
 /// The single agent module, precompiled by `build.rs`; baked into the binary.
 pub const EMBEDDED_AGENT: &[u8] = include_bytes!(env!("CARSON_AGENT_CWASM"));
-// Force a rebuild whenever the embedded artifact content changes.
-const _: &str = env!("CARSON_AGENT_CWASM_FNV");
+// Key the rebuild on the deterministic cargo-built wasm, not the cwasm
+// (whose precompiled bytes may repeat/reorder across runs). When the wasm
+// changes, the FNV changes and carson recompiles, picking up the fresh cwasm.
+const _: &str = env!("CARSON_AGENT_WASM_FNV");
 
 /// Built-in tool component, precompiled by `build.rs`.
 pub const EMBEDDED_TIME_TOOL: &[u8] = include_bytes!(env!("CARSON_TOOL_TIME_CWASM"));
-const _: &str = env!("CARSON_TOOL_TIME_CWASM_FNV");
+const _: &str = env!("CARSON_TOOL_TIME_WASM_FNV");
 
 /// The bash interpreter component and its coreutils runner.
 pub const EMBEDDED_BASH_TOOL: &[u8] = include_bytes!(env!("CARSON_TOOL_BASH_CWASM"));
-const _: &str = env!("CARSON_TOOL_BASH_CWASM_FNV");
+const _: &str = env!("CARSON_TOOL_BASH_WASM_FNV");
 pub const EMBEDDED_COREUTILS: &[u8] = include_bytes!(env!("CARSON_TOOL_COREUTILS_CWASM"));
-const _: &str = env!("CARSON_TOOL_COREUTILS_CWASM_FNV");
+const _: &str = env!("CARSON_TOOL_COREUTILS_WASM_FNV");
 
 /// Returns the embedded bytes for a built-in tool, if any.
 pub fn embedded_tool(name: &str) -> Option<&'static [u8]> {

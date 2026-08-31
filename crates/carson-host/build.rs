@@ -130,9 +130,14 @@ fn precompile_if_stale(wasm: &Path, cwasm: &Path) {
     let compiled = engine
         .precompile_component(&bytes)
         .unwrap_or_else(|e| panic!("precompile {}: {e}", wasm.display()));
-    std::fs::write(cwasm, &compiled)
-        .unwrap_or_else(|e| panic!("write {}: {e}", cwasm.display()));
-    println!("cargo:rerun-if-changed={}", wasm.display());
+    // Only rewrite when content actually differs, so the artifact mtime (and
+    // therefore the rebuild fingerprint) stays stable when nothing changed.
+    let same = std::fs::read(cwasm).map(|existing| existing == compiled.as_slice()).unwrap_or(false);
+    if !same {
+        std::fs::write(cwasm, &compiled)
+            .unwrap_or_else(|e| panic!("write {}: {e}", cwasm.display()));
+        println!("cargo:rerun-if-changed={}", wasm.display());
+    }
 }
 
 /// Build the wasm packages with a nested cargo invocation.
