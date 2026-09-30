@@ -16,7 +16,7 @@ serde_json.workspace = true
 toml.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-utoipa = { version = "5", features = ["macros"] }
+utoipa = { version = "6", features = ["macros"] }
 wasmtime.workspace = true
 wasmtime-wasi.workspace = true
 uuid = { workspace = true, features = ["v4", "v5"] }

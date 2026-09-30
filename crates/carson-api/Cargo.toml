@@ -17,8 +17,8 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-utoipa = { version = "5", features = ["axum_extras", "macros"] }
-utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
+utoipa = { version = "6", features = ["axum_extras", "macros"] }
+utoipa-swagger-ui = { version = "10", features = ["axum", "vendored"] }
 
 [dev-dependencies]
 toml.workspace = true
