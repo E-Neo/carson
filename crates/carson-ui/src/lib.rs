@@ -10,6 +10,7 @@ pub mod chat;
 pub mod login;
 pub mod shell;
 pub mod sse;
+pub mod theme;
 pub mod types;
 
 /// Root-owned authentication state shared by every page. `None` while probing
@@ -41,6 +42,7 @@ pub async fn logout() {
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn main() {
     console_error_panic_hook::set_once();
+    theme::init_theme();
     mount_to_body(App);
 }
 

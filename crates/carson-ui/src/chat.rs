@@ -1113,6 +1113,7 @@ pub fn ChatPage() -> impl IntoView {
                 >
                     <div class="brand-row">
                         <h1>"Carson"</h1>
+                        <crate::theme::ThemeToggle/>
                         <div class="sub">"Chat"</div>
                     </div>
                     <button class="btn primary" on:click=move |_| new_chat()>"+ New chat"</button>

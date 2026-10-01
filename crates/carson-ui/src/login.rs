@@ -47,7 +47,10 @@ pub fn LoginPage() -> impl IntoView {
                     submit();
                 }
             >
-                <h1>"Carson"</h1>
+                <div class="login-head">
+                    <h1>"Carson"</h1>
+                    <crate::theme::ThemeToggle/>
+                </div>
                 <p class="login-sub">"Sign in with the API token from config.toml"</p>
                 <input
                     name="token"

@@ -1,4 +1,20 @@
 :root {
+  color-scheme: light;
+  --bg: #f6f7f9;
+  --bg-panel: #ffffff;
+  --bg-input: #eef0f4;
+  --border: #d5dae3;
+  --text: #1c1f26;
+  --text-dim: #5b6373;
+  --accent: #2563eb;
+  --accent-dim: #dce7fd;
+  --danger: #dc2626;
+  --ok: #16a34a;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
   --bg: #0f1117;
   --bg-panel: #171a23;
   --bg-input: #1d212c;
@@ -9,7 +25,6 @@
   --accent-dim: #2a4a8a;
   --danger: #e5534b;
   --ok: #57ab5a;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 * { box-sizing: border-box; }
@@ -77,12 +92,21 @@ body {
   overflow-y: auto;
 }
 
+.brand-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 8px;
+}
+
 .brand-row h1 {
+  flex: 1;
   font-size: 18px;
   margin: 0;
 }
 
 .brand-row .sub {
+  flex-basis: 100%;
   color: var(--text-dim);
   font-size: 12px;
   margin-bottom: 8px;
@@ -248,7 +272,7 @@ body {
   line-height: 1.45;
 }
 
-.msg.user { align-self: flex-end; background: var(--accent); }
+.msg.user { align-self: flex-end; background: var(--accent); color: #fff; }
 
 .msg.assistant {
   align-self: flex-start;
@@ -436,7 +460,9 @@ body {
 
 .btn:hover { border-color: var(--accent); }
 
-.btn.primary { background: var(--accent); border-color: var(--accent); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+.btn.primary:hover { border-color: var(--accent); }
 
 .btn.danger { background: transparent; border-color: var(--danger); color: var(--danger); }
 
@@ -758,6 +784,25 @@ body {
 
 .logout-link:hover { border-color: var(--danger); color: var(--danger); }
 
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.theme-toggle:hover { border-color: var(--accent); color: var(--text); }
+
 .boot {
   display: none;
 }
@@ -782,7 +827,14 @@ body {
   background: var(--bg-panel);
 }
 
+.login-card .login-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .login-card h1 {
+  flex: 1;
   margin: 0;
   font-size: 22px;
   text-align: center;

@@ -171,6 +171,7 @@ pub fn AdminPage() -> impl IntoView {
             >
                 <div class="brand-row">
                     <h1>"Carson"</h1>
+                    <crate::theme::ThemeToggle/>
                     <div class="sub">"Admin"</div>
                 </div>
                 <button class=tab_class("status") on:click=move |_| pick_tab("status")>"Status"</button>
