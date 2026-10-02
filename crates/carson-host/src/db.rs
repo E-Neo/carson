@@ -77,6 +77,10 @@ CREATE TABLE IF NOT EXISTS messages (
     finished_at INTEGER,
     PRIMARY KEY (session_id, seq)
 );
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 "#;
 
 fn now_ms() -> i64 {
@@ -674,6 +678,28 @@ impl Db {
         )?;
         Ok(())
     }
+
+    /// Read a persisted key-value setting.
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?1")?;
+        let mut rows = stmt.query([key])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Upsert a key-value setting.
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -923,5 +949,19 @@ mod tests {
         assert_eq!(fetched.name, "websearch");
         assert_eq!(db.delete_tool(&def.id).unwrap(), 1);
         assert!(db.list_tools().unwrap().is_empty());
+    }
+
+    #[test]
+    fn settings_upsert_roundtrip() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(db.get_setting("ui.theme").unwrap(), None);
+        db.set_setting("ui.theme", "dark").unwrap();
+        assert_eq!(db.get_setting("ui.theme").unwrap().as_deref(), Some("dark"));
+        db.set_setting("ui.theme", "light").unwrap();
+        assert_eq!(
+            db.get_setting("ui.theme").unwrap().as_deref(),
+            Some("light")
+        );
+        assert_eq!(db.get_setting("missing").unwrap(), None);
     }
 }

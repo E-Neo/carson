@@ -157,6 +157,7 @@ pub(crate) struct ToolIdPath {
         health,
         status,
         config_info,
+        update_config,
         login,
         logout,
         me,
@@ -197,6 +198,7 @@ pub(crate) struct ToolIdPath {
         ProviderListResponse,
         ToolListResponse,
         ConfigResponse,
+        ConfigUpdateReq,
         AgentListResponse,
         AgentCommandResponse,
         AgentDeleteResponse,
@@ -274,10 +276,19 @@ pub struct ToolCommandResponse {
 
 #[derive(ToSchema)]
 #[schema(example = json!({
-    "bind": "127.0.0.1:8000"
+    "bind": "127.0.0.1:8000",
+    "theme": "light"
 }))]
 pub struct ConfigResponse {
     pub bind: String,
+    pub theme: String,
+}
+
+/// Body for updating effective configuration (currently just the UI theme).
+#[derive(Deserialize, ToSchema)]
+#[schema(example = json!({"theme": "dark"}))]
+pub struct ConfigUpdateReq {
+    pub theme: String,
 }
 
 #[derive(ToSchema)]
@@ -408,7 +419,7 @@ pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/api/health", get(health))
         .route("/api/status", get(status))
-        .route("/api/config", get(config_info))
+        .route("/api/config", get(config_info).put(update_config))
         .route("/api/agents", get(list_agents).post(create_agent))
         .route(AgentNamePath::PATH, put(update_agent).delete(delete_agent))
         .route(AgentVersionsPath::PATH, get(list_agent_versions))
@@ -676,7 +687,48 @@ pub(crate) async fn status(State(st): State<AppState>) -> Response {
 pub(crate) async fn config_info(State(st): State<AppState>) -> Response {
     json_ok(json!({
         "bind": st.cfg.server.bind().to_string(),
+        "theme": ui_theme(&st),
     }))
+}
+
+/// Update effective configuration (currently the UI theme, validated to
+/// `light` or `dark`).
+#[utoipa::path(
+    put,
+    path = "/api/config",
+    request_body = ConfigUpdateReq,
+    responses(
+        (status = 200, description = "Configuration updated", body = ConfigResponse),
+        (status = 400, description = "Invalid theme", body = ErrorResponse),
+        (status = 500, description = "Db failure", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn update_config(
+    State(st): State<AppState>,
+    Json(req): Json<ConfigUpdateReq>,
+) -> Response {
+    let theme = req.theme;
+    if theme != "light" && theme != "dark" {
+        return json_err(StatusCode::BAD_REQUEST, "theme must be 'light' or 'dark'");
+    }
+    if let Err(err) = st.db.set_setting("ui.theme", &theme) {
+        return json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("db error: {err}"),
+        );
+    }
+    json_ok(json!({
+        "bind": st.cfg.server.bind().to_string(),
+        "theme": theme,
+    }))
+}
+
+/// The persisted UI theme, defaulting to `light`.
+fn ui_theme(st: &AppState) -> &'static str {
+    match st.db.get_setting("ui.theme") {
+        Ok(Some(v)) if v == "dark" => "dark",
+        _ => "light",
+    }
 }
 
 fn agent_json(def: &AgentDef) -> Value {
@@ -2095,6 +2147,25 @@ mod tests {
             let (status, _, body) = read(response(app.clone(), path).await).await;
             assert_eq!(status, StatusCode::OK, "{path}: {body}");
         }
+    }
+
+    #[tokio::test]
+    async fn config_theme_defaults_light_and_persists() {
+        let app = router(app_state().await);
+        let (status, _, body) = read(response(app.clone(), "/api/config").await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"theme\":\"light\""), "{body}");
+
+        let (status, _, body) = read(put(&app, "/api/config", r#"{"theme":"dark"}"#).await).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("\"theme\":\"dark\""), "{body}");
+
+        let (_, _, body) = read(response(app.clone(), "/api/config").await).await;
+        assert!(body.contains("\"theme\":\"dark\""), "persisted: {body}");
+
+        // Invalid theme is rejected.
+        let (status, _, _) = read(put(&app, "/api/config", r#"{"theme":"blue"}"#).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

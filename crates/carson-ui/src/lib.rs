@@ -50,6 +50,13 @@ pub fn main() {
 pub fn App() -> impl IntoView {
     shell::init_shell();
     probe_auth();
+    // Load the DB-persisted theme once authenticated (initial load or after
+    // signing in); before then the light default is in effect.
+    Effect::new(move |_| {
+        if auth().get() == Some(true) {
+            spawn_local(theme::load_from_server());
+        }
+    });
     view! {
         <Router>
             {move || match auth().get() {
