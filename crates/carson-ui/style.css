@@ -274,6 +274,10 @@ body {
 
 .msg.user { align-self: flex-end; background: var(--accent); color: #fff; }
 
+/* Timestamp + duration stay readable on the accent user bubble in both themes. */
+.msg.user .msg-start,
+.msg.user .msg-dur { color: rgba(255, 255, 255, 0.85); }
+
 .msg.assistant {
   align-self: flex-start;
   background: var(--bg-panel);
