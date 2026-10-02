@@ -26,19 +26,24 @@ use utoipa_swagger_ui::SwaggerUi;
 #[derive(Deserialize, ToSchema)]
 pub struct CreateSessionReq {
     agent: String,
+    /// The session's model in `provider/model` form. The agent no longer owns
+    /// a model; the session is created with one and it can be switched later.
+    model: String,
     /// Link the session to an existing sandbox; omitted creates a fresh one.
     #[serde(default)]
     sandbox_id: Option<String>,
 }
 
-/// Rename a session and/or point it at a different sandbox. Omitted fields
-/// leave the corresponding setting unchanged.
+/// Rename a session and/or point it at a different sandbox or model. Omitted
+/// fields leave the corresponding setting unchanged.
 #[derive(Deserialize, ToSchema)]
 pub struct SessionUpdateReq {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
     sandbox_id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// Create or rename a sandbox by its display alias.
@@ -331,11 +336,17 @@ pub struct SessionListResponse {
 }
 
 #[derive(ToSchema)]
-#[schema(example = json!({"session_id": "<uuid>", "agent": "assistant", "agent_version_id": "<uuid>"}))]
+#[schema(example = json!({
+    "session_id": "<uuid>",
+    "agent": "assistant",
+    "agent_version_id": "<uuid>",
+    "model": "groq/llama-3"
+}))]
 pub struct SessionCreateResponse {
     pub session_id: String,
     pub agent: String,
     pub agent_version_id: String,
+    pub model: String,
 }
 
 /// One entry of the conversation block log.
@@ -347,6 +358,7 @@ pub struct SessionCreateResponse {
     "tool_name": null,
     "arguments": null,
     "is_error": false,
+    "model": "groq/llama-3",
     "input_tokens": 10,
     "cache_read_tokens": 0,
     "cache_creation_tokens": 0,
@@ -361,6 +373,8 @@ pub struct BlockInfo {
     pub tool_name: Option<String>,
     pub arguments: Option<String>,
     pub is_error: bool,
+    /// The model that produced this block.
+    pub model: String,
     pub input_tokens: u32,
     pub cache_read_tokens: u32,
     pub cache_creation_tokens: u32,
@@ -382,7 +396,7 @@ pub struct SessionResponse {
     pub session_id: String,
     pub agent: String,
     pub agent_version_id: String,
-    pub model: Option<String>,
+    pub model: String,
     pub message_count: usize,
     pub messages: Vec<BlockInfo>,
 }
@@ -736,7 +750,6 @@ fn agent_json(def: &AgentDef) -> Value {
         "id": def.id,
         "name": def.name,
         "system_prompt": def.system_prompt,
-        "model": def.model,
         "instances": def.instances,
         "max_history": def.max_history,
         "context_window": def.context_window,
@@ -807,7 +820,7 @@ pub(crate) async fn list_agent_versions(
     request_body = AgentDef,
     responses(
         (status = 201, description = "Agent created", body = AgentCommandResponse),
-        (status = 400, description = "Model is not in 'provider/model' form or the provider is unknown", body = ErrorResponse),
+        (status = 400, description = "Invalid agent name or capabilities", body = ErrorResponse),
         (status = 500, description = "Agent build or db failure", body = ErrorResponse)
     )
 )]
@@ -825,9 +838,6 @@ pub(crate) async fn create_agent(
         .unwrap_or(false)
     {
         return json_err(StatusCode::CONFLICT, "agent name already exists");
-    }
-    if let Some(err) = validate_agent_model(&st, &def) {
-        return json_err(StatusCode::BAD_REQUEST, err);
     }
     if let Some(err) = validate_agent_caps(&st, &def) {
         return json_err(StatusCode::BAD_REQUEST, &err);
@@ -895,9 +905,10 @@ fn validate_agent_caps(st: &AppState, def: &AgentDef) -> Option<String> {
     None
 }
 
-/// Validate that the agent's model is `provider/model` and the provider is registered.
-fn validate_agent_model(st: &AppState, def: &AgentDef) -> Option<&'static str> {
-    let Some((provider, model)) = def.model.split_once('/') else {
+/// Validate that a session model is `provider/model` and the provider is
+/// registered.
+fn validate_session_model(st: &AppState, model: &str) -> Option<&'static str> {
+    let Some((provider, model)) = model.split_once('/') else {
         return Some("model must be in 'provider/model' form");
     };
     if provider.is_empty() || model.is_empty() {
@@ -920,7 +931,7 @@ fn validate_agent_model(st: &AppState, def: &AgentDef) -> Option<&'static str> {
     request_body = AgentDef,
     responses(
         (status = 200, description = "New version created and pointer moved", body = AgentCommandResponse),
-        (status = 400, description = "Name mismatch or invalid model", body = ErrorResponse),
+        (status = 400, description = "Name mismatch or invalid capabilities", body = ErrorResponse),
         (status = 404, description = "Unknown agent name", body = ErrorResponse)
     )
 )]
@@ -939,9 +950,6 @@ pub(crate) async fn update_agent(
         .unwrap_or(true)
     {
         return json_err(StatusCode::NOT_FOUND, "unknown agent name");
-    }
-    if let Some(err) = validate_agent_model(&st, &def) {
-        return json_err(StatusCode::BAD_REQUEST, err);
     }
     if let Some(err) = validate_agent_caps(&st, &def) {
         return json_err(StatusCode::BAD_REQUEST, &err);
@@ -1373,13 +1381,17 @@ pub(crate) async fn create_session(
     let Some(def) = st.db.current_agent(&req.agent).ok().flatten() else {
         return json_err(StatusCode::NOT_FOUND, "unknown agent name");
     };
+    let model = req.model.trim().to_string();
+    if let Some(err) = validate_session_model(&st, &model) {
+        return json_err(StatusCode::BAD_REQUEST, err);
+    }
     let pool = match carson_host::registry::get_or_build_pool(&st.ctx, &st.registry, &def).await {
         Ok(pool) => pool,
         Err(err) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
     };
     let instance = pool.next();
     let session_id = uuid::Uuid::new_v4().to_string();
-    let config = pool.config();
+    let config = pool.config(&model);
 
     // Resolve the session's sandbox: link an existing one or mint a fresh
     // sandbox. The directory itself is created lazily on first tool use.
@@ -1419,6 +1431,7 @@ pub(crate) async fn create_session(
                     agent_version_id: def.id.clone(),
                     name: None,
                     sandbox_id: sandbox_id.clone(),
+                    model: model.clone(),
                     updated_at: host::ms_since_epoch(),
                     instance: instance.clone(),
                 },
@@ -1429,6 +1442,7 @@ pub(crate) async fn create_session(
                 "session_id": session_id,
                 "agent": def.name,
                 "agent_version_id": def.id,
+                "model": model,
                 "sandbox_id": sandbox_id,
             }))
         }
@@ -1471,13 +1485,8 @@ pub(crate) async fn get_session(State(st): State<AppState>, path: SessionPath) -
         Ok((Ok(blocks),)) => blocks,
         _ => return json_err(StatusCode::NOT_FOUND, "session not found"),
     };
-    // Model metadata derives from the pinned agent version, never stored per block.
-    let model = st
-        .db
-        .get_agent_version(&entry.agent_version_id)
-        .ok()
-        .flatten()
-        .map(|def| def.model);
+    // The session's own model (switchable), not derived from the agent.
+    let model = entry.model.clone();
     // Tool blocks carry their identity/payload as a JSON envelope inside the
     // content; project it back into flat fields for clients.
     let messages: Vec<Value> = blocks
@@ -1496,6 +1505,7 @@ pub(crate) async fn get_session(State(st): State<AppState>, path: SessionPath) -
                 "tool_name": payload.get("name").and_then(|v| v.as_str()),
                 "arguments": payload.get("arguments").and_then(|v| v.as_str()),
                 "is_error": payload.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false),
+                "model": b.model,
                 "input_tokens": b.input_tokens,
                 "cache_read_tokens": b.cache_read_tokens,
                 "cache_creation_tokens": b.cache_creation_tokens,
@@ -1517,16 +1527,18 @@ pub(crate) async fn get_session(State(st): State<AppState>, path: SessionPath) -
     }))
 }
 
-/// Destroy a session.
+/// Update a session's name, sandbox and/or model.
 #[utoipa::path(
-    delete,
+    put,
     path = "/api/sessions/{id}",
     params(
         ("id" = String, Path, description = "Session id")
     ),
+    request_body = SessionUpdateReq,
     responses(
-        (status = 200, description = "Session deleted", body = SessionCommandResponse),
-        (status = 404, description = "Session not found", body = ErrorResponse)
+        (status = 200, description = "Session updated", body = SessionCommandResponse),
+        (status = 400, description = "Invalid model", body = ErrorResponse),
+        (status = 404, description = "Session or sandbox not found", body = ErrorResponse)
     )
 )]
 pub(crate) async fn update_session(
@@ -1574,11 +1586,38 @@ pub(crate) async fn update_session(
             .insert(id.clone(), sandbox_id.clone());
         entry.sandbox_id = sandbox_id.clone();
     }
+    if let Some(model) = &req.model {
+        let model = model.trim().to_string();
+        if let Some(err) = validate_session_model(&st, &model) {
+            return json_err(StatusCode::BAD_REQUEST, err);
+        }
+        if st.db.set_session_model(&id, &model).is_err() {
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, "failed to switch model");
+        }
+        // Push the new model into the live wasm session so the next turn uses it.
+        let mut store = entry.instance.store.lock().await;
+        let guest = entry.instance.agent.carson_agent_agent();
+        let result = guest
+            .func_set_model()
+            .call_async(&mut *store, (&id, &model))
+            .await;
+        drop(store);
+        match result {
+            Ok((Ok(()),)) => entry.model = model,
+            _ => {
+                return json_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to update agent session",
+                );
+            }
+        }
+    }
     st.sessions.lock().await.insert(id.clone(), entry.clone());
     json_ok(json!({
         "session_id": id,
         "name": entry.name,
         "sandbox_id": entry.sandbox_id,
+        "model": entry.model,
     }))
 }
 
@@ -1794,7 +1833,8 @@ async fn sync_session_agent(st: &AppState, id: &str, entry: &SessionEntry) -> Se
 
     let instance = pool.next();
     instance.stop.store(false, Ordering::SeqCst);
-    if let Err(err) = host::restore_session(&instance, id, &persisted, &pool.config()).await {
+    let model = entry.model.clone();
+    if let Err(err) = host::restore_session(&instance, id, &persisted, &pool.config(&model)).await {
         tracing::warn!(session = %id, error = %err, "agent sync failed; staying on pinned version");
         return entry.clone();
     }
@@ -1804,6 +1844,7 @@ async fn sync_session_agent(st: &AppState, id: &str, entry: &SessionEntry) -> Se
         agent_version_id: def.id.clone(),
         name: entry.name.clone(),
         sandbox_id: entry.sandbox_id.clone(),
+        model,
         updated_at: entry.updated_at,
         instance,
     };

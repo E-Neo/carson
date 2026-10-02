@@ -765,6 +765,13 @@ body {
   letter-spacing: 0.05em;
 }
 
+.msg-model {
+  color: var(--text-dim);
+  font-size: 11px;
+  font-family: var(--mono);
+  margin-left: auto;
+}
+
 .msg-dur {
   margin-top: 4px;
   text-align: right;

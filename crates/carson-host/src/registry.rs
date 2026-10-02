@@ -22,7 +22,6 @@ pub struct AgentDef {
     pub name: String,
     #[serde(default)]
     pub system_prompt: String,
-    pub model: String,
     #[serde(default = "default_instances")]
     pub instances: usize,
     #[serde(default = "default_history")]
@@ -115,12 +114,16 @@ impl AgentPool {
         }
     }
 
-    /// The guest session config derived from this pool's agent definition.
-    pub fn config(&self) -> crate::bindings::exports::carson::agent::agent::SessionConfig {
+    /// The guest session config derived from this pool's agent definition,
+    /// with the session's model (the agent no longer owns one).
+    pub fn config(
+        &self,
+        model: &str,
+    ) -> crate::bindings::exports::carson::agent::agent::SessionConfig {
         crate::bindings::exports::carson::agent::agent::SessionConfig {
             agent_version_id: self.version_id.clone(),
             system_prompt: self.def.system_prompt.clone(),
-            model: self.def.model.clone(),
+            model: model.to_string(),
             capabilities_json: serde_json::json!(self.def.capabilities).to_string(),
             max_history: self.def.max_history as u32,
             context_window: self.def.context_window as u32,

@@ -111,9 +111,12 @@ interface agent {
     ///
     /// `kind` is one of "user", "thinking", "text", "tool-use", "tool-result"
     /// or "system". Token counters carry the usage of the LLM call that
-    /// produced the block (zero for user/tool-result entries).
+    /// produced the block (zero for user/tool-result entries). `model` is the
+    /// session's model at the time the block was produced, so history records
+    /// which model generated each part.
     record block {
         agent-version-id: string,
+        model: string,
         kind: string,
         text: option<string>,
         input-tokens: u32,
@@ -145,6 +148,7 @@ interface agent {
     reset-session: func(session-id: string) -> result<_, error>;
     handle-message: func(session-id: string, message: string) -> result<_, error>;
     destroy-session: func(session-id: string) -> result<_, error>;
+    set-model: func(session-id: string, model: string) -> result<_, error>;
 }
 
 world agent-world {

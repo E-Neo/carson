@@ -11,7 +11,6 @@ fn coder_def() -> AgentDef {
         id: uuid::Uuid::new_v4().to_string(),
         name: "coder".into(),
         system_prompt: "You are a coding agent.".into(),
-        model: "mock/mock".into(),
         instances: 1,
         max_history: 40,
         context_window: 128_000,
@@ -56,7 +55,7 @@ async fn create_session_for(instance: &AgentInstance, session_id: &str, agent: &
     let config = SessionConfig {
         agent_version_id: agent.id.clone(),
         system_prompt: agent.system_prompt.clone(),
-        model: agent.model.clone(),
+        model: "mock/mock".into(),
         capabilities_json: "[]".into(),
         max_history: agent.max_history as u32,
         context_window: agent.context_window as u32,
@@ -174,6 +173,60 @@ async fn history_records_the_conversation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_model_stamps_new_blocks_and_rejects_unknown_sessions() {
+    let (_hub, _registry, instance) = setup().await;
+    // A second provider alias so a switched model still resolves to a driver.
+    instance
+        .store
+        .lock()
+        .await
+        .data()
+        .drivers
+        .write()
+        .unwrap()
+        .insert("other".to_string(), Arc::new(EchoDriver));
+    create_session(&instance, "s").await;
+    let _ = send_message(&instance, &_hub, "s", "first").await;
+
+    let mut store = instance.store.lock().await;
+    let guest = instance.agent.carson_agent_agent();
+    let (result,) = guest
+        .func_set_model()
+        .call_async(&mut *store, ("s", "other/model"))
+        .await
+        .unwrap();
+    assert_eq!(result, Ok(()));
+
+    let (result,) = guest
+        .func_set_model()
+        .call_async(&mut *store, ("missing", "other/model"))
+        .await
+        .unwrap();
+    assert!(matches!(result, Err(Error::NotFound)));
+    drop(store);
+
+    let _ = send_message(&instance, &_hub, "s", "second").await;
+    let mut store = instance.store.lock().await;
+    let guest = instance.agent.carson_agent_agent();
+    let (result,) = guest
+        .func_session_history()
+        .call_async(&mut *store, ("s",))
+        .await
+        .unwrap();
+    drop(store);
+    let blocks = result.unwrap();
+    let models: Vec<&str> = blocks.iter().map(|b| b.model.as_str()).collect();
+    assert!(
+        models.iter().take(2).all(|m| *m == "mock/mock"),
+        "old blocks keep their original model: {models:?}"
+    );
+    assert!(
+        blocks[2..].iter().all(|b| b.model == "other/model"),
+        "blocks after the switch use the new model: {models:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reset_clears_history() {
     let (_hub, _registry, instance) = setup().await;
     create_session(&instance, "4").await;
@@ -242,7 +295,6 @@ fn compaction_def(max_history: usize, context_window: usize, auto_compact: bool)
         id: uuid::Uuid::new_v4().to_string(),
         name: "coder".into(),
         system_prompt: "You are a coding agent.".into(),
-        model: "mock/mock".into(),
         instances: 1,
         max_history,
         context_window,

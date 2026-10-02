@@ -185,8 +185,21 @@ async fn main() -> Result<()> {
             }
         };
         let instance = pool.next();
-        if let Err(err) =
-            host::restore_session(&instance, &persisted.id, &persisted, &pool.config()).await
+        if persisted.model.is_empty() {
+            tracing::warn!(
+                id = %persisted.id,
+                version = %persisted.agent_version_id,
+                "dropping persisted session with no model"
+            );
+            continue;
+        }
+        if let Err(err) = host::restore_session(
+            &instance,
+            &persisted.id,
+            &persisted,
+            &pool.config(&persisted.model),
+        )
+        .await
         {
             tracing::warn!(id = %persisted.id, error = %err, "failed to restore session");
             continue;
@@ -224,6 +237,7 @@ async fn main() -> Result<()> {
                 agent_version_id: persisted.agent_version_id.clone(),
                 name: persisted.name.clone(),
                 sandbox_id,
+                model: persisted.model.clone(),
                 updated_at: persisted.updated_at,
                 instance,
             },

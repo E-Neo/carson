@@ -242,6 +242,9 @@ pub async fn snapshot_session(db: &Arc<Db>, instance: &AgentInstance, session_id
         // their own update calls; the message snapshot must not clobber them.
         name: None,
         sandbox_id: None,
+        // The model is session metadata managed by the API layer; the message
+        // snapshot derives it from the latest block if there is one.
+        model: messages.last().map(|b| b.model.clone()).unwrap_or_default(),
         updated_at: ms_since_epoch(),
         summary: state.summary,
         usage: Usage {

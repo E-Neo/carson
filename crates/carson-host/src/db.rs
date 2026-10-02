@@ -12,7 +12,6 @@ CREATE TABLE IF NOT EXISTS agents (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     system_prompt TEXT NOT NULL,
-    model TEXT NOT NULL,
     instances INTEGER NOT NULL DEFAULT 1,
     max_history INTEGER NOT NULL DEFAULT 40,
     context_window INTEGER NOT NULL DEFAULT 128000,
@@ -49,6 +48,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     agent_version_id TEXT NOT NULL,
     name TEXT,
     sandbox_id TEXT,
+    model TEXT NOT NULL DEFAULT '',
     summary TEXT,
     input_tokens INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id TEXT NOT NULL,
     seq INTEGER NOT NULL,
     agent_version_id TEXT NOT NULL,
+    model TEXT NOT NULL DEFAULT '',
     kind TEXT NOT NULL,
     content TEXT,
     input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -93,12 +94,24 @@ fn now_ms() -> i64 {
 /// Add a column to an existing table if it is not present yet. SQLite has no
 /// `ADD COLUMN IF NOT EXISTS`, so existing databases are upgraded here.
 fn add_column_if_missing(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
+    if !column_exists(conn, table, column)? {
+        conn.execute_batch(ddl)?;
+    }
+    Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let columns: Vec<String> = stmt
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<std::result::Result<_, _>>()?;
-    if !columns.iter().any(|c| c == column) {
-        conn.execute_batch(ddl)?;
+    Ok(columns.iter().any(|c| c == column))
+}
+
+/// Drop a column from an existing table (SQLite 3.35+).
+fn drop_column(conn: &Connection, table: &str, column: &str) -> Result<()> {
+    if column_exists(conn, table, column)? {
+        conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}"))?;
     }
     Ok(())
 }
@@ -117,6 +130,34 @@ fn migrate(conn: &Connection) -> Result<()> {
         "sandbox_id",
         "ALTER TABLE sessions ADD COLUMN sandbox_id TEXT",
     )?;
+    add_column_if_missing(
+        conn,
+        "sessions",
+        "model",
+        "ALTER TABLE sessions ADD COLUMN model TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(
+        conn,
+        "messages",
+        "model",
+        "ALTER TABLE messages ADD COLUMN model TEXT NOT NULL DEFAULT ''",
+    )?;
+    // Backfill the model for sessions (and their blocks) that predate the
+    // decoupling, from the agent version they are pinned to — while that
+    // column still exists — then drop the now-unused agents.model column.
+    if column_exists(conn, "agents", "model")? {
+        conn.execute_batch(
+            "UPDATE sessions SET model = \
+                 COALESCE((SELECT a.model FROM agents a WHERE a.id = sessions.agent_version_id), '') \
+             WHERE model = ''",
+        )?;
+        conn.execute_batch(
+            "UPDATE messages SET model = \
+                 COALESCE((SELECT s.model FROM sessions s WHERE s.id = messages.session_id), '') \
+             WHERE model = ''",
+        )?;
+        drop_column(conn, "agents", "model")?;
+    }
     Ok(())
 }
 
@@ -124,6 +165,8 @@ fn migrate(conn: &Connection) -> Result<()> {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredBlock {
     pub agent_version_id: String,
+    /// The session's model when this block was produced.
+    pub model: String,
     pub kind: String,
     /// Plain text for user/thinking/text/system; a JSON payload for tool
     /// kinds (`{"id","name","arguments"}` / `{"id","name","output","is_error"}`).
@@ -140,6 +183,7 @@ impl From<&crate::bindings::exports::carson::agent::agent::Block> for StoredBloc
     fn from(b: &crate::bindings::exports::carson::agent::agent::Block) -> Self {
         Self {
             agent_version_id: b.agent_version_id.clone(),
+            model: b.model.clone(),
             kind: b.kind.clone(),
             text: b.text.clone(),
             input_tokens: b.input_tokens,
@@ -156,6 +200,7 @@ impl From<&StoredBlock> for crate::bindings::exports::carson::agent::agent::Bloc
     fn from(b: &StoredBlock) -> Self {
         Self {
             agent_version_id: b.agent_version_id.clone(),
+            model: b.model.clone(),
             kind: b.kind.clone(),
             text: b.text.clone(),
             input_tokens: b.input_tokens,
@@ -179,6 +224,8 @@ pub struct PersistedSession {
     /// The sandbox this session's tools operate in; backfilled on restore for
     /// sessions created before sandboxes existed.
     pub sandbox_id: Option<String>,
+    /// The session's model (`provider/model`); empty means unknown (pre-decoupling).
+    pub model: String,
     pub updated_at: i64,
     pub summary: Option<String>,
     pub usage: Usage,
@@ -198,17 +245,16 @@ pub struct Sandbox {
 struct MessageRow(StoredBlock);
 
 fn def_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentDef> {
-    let caps: String = row.get(9)?;
+    let caps: String = row.get(8)?;
     Ok(AgentDef {
         id: row.get(0)?,
         name: row.get(1)?,
         system_prompt: row.get(2)?,
-        model: row.get(3)?,
-        instances: row.get::<_, i64>(4)? as usize,
-        max_history: row.get::<_, i64>(5)? as usize,
-        context_window: row.get::<_, i64>(6)? as usize,
-        compaction_ratio: row.get(7)?,
-        auto_compact: row.get::<_, i64>(8)? != 0,
+        instances: row.get::<_, i64>(3)? as usize,
+        max_history: row.get::<_, i64>(4)? as usize,
+        context_window: row.get::<_, i64>(5)? as usize,
+        compaction_ratio: row.get(6)?,
+        auto_compact: row.get::<_, i64>(7)? != 0,
         capabilities: serde_json::from_str(&caps).unwrap_or_default(),
     })
 }
@@ -232,7 +278,7 @@ where
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
-const AGENT_COLUMNS: &str = "a.id, a.name, a.system_prompt, a.model, a.instances, a.max_history, a.context_window, \
+const AGENT_COLUMNS: &str = "a.id, a.name, a.system_prompt, a.instances, a.max_history, a.context_window, \
      a.compaction_ratio, a.auto_compact, a.capabilities_json";
 
 pub struct Db {
@@ -312,14 +358,13 @@ impl Db {
     pub fn insert_agent_version(&self, def: &AgentDef) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO agents (id, name, system_prompt, model, instances, max_history, \
+            "INSERT INTO agents (id, name, system_prompt, instances, max_history, \
              context_window, compaction_ratio, auto_compact, capabilities_json, created_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 def.id,
                 def.name,
                 def.system_prompt,
-                def.model,
                 def.instances as i64,
                 def.max_history as i64,
                 def.context_window as i64,
@@ -460,19 +505,20 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO sessions (id, agent_name, agent_version_id, name, sandbox_id, summary, \
+            "INSERT INTO sessions (id, agent_name, agent_version_id, name, sandbox_id, model, summary, \
              input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, created_at, \
              updated_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11) \
-             ON CONFLICT(id) DO UPDATE SET agent_name=?2, agent_version_id=?3, summary=?6, \
-             input_tokens=?7, cache_read_tokens=?8, cache_creation_tokens=?9, output_tokens=?10, \
-             updated_at=?11",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12) \
+             ON CONFLICT(id) DO UPDATE SET agent_name=?2, agent_version_id=?3, name=?4, \
+             sandbox_id=?5, model=?6, summary=?7, input_tokens=?8, cache_read_tokens=?9, \
+             cache_creation_tokens=?10, output_tokens=?11, updated_at=?12",
             params![
                 session.id,
                 session.agent_name,
                 session.agent_version_id,
                 session.name,
                 session.sandbox_id,
+                session.model,
                 session.summary,
                 session.usage.input_tokens,
                 session.usage.cache_read_tokens,
@@ -487,15 +533,16 @@ impl Db {
         )?;
         for (seq, block) in session.messages.iter().enumerate() {
             tx.execute(
-                "INSERT INTO messages (session_id, seq, agent_version_id, kind, content, \
+                "INSERT INTO messages (session_id, seq, agent_version_id, model, kind, content, \
                  input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, \
                  created_at, finished_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                 params![
                     session.id,
                     seq as i64,
                     // Per-block provenance: which agent version produced it.
                     block.agent_version_id,
+                    block.model,
                     block.kind,
                     block.text,
                     block.input_tokens,
@@ -514,27 +561,28 @@ impl Db {
     pub fn load_sessions(&self) -> Result<Vec<PersistedSession>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT s.id, s.agent_name, s.agent_version_id, s.name, s.sandbox_id, s.summary, \
+            "SELECT s.id, s.agent_name, s.agent_version_id, s.name, s.sandbox_id, s.model, s.summary, \
              s.input_tokens, s.cache_read_tokens, s.cache_creation_tokens, s.output_tokens, \
              s.updated_at, \
-             m.seq, m.agent_version_id, m.kind, m.content, m.input_tokens, \
+             m.seq, m.agent_version_id, m.model, m.kind, m.content, m.input_tokens, \
              m.cache_read_tokens, m.cache_creation_tokens, \
              m.output_tokens, m.created_at, m.finished_at \
              FROM sessions s LEFT JOIN messages m ON m.session_id = s.id \
              ORDER BY s.rowid, m.seq",
         )?;
         let rows = stmt.query_map([], |row| {
-            let block = if row.get::<_, Option<i64>>(11)?.is_some() {
+            let block = if row.get::<_, Option<i64>>(12)?.is_some() {
                 Some(MessageRow(StoredBlock {
-                    agent_version_id: row.get::<_, Option<String>>(12)?.unwrap_or_default(),
-                    kind: row.get::<_, Option<String>>(13)?.unwrap_or_default(),
-                    text: row.get(14)?,
-                    input_tokens: row.get::<_, i64>(15)? as u32,
-                    cache_read_tokens: row.get::<_, i64>(16)? as u32,
-                    cache_creation_tokens: row.get::<_, i64>(17)? as u32,
-                    output_tokens: row.get::<_, i64>(18)? as u32,
-                    created_at_ms: row.get::<_, Option<i64>>(19)?.unwrap_or(0) as u64,
-                    finished_at_ms: row.get::<_, Option<i64>>(20)?.unwrap_or(0) as u64,
+                    agent_version_id: row.get::<_, Option<String>>(13)?.unwrap_or_default(),
+                    model: row.get::<_, Option<String>>(14)?.unwrap_or_default(),
+                    kind: row.get::<_, Option<String>>(15)?.unwrap_or_default(),
+                    text: row.get(16)?,
+                    input_tokens: row.get::<_, i64>(17)? as u32,
+                    cache_read_tokens: row.get::<_, i64>(18)? as u32,
+                    cache_creation_tokens: row.get::<_, i64>(19)? as u32,
+                    output_tokens: row.get::<_, i64>(20)? as u32,
+                    created_at_ms: row.get::<_, Option<i64>>(21)?.unwrap_or(0) as u64,
+                    finished_at_ms: row.get::<_, Option<i64>>(22)?.unwrap_or(0) as u64,
                 }))
             } else {
                 None
@@ -545,12 +593,13 @@ impl Db {
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, i64>(6)? as u32,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
                 row.get::<_, i64>(7)? as u32,
                 row.get::<_, i64>(8)? as u32,
                 row.get::<_, i64>(9)? as u32,
-                row.get::<_, i64>(10)?,
+                row.get::<_, i64>(10)? as u32,
+                row.get::<_, i64>(11)?,
                 block,
             ))
         })?;
@@ -565,6 +614,7 @@ impl Db {
                 agent_version_id,
                 name,
                 sandbox_id,
+                model,
                 summary,
                 input,
                 cache_read,
@@ -582,6 +632,7 @@ impl Db {
                         agent_version_id,
                         name,
                         sandbox_id,
+                        model,
                         updated_at,
                         summary,
                         usage: Usage {
@@ -679,6 +730,16 @@ impl Db {
         Ok(())
     }
 
+    /// Set the session's model (`provider/model`).
+    pub fn set_session_model(&self, id: &str, model: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET model = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, model, now_ms()],
+        )?;
+        Ok(())
+    }
+
     /// Read a persisted key-value setting.
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
@@ -711,7 +772,6 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             name: name.into(),
             system_prompt: "sys".into(),
-            model: "mock".into(),
             instances: 1,
             max_history: 40,
             context_window: 128_000,
@@ -724,6 +784,7 @@ mod tests {
     fn block(version: &str, kind: &str, text: &str) -> StoredBlock {
         StoredBlock {
             agent_version_id: version.into(),
+            model: "mock/mock".into(),
             kind: kind.into(),
             text: Some(text.into()),
             input_tokens: 0,
@@ -747,6 +808,7 @@ mod tests {
             agent_version_id: version.into(),
             name: None,
             sandbox_id: Some(id.into()),
+            model: "mock/mock".into(),
             updated_at: 5_000,
             summary: Some("summary".into()),
             usage: Usage {

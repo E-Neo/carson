@@ -29,7 +29,6 @@ fn def() -> AgentDef {
         id: uuid::Uuid::new_v4().to_string(),
         name: "coder".into(),
         system_prompt: "You are a coding agent.".into(),
-        model: "mock/mock".into(),
         instances: 1,
         max_history: 40,
         context_window: 128_000,
@@ -68,7 +67,7 @@ fn crate_config(
     SessionConfig {
         agent_version_id: def.id.clone(),
         system_prompt: def.system_prompt.clone(),
-        model: def.model.clone(),
+        model: "mock/mock".into(),
         capabilities_json: serde_json::json!(def.capabilities).to_string(),
         max_history: def.max_history as u32,
         context_window: def.context_window as u32,
@@ -266,6 +265,7 @@ async fn tool_turn_persists_ordered_blocks() {
 fn stored_block_metadata_roundtrip() {
     let block = StoredBlock {
         agent_version_id: "v9".into(),
+        model: "mock/mock".into(),
         kind: "thinking".into(),
         text: Some("hmm".into()),
         input_tokens: 11,
@@ -279,8 +279,10 @@ fn stored_block_metadata_roundtrip() {
         carson_host::bindings::exports::carson::agent::agent::Block::from(&block);
     assert_eq!(wit.created_at_ms, 1234);
     assert_eq!(wit.finished_at_ms, 5678);
+    assert_eq!(wit.model, "mock/mock");
     let back = StoredBlock::from(&wit);
     assert_eq!(back.input_tokens, 11);
     assert_eq!(back.cache_read_tokens, 3);
     assert_eq!(back.agent_version_id, "v9");
+    assert_eq!(back.model, "mock/mock");
 }

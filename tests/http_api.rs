@@ -30,7 +30,6 @@ fn coder_def() -> AgentDef {
         id: uuid::Uuid::new_v4().to_string(),
         name: "coder".into(),
         system_prompt: "You are a coding agent.".into(),
-        model: "mock/mock".into(),
         instances: 1,
         max_history: 40,
         context_window: 128_000,
@@ -364,9 +363,79 @@ async fn session_cookie_works_across_multiple_endpoints() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_model_switch_via_api() {
+    let app = app().await;
+    let (status, created) = post(
+        &app,
+        "/api/sessions",
+        r#"{"agent":"coder","model":"mock/mock"}"#,
+    )
+    .await;
+    assert_eq!(status, 201, "{created}");
+    let session_id = created["session_id"].as_str().unwrap();
+    assert_eq!(created["model"], "mock/mock");
+
+    // Switch to another model on the same registered provider.
+    let (status, body) = put(
+        &app,
+        &format!("/api/sessions/{session_id}"),
+        r#"{"model":"mock/other"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["model"], "mock/other");
+
+    let (_, body) = get(&app, &format!("/api/sessions/{session_id}")).await;
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["model"], "mock/other");
+
+    // Unknown provider is rejected.
+    let (status, _) = put(
+        &app,
+        &format!("/api/sessions/{session_id}"),
+        r#"{"model":"ghost/x"}"#,
+    )
+    .await;
+    assert_eq!(status, 400);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_blocks_carry_their_model() {
+    let app = app().await;
+    let (_, created) = post(
+        &app,
+        "/api/sessions",
+        r#"{"agent":"coder","model":"mock/mock"}"#,
+    )
+    .await;
+    let session_id = created["session_id"].as_str().unwrap();
+    let (status, _) = post(
+        &app,
+        &format!("/api/sessions/{session_id}/message"),
+        r#"{"content":"what time is it?"}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let (_, body) = get(&app, &format!("/api/sessions/{session_id}")).await;
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let blocks = v["messages"].as_array().unwrap();
+    assert!(blocks.len() >= 2);
+    assert!(
+        blocks.iter().all(|b| b["model"] == "mock/mock"),
+        "every block is stamped with the producing model: {v}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_ids_are_uuids() {
     let app = app().await;
-    let (status, created) = post(&app, "/api/sessions", r#"{"agent":"coder"}"#).await;
+    let (status, created) = post(
+        &app,
+        "/api/sessions",
+        r#"{"agent":"coder","model":"mock/mock"}"#,
+    )
+    .await;
     assert_eq!(status, 201, "{created}");
     let id = created["session_id"].as_str().unwrap();
     assert_eq!(id.len(), 36, "uuid format: {id}");
@@ -409,7 +478,12 @@ async fn api_requires_bearer_token() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_create_and_stream_roundtrip() {
     let app = app().await;
-    let (_, created) = post(&app, "/api/sessions", r#"{"agent":"coder"}"#).await;
+    let (_, created) = post(
+        &app,
+        "/api/sessions",
+        r#"{"agent":"coder","model":"mock/mock"}"#,
+    )
+    .await;
     let session_id = created["session_id"].as_str().unwrap();
 
     let (status, body) = post_raw(
@@ -430,7 +504,12 @@ async fn session_create_and_stream_roundtrip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn message_returns_the_echo_reply() {
     let app = app().await;
-    let (_, created) = post(&app, "/api/sessions", r#"{"agent":"coder"}"#).await;
+    let (_, created) = post(
+        &app,
+        "/api/sessions",
+        r#"{"agent":"coder","model":"mock/mock"}"#,
+    )
+    .await;
     let session_id = created["session_id"].as_str().unwrap();
 
     let (status, body) = post(
@@ -447,14 +526,24 @@ async fn message_returns_the_echo_reply() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_agent_is_404() {
     let app = app().await;
-    let (status, body) = post(&app, "/api/sessions", r#"{"agent":"nope"}"#).await;
+    let (status, body) = post(
+        &app,
+        "/api/sessions",
+        r#"{"agent":"nope","model":"mock/mock"}"#,
+    )
+    .await;
     assert_eq!(status, 404, "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_lifecycle_endpoints() {
     let app = app().await;
-    let (_, created) = post(&app, "/api/sessions", r#"{"agent":"coder"}"#).await;
+    let (_, created) = post(
+        &app,
+        "/api/sessions",
+        r#"{"agent":"coder","model":"mock/mock"}"#,
+    )
+    .await;
     let session_id = created["session_id"].as_str().unwrap();
     let uri = format!("/api/sessions/{session_id}");
 
@@ -489,7 +578,12 @@ async fn session_lifecycle_endpoints() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_session_returns_ordered_blocks_with_metadata() {
     let app = app().await;
-    let (_, created) = post(&app, "/api/sessions", r#"{"agent":"coder"}"#).await;
+    let (_, created) = post(
+        &app,
+        "/api/sessions",
+        r#"{"agent":"coder","model":"mock/mock"}"#,
+    )
+    .await;
     let session_id = created["session_id"].as_str().unwrap();
 
     let (status, _) = post(
@@ -529,21 +623,29 @@ async fn get_session_returns_ordered_blocks_with_metadata() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn agent_model_requires_known_provider() {
+async fn session_model_requires_known_provider() {
     let app = app().await;
     let (status, body) = post(
         &app,
-        "/api/agents",
-        r#"{"name":"writer","model":"ghost/model","system_prompt":"x"}"#,
+        "/api/sessions",
+        r#"{"agent":"coder","model":"ghost/model"}"#,
     )
     .await;
+    assert_eq!(status, 400, "{body}");
+    // Models must be in provider/model form.
+    let (status, body) = post(&app, "/api/sessions", r#"{"agent":"coder","model":"nope"}"#).await;
     assert_eq!(status, 400, "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compact_endpoint() {
     let app = app().await;
-    let (status, created) = post(&app, "/api/sessions", r#"{"agent":"coder"}"#).await;
+    let (status, created) = post(
+        &app,
+        "/api/sessions",
+        r#"{"agent":"coder","model":"mock/mock"}"#,
+    )
+    .await;
     assert_eq!(status, 201);
     let session_id = created["session_id"].as_str().unwrap();
     let (status, body) = post(&app, &format!("/api/sessions/{session_id}/compact"), "{}").await;
@@ -565,9 +667,10 @@ async fn agent_crud_via_api() {
     let (status, created) = post(
         &app,
         "/api/agents",
-        json!({"name":"writer","model":"mock/mock","system_prompt":"write","capabilities":[time_id()]})
-            .to_string()
-            .as_str(),
+        json!({"name":"writer",
+"system_prompt":"write","capabilities":[time_id()]})
+        .to_string()
+        .as_str(),
     )
     .await;
     assert_eq!(status, 201, "{created}");
@@ -578,14 +681,20 @@ async fn agent_crud_via_api() {
     assert!(body.contains("\"name\":\"writer\""), "{body}");
     assert!(body.contains("\"name\":\"coder\""), "{body}");
 
-    let (status, _sess) = post(&app, "/api/sessions", r#"{"agent":"writer"}"#).await;
+    let (status, _sess) = post(
+        &app,
+        "/api/sessions",
+        r#"{"agent":"writer","model":"mock/mock"}"#,
+    )
+    .await;
     assert_eq!(status, 201, "{_sess}");
 
     // Update creates a NEW version and repoints the name.
     let (status, updated) = put(
         &app,
         "/api/agents/writer",
-        r#"{"name":"writer","model":"mock/mock","system_prompt":"new prompt","capabilities":[]}"#,
+        r#"{"name":"writer",
+"system_prompt":"new prompt","capabilities":[]}"#,
     )
     .await;
     assert_eq!(status, 200, "{updated}");
@@ -612,15 +721,21 @@ async fn sessions_follow_the_current_agent_version() {
     let (status, created) = post(
         &app,
         "/api/agents",
-        json!({"name":"writer","model":"mock/mock","system_prompt":"v1","capabilities":[time_id()]})
-            .to_string()
-            .as_str(),
+        json!({"name":"writer",
+"system_prompt":"v1","capabilities":[time_id()]})
+        .to_string()
+        .as_str(),
     )
     .await;
     assert_eq!(status, 201, "{created}");
     let v1 = created["version_id"].as_str().unwrap().to_string();
 
-    let (_, sess) = post(&app, "/api/sessions", r#"{"agent":"writer"}"#).await;
+    let (_, sess) = post(
+        &app,
+        "/api/sessions",
+        r#"{"agent":"writer","model":"mock/mock"}"#,
+    )
+    .await;
     let session_id = sess["session_id"].as_str().unwrap().to_string();
     assert_eq!(sess["agent_version_id"], json!(v1));
 
@@ -628,7 +743,8 @@ async fn sessions_follow_the_current_agent_version() {
     let (status, updated) = put(
         &app,
         "/api/agents/writer",
-        r#"{"name":"writer","model":"mock/mock","system_prompt":"v2","capabilities":[]}"#,
+        r#"{"name":"writer",
+"system_prompt":"v2","capabilities":[]}"#,
     )
     .await;
     assert_eq!(status, 200, "{updated}");
@@ -636,7 +752,12 @@ async fn sessions_follow_the_current_agent_version() {
     assert_ne!(v1, v2);
 
     // New sessions land on v2 immediately.
-    let (_, new_sess) = post(&app, "/api/sessions", r#"{"agent":"writer"}"#).await;
+    let (_, new_sess) = post(
+        &app,
+        "/api/sessions",
+        r#"{"agent":"writer","model":"mock/mock"}"#,
+    )
+    .await;
     assert_eq!(new_sess["agent_version_id"], json!(v2));
 
     // The existing session still reports its pinned version until its next
@@ -675,11 +796,17 @@ async fn delete_agent_keeps_history_rows_and_sessions() {
     let (status, _) = post(
         &app,
         "/api/agents",
-        r#"{"name":"temp","model":"mock/mock","system_prompt":"temp"}"#,
+        r#"{"name":"temp",
+"system_prompt":"temp"}"#,
     )
     .await;
     assert_eq!(status, 201);
-    let (status, sess) = post(&app, "/api/sessions", r#"{"agent":"temp"}"#).await;
+    let (status, sess) = post(
+        &app,
+        "/api/sessions",
+        r#"{"agent":"temp","model":"mock/mock"}"#,
+    )
+    .await;
     assert_eq!(status, 201, "{sess}");
     let session_id = sess["session_id"].as_str().unwrap();
 
@@ -688,7 +815,12 @@ async fn delete_agent_keeps_history_rows_and_sessions() {
     assert_eq!(deleted["status"], "deleted");
 
     // The pointer is gone: no more new sessions on this name…
-    let (status, _) = post(&app, "/api/sessions", r#"{"agent":"temp"}"#).await;
+    let (status, _) = post(
+        &app,
+        "/api/sessions",
+        r#"{"agent":"temp","model":"mock/mock"}"#,
+    )
+    .await;
     assert_eq!(status, 404);
 
     // …and it no longer lists among current agents.
@@ -711,12 +843,7 @@ async fn delete_agent_keeps_history_rows_and_sessions() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn update_agent_name_mismatch_rejected() {
     let app = app().await;
-    let (status, body) = put(
-        &app,
-        "/api/agents/coder",
-        r#"{"name":"other","model":"mock/mock"}"#,
-    )
-    .await;
+    let (status, body) = put(&app, "/api/agents/coder", r#"{"name":"other"}"#).await;
     assert_eq!(status, 400, "{body}");
 }
 
@@ -838,7 +965,6 @@ async fn agent_rejects_two_tools_with_the_same_name() {
         "/api/agents",
         json!({
             "name":"ambiguous",
-            "model":"mock/mock",
             "system_prompt":"x",
             "capabilities":[time_id(), custom_id]
         })
@@ -864,13 +990,19 @@ async fn message_blocks_keep_their_original_agent_version() {
     let (status, created) = post(
         &app,
         "/api/agents",
-        r#"{"name":"writer","model":"mock/mock","system_prompt":"v1"}"#,
+        r#"{"name":"writer",
+"system_prompt":"v1"}"#,
     )
     .await;
     assert_eq!(status, 201, "{created}");
     let v1 = created["version_id"].as_str().unwrap().to_string();
 
-    let (_, sess) = post(&app, "/api/sessions", r#"{"agent":"writer"}"#).await;
+    let (_, sess) = post(
+        &app,
+        "/api/sessions",
+        r#"{"agent":"writer","model":"mock/mock"}"#,
+    )
+    .await;
     let session_id = sess["session_id"].as_str().unwrap().to_string();
 
     // Turn 1 under v1.
@@ -886,7 +1018,8 @@ async fn message_blocks_keep_their_original_agent_version() {
     let (_, updated) = put(
         &app,
         "/api/agents/writer",
-        r#"{"name":"writer","model":"mock/mock","system_prompt":"v2"}"#,
+        r#"{"name":"writer",
+"system_prompt":"v2"}"#,
     )
     .await;
     let v2 = updated["version_id"].as_str().unwrap().to_string();

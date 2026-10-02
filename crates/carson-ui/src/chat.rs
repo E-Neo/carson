@@ -41,6 +41,9 @@ struct MsgEntry {
     id: u64,
     /// (created_ms, finished_ms); finished == 0 while the turn streams.
     times: RwSignal<(u64, u64)>,
+    /// The model that produced this block (empty for live user/system rows
+    /// until the session model is known).
+    model: String,
     block: UiBlock,
 }
 
@@ -90,9 +93,11 @@ fn build_history(v: &Value, next_id: &RwSignal<u64>) -> Vec<MsgEntry> {
         return out;
     };
     for m in arr {
+        let model = str_of(m, "model");
         match m.get("kind").and_then(|k| k.as_str()).unwrap_or("") {
             "user" => out.push(MsgEntry {
                 id: alloc_id(next_id),
+                model: model.clone(),
                 times: RwSignal::new((
                     m["created_at_ms"].as_u64().unwrap_or(0),
                     m["finished_at_ms"].as_u64().unwrap_or(0),
@@ -103,6 +108,7 @@ fn build_history(v: &Value, next_id: &RwSignal<u64>) -> Vec<MsgEntry> {
             }),
             "thinking" => out.push(MsgEntry {
                 id: alloc_id(next_id),
+                model: model.clone(),
                 times: RwSignal::new((
                     m["created_at_ms"].as_u64().unwrap_or(0),
                     m["finished_at_ms"].as_u64().unwrap_or(0),
@@ -113,6 +119,7 @@ fn build_history(v: &Value, next_id: &RwSignal<u64>) -> Vec<MsgEntry> {
             }),
             "text" => out.push(MsgEntry {
                 id: alloc_id(next_id),
+                model: model.clone(),
                 times: RwSignal::new((
                     m["created_at_ms"].as_u64().unwrap_or(0),
                     m["finished_at_ms"].as_u64().unwrap_or(0),
@@ -130,6 +137,7 @@ fn build_history(v: &Value, next_id: &RwSignal<u64>) -> Vec<MsgEntry> {
                 }
                 out.push(MsgEntry {
                     id: alloc_id(next_id),
+                    model: model.clone(),
                     times: RwSignal::new((
                         m["created_at_ms"].as_u64().unwrap_or(0),
                         m["finished_at_ms"].as_u64().unwrap_or(0),
@@ -148,6 +156,7 @@ fn build_history(v: &Value, next_id: &RwSignal<u64>) -> Vec<MsgEntry> {
                 };
                 out.push(MsgEntry {
                     id: alloc_id(next_id),
+                    model,
                     times: RwSignal::new((
                         m["created_at_ms"].as_u64().unwrap_or(0),
                         m["finished_at_ms"].as_u64().unwrap_or(0),
@@ -185,9 +194,11 @@ async fn load_history(
     follow: &RwSignal<bool>,
     at_latest: &RwSignal<bool>,
     next_id: &RwSignal<u64>,
+    session_model: &RwSignal<String>,
 ) {
     if let Ok((status, v)) = api::get(&format!("/api/sessions/{id}")).await {
         if status == 200 {
+            session_model.set(str_of(&v, "model"));
             messages.set(build_history(&v, next_id));
         } else {
             error.set(Some(str_of(&v, "error")));
@@ -206,6 +217,7 @@ fn stream_text(
     messages: &RwSignal<Vec<MsgEntry>>,
     next_id: &RwSignal<u64>,
     now: u64,
+    model: &str,
     matches_kind: impl Fn(&UiBlock) -> bool,
     make: impl FnOnce() -> UiBlock,
     extract: fn(&UiBlock) -> Option<RwSignal<String>>,
@@ -226,7 +238,15 @@ fn stream_text(
         let id = alloc_id(next_id);
         let times = RwSignal::new((now, 0));
         let block = make();
-        messages.update(|m| m.push(MsgEntry { id, times, block }));
+        let model = model.to_string();
+        messages.update(|m| {
+            m.push(MsgEntry {
+                id,
+                model,
+                times,
+                block,
+            })
+        });
     }
     // Re-resolve AFTER the possible push so a freshly created block receives
     // its first chunk too; the handle keeps every write outside any borrow.
@@ -249,6 +269,8 @@ struct ChatSignals {
     follow: RwSignal<bool>,
     at_latest: RwSignal<bool>,
     next_id: RwSignal<u64>,
+    /// The session's current model, stamped onto newly streamed blocks.
+    session_model: RwSignal<String>,
     /// Called after a turn completes so the session list reorders.
     on_turn_done: Option<Callback<()>>,
 }
@@ -277,10 +299,12 @@ fn apply_stream_event(st: &ChatSignals, now: u64, ev: &sse::SseEvent) -> EventOu
     match ev.event.as_str() {
         "chunk" => {
             let text = serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
+            let model = st.session_model.get_untracked();
             stream_text(
                 &messages,
                 &next_id,
                 now,
+                &model,
                 last_is_text,
                 || UiBlock::Text {
                     text: RwSignal::new(String::new()),
@@ -296,10 +320,12 @@ fn apply_stream_event(st: &ChatSignals, now: u64, ev: &sse::SseEvent) -> EventOu
         }
         "thinking" => {
             let text = serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
+            let model = st.session_model.get_untracked();
             stream_text(
                 &messages,
                 &next_id,
                 now,
+                &model,
                 last_is_thinking,
                 || UiBlock::Thinking {
                     text: RwSignal::new(String::new()),
@@ -317,7 +343,8 @@ fn apply_stream_event(st: &ChatSignals, now: u64, ev: &sse::SseEvent) -> EventOu
             let v = parse_event_object(&ev.data);
             let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("");
             if !name.is_empty() {
-                push_tool(&messages, &next_id, now, name.to_string());
+                let model = st.session_model.get_untracked();
+                push_tool(&messages, &next_id, now, &model, name.to_string());
             }
             st.scroll_tick.update(|t| *t += 1);
             EventOutcome::Silent
@@ -356,9 +383,11 @@ fn apply_stream_event(st: &ChatSignals, now: u64, ev: &sse::SseEvent) -> EventOu
                 .get("finished_at_ms")
                 .and_then(|x| x.as_u64())
                 .unwrap_or(now);
+            let model = st.session_model.get_untracked();
             push_tool_at(
                 &messages,
                 &next_id,
+                &model,
                 created,
                 finished,
                 format!("{marker}{preview}"),
@@ -399,9 +428,11 @@ fn send(session_id: String, input: RwSignal<String>, st: ChatSignals) {
     }
     let id = alloc_id(&st.next_id);
     let times = RwSignal::new((now_ms(), 0));
+    let model = st.session_model.get_untracked();
     st.messages.update(|m| {
         m.push(MsgEntry {
             id,
+            model,
             times,
             block: UiBlock::User {
                 content: text.clone(),
@@ -485,13 +516,21 @@ fn finish_user(messages: &RwSignal<Vec<MsgEntry>>, at: u64) {
 
 /// Push a new plain-text Tool block. Closes the previous open non-user block
 /// so it spans only up to this point.
-fn push_tool(messages: &RwSignal<Vec<MsgEntry>>, next_id: &RwSignal<u64>, now: u64, text: String) {
+fn push_tool(
+    messages: &RwSignal<Vec<MsgEntry>>,
+    next_id: &RwSignal<u64>,
+    now: u64,
+    model: &str,
+    text: String,
+) {
     close_open_assistant(messages, now);
     let id = alloc_id(next_id);
     let times = RwSignal::new((now, 0));
+    let model = model.to_string();
     messages.update(|m| {
         m.push(MsgEntry {
             id,
+            model,
             times,
             block: UiBlock::Tool {
                 text: RwSignal::new(text),
@@ -505,15 +544,18 @@ fn push_tool(messages: &RwSignal<Vec<MsgEntry>>, next_id: &RwSignal<u64>, now: u
 fn push_tool_at(
     messages: &RwSignal<Vec<MsgEntry>>,
     next_id: &RwSignal<u64>,
+    model: &str,
     created: u64,
     finished: u64,
     text: String,
 ) {
     let id = alloc_id(next_id);
     let times = RwSignal::new((created, finished));
+    let model = model.to_string();
     messages.update(|m| {
         m.push(MsgEntry {
             id,
+            model,
             times,
             block: UiBlock::Tool {
                 text: RwSignal::new(text),
@@ -612,9 +654,11 @@ fn fmt_duration(created: u64, finished: u64) -> String {
     format!("{:.3}s", finished.saturating_sub(created) as f64 / 1000.0)
 }
 
-/// Header line: the start time, then an optional kind label (Thinking / Tool).
-fn time_head(kind: Option<&str>, times: RwSignal<(u64, u64)>) -> AnyView {
+/// Header line: the start time, then an optional kind label (Thinking / Tool)
+/// and the producing model when known.
+fn time_head(kind: Option<&str>, model: &str, times: RwSignal<(u64, u64)>) -> AnyView {
     let label = kind.map(str::to_owned);
+    let model = (!model.is_empty()).then(|| model.to_string());
     view! {
         <div class="msg-head" title=move || {
             let (created, _) = times.get_untracked();
@@ -625,6 +669,7 @@ fn time_head(kind: Option<&str>, times: RwSignal<(u64, u64)>) -> AnyView {
                 if created == 0 { String::new() } else { fmt_clock(created) }
             }}</span>
             {move || label.clone().map(|k| view! { <span class="msg-kind">{k}</span> })}
+            {move || model.clone().map(|m| view! { <span class="msg-model">{m}</span> })}
         </div>
     }
     .into_any()
@@ -652,7 +697,13 @@ fn entry_view(entry: &MsgEntry) -> AnyView {
         UiBlock::Tool { .. } => Some("Tool"),
         _ => None,
     };
-    let head = time_head(kind, entry.times);
+    // Only assistant-side blocks carry a producing model; user rows show none.
+    let model = if matches!(&entry.block, UiBlock::User { .. }) {
+        ""
+    } else {
+        entry.model.as_str()
+    };
+    let head = time_head(kind, model, entry.times);
     let tail = time_tail(entry.times);
     let child = block_child(entry);
     match &entry.block {
@@ -720,6 +771,7 @@ pub fn ChatPage() -> impl IntoView {
     let status_line = RwSignal::new(None::<String>);
     let active = RwSignal::new(None::<String>);
     let selected_agent = RwSignal::new(String::new());
+    let new_model = RwSignal::new(String::new());
     let next_id = RwSignal::new(1u64);
     let drawer_open = RwSignal::new(false);
 
@@ -728,9 +780,12 @@ pub fn ChatPage() -> impl IntoView {
     let settings_session = RwSignal::new(None::<String>);
     let sandboxes = RwSignal::new(Vec::<SandboxSummary>::new());
     let name_edit = RwSignal::new(String::new());
+    let model_edit = RwSignal::new(String::new());
     let rename_alias = RwSignal::new(String::new());
     let new_sandbox_name = RwSignal::new(String::new());
     let selected_sandbox = RwSignal::new(None::<String>);
+    // The session's current model; streamed blocks are stamped with it.
+    let session_model = RwSignal::new(String::new());
     // Which session-item (if any) has its action menu open, plus where to anchor it.
     let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
     // Inline rename of a session-item row.
@@ -761,6 +816,7 @@ pub fn ChatPage() -> impl IntoView {
         follow,
         at_latest,
         next_id,
+        session_model,
         on_turn_done: Some(Callback::new(move |()| {
             let sessions = sessions;
             spawn_local(async move {
@@ -810,6 +866,7 @@ pub fn ChatPage() -> impl IntoView {
             let follow = follow;
             let at_latest = at_latest;
             let next_id = next_id;
+            let session_model = session_model;
             spawn_local(async move {
                 load_history(
                     &id,
@@ -819,6 +876,7 @@ pub fn ChatPage() -> impl IntoView {
                     &follow,
                     &at_latest,
                     &next_id,
+                    &session_model,
                 )
                 .await;
             });
@@ -858,14 +916,17 @@ pub fn ChatPage() -> impl IntoView {
 
     let create_session = move || {
         let agent = selected_agent.get();
-        if agent.is_empty() {
+        let model = new_model.get().trim().to_string();
+        if agent.is_empty() || model.is_empty() {
             return;
         }
         spawn_local(async move {
-            if let Ok((status, v)) = api::post("/api/sessions", &json!({ "agent": agent })).await
+            if let Ok((status, v)) =
+                api::post("/api/sessions", &json!({ "agent": agent, "model": model })).await
                 && status == 201
                 && let Some(id) = v.get("session_id").and_then(|x| x.as_str())
             {
+                new_model.set(String::new());
                 refresh_sessions_async(sessions).await;
                 go_to.set(Some(format!("/chat/{id}")));
             }
@@ -911,6 +972,13 @@ pub fn ChatPage() -> impl IntoView {
                 .and_then(|s| s.name.clone())
                 .unwrap_or_default(),
         );
+        let model_edit = model_edit;
+        let sid2 = sid.clone();
+        spawn_local(async move {
+            if let Ok((_, v)) = api::get(&format!("/api/sessions/{sid2}")).await {
+                model_edit.set(str_of(&v, "model"));
+            }
+        });
         settings_open.set(true);
         let sandboxes = sandboxes;
         spawn_local(async move {
@@ -997,6 +1065,23 @@ pub fn ChatPage() -> impl IntoView {
                 refresh_sessions_async(sessions).await;
             });
         }
+    };
+
+    let save_session_model = move || {
+        let id = settings_target();
+        if id.is_empty() {
+            return;
+        }
+        let model = model_edit.get().trim().to_string();
+        if model.is_empty() {
+            return;
+        }
+        let session_model = session_model;
+        spawn_local(async move {
+            let _ = api::put(&format!("/api/sessions/{id}"), &json!({ "model": model })).await;
+            // Newly streamed blocks are stamped with the new model.
+            session_model.set(model);
+        });
     };
 
     let switch_sandbox = move |sandbox_id: String| {
@@ -1379,6 +1464,16 @@ pub fn ChatPage() -> impl IntoView {
                                                         }}
                                                     </select>
                                                 </div>
+                                                <div class="field">
+                                                    <label for="new-model">"Model (provider/model)"</label>
+                                                    <input
+                                                        id="new-model"
+                                                        name="model"
+                                                        placeholder="groq/llama-3.3-70b-versatile"
+                                                        prop:value=move || new_model.get()
+                                                        on:input=move |ev| new_model.set(event_target_value(&ev))
+                                                    />
+                                                </div>
                                                 <button class="btn primary" on:click=move |_| create_session()>
                                                     "Start"
                                                 </button>
@@ -1419,6 +1514,19 @@ pub fn ChatPage() -> impl IntoView {
                                                 on:input=move |ev| name_edit.set(event_target_value(&ev))
                                             />
                                             <button class="btn primary" on:click=move |_| save_session_name()>
+                                                "Save"
+                                            </button>
+                                        </div>
+                                        <label for="session-model">"Model (provider/model)"</label>
+                                        <div class="settings-row">
+                                            <input
+                                                id="session-model"
+                                                name="session-model"
+                                                placeholder="groq/llama-3.3-70b-versatile"
+                                                prop:value=move || model_edit.get()
+                                                on:input=move |ev| model_edit.set(event_target_value(&ev))
+                                            />
+                                            <button class="btn primary" on:click=move |_| save_session_model()>
                                                 "Save"
                                             </button>
                                         </div>
@@ -1584,6 +1692,7 @@ mod tests {
             &messages,
             &next_id,
             1000,
+            "mock/mock",
             last_is_thinking,
             || UiBlock::Thinking {
                 text: RwSignal::new(String::new()),
@@ -1598,6 +1707,7 @@ mod tests {
             &messages,
             &next_id,
             1050,
+            "mock/mock",
             last_is_thinking,
             || UiBlock::Thinking {
                 text: RwSignal::new(String::new()),
@@ -1612,6 +1722,7 @@ mod tests {
             &messages,
             &next_id,
             1100,
+            "mock/mock",
             last_is_text,
             || UiBlock::Text {
                 text: RwSignal::new(String::new()),
@@ -1623,6 +1734,7 @@ mod tests {
         let entries = messages.get_untracked();
         assert_eq!(entries.len(), 2, "kind switch opens a new block");
         assert_eq!(entries[0].id, 1);
+        assert_eq!(entries[0].model, "mock/mock");
         match &entries[0].block {
             UiBlock::Thinking { text } => assert_eq!(text.get_untracked(), "let me think"),
             other => panic!("expected thinking, got {other:?}"),
@@ -1643,6 +1755,7 @@ mod tests {
             MsgEntry {
                 id: 1,
                 times: RwSignal::new((10, 0)),
+                model: "mock/mock".into(),
                 block: UiBlock::User {
                     content: "hi".into(),
                 },
@@ -1650,11 +1763,13 @@ mod tests {
             MsgEntry {
                 id: 2,
                 times: RwSignal::new((20, 0)),
+                model: "mock/mock".into(),
                 block: text_block_signal(),
             },
             MsgEntry {
                 id: 3,
                 times: RwSignal::new((30, 35)),
+                model: "mock/mock".into(),
                 block: text_block_signal(),
             },
         ]);
@@ -1676,13 +1791,13 @@ mod tests {
     fn history_fixture() -> Value {
         json!({
             "messages": [
-                {"kind": "user", "text": "hi", "created_at_ms": 1000, "finished_at_ms": 1000},
-                {"kind": "thinking", "text": "reasoning", "created_at_ms": 2000, "finished_at_ms": 2500},
+                {"kind": "user", "text": "hi", "model": "mock/mock", "created_at_ms": 1000, "finished_at_ms": 1000},
+                {"kind": "thinking", "text": "reasoning", "model": "mock/mock", "created_at_ms": 2000, "finished_at_ms": 2500},
                 {"kind": "tool-use", "tool_call_id": "c1", "tool_name": "time",
-                 "arguments": "{}", "created_at_ms": 3000, "finished_at_ms": 3000},
+                 "arguments": "{}", "model": "mock/mock", "created_at_ms": 3000, "finished_at_ms": 3000},
                 {"kind": "tool-result", "text": "12:00:00", "tool_call_id": "c1",
-                 "created_at_ms": 4000, "finished_at_ms": 4500},
-                {"kind": "text", "text": "done", "created_at_ms": 5000, "finished_at_ms": 6000}
+                 "model": "mock/mock", "created_at_ms": 4000, "finished_at_ms": 4500},
+                {"kind": "text", "text": "done", "model": "mock/mock", "created_at_ms": 5000, "finished_at_ms": 6000}
             ]
         })
     }
@@ -1704,6 +1819,10 @@ mod tests {
 
         assert!(matches!(entries[0].block, UiBlock::User { ref content } if content == "hi"));
         assert_eq!(entries[0].times.get_untracked(), (1000, 1000));
+        assert_eq!(
+            entries[0].model, "mock/mock",
+            "model provenance survives history"
+        );
 
         match &entries[2].block {
             UiBlock::Tool { text } => {
@@ -1798,6 +1917,7 @@ mod tests {
             follow: RwSignal::new(true),
             at_latest: RwSignal::new(true),
             next_id: RwSignal::new(0u64),
+            session_model: RwSignal::new("mock/mock".into()),
             on_turn_done: None,
         }
     }

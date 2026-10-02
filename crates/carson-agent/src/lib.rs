@@ -76,10 +76,11 @@ fn now_ms() -> u64 {
     events::now_ms()
 }
 
-fn user_block(version: &str, text: String) -> Block {
+fn user_block(version: &str, model: &str, text: String) -> Block {
     let now = now_ms();
     Block {
         agent_version_id: version.to_string(),
+        model: model.to_string(),
         kind: "user".into(),
         text: Some(text),
         input_tokens: 0,
@@ -274,9 +275,11 @@ impl Guest for CarsonAgent {
         let mut sessions = sessions().lock().unwrap();
         let session = sessions.get_mut(&session_id).ok_or(Error::NotFound)?;
         session.turn_usage = TurnUsage::default();
-        session
-            .blocks
-            .push(user_block(&session.agent_version_id, message));
+        session.blocks.push(user_block(
+            &session.agent_version_id,
+            &session.model,
+            message,
+        ));
         let result = run_loop(session);
         // The user message's duration spans the whole turn: stamp its finish
         // at the turn end.
@@ -300,6 +303,15 @@ impl Guest for CarsonAgent {
             .unwrap()
             .remove(&session_id)
             .map(|_| ())
+            .ok_or(Error::NotFound)
+    }
+
+    fn set_model(session_id: String, model: String) -> Result<(), Error> {
+        sessions()
+            .lock()
+            .unwrap()
+            .get_mut(&session_id)
+            .map(|s| s.model = model)
             .ok_or(Error::NotFound)
     }
 }
@@ -425,7 +437,7 @@ impl Seg {
         }
     }
 
-    fn into_block(self, version: &str, stream_end: u64, usage: &Usage) -> Block {
+    fn into_block(self, version: &str, model: &str, stream_end: u64, usage: &Usage) -> Block {
         let (kind, text, created, finished) = match self {
             Seg::Thinking {
                 text,
@@ -454,6 +466,7 @@ impl Seg {
         let finished = if finished == 0 { stream_end } else { finished };
         Block {
             agent_version_id: version.to_string(),
+            model: model.to_string(),
             kind: kind.into(),
             text,
             input_tokens: usage.input_tokens,
@@ -468,6 +481,7 @@ impl Seg {
 
 fn tool_result_block(
     version: &str,
+    model: &str,
     tc: &ToolCall,
     result: String,
     is_error: bool,
@@ -476,6 +490,7 @@ fn tool_result_block(
 ) -> Block {
     Block {
         agent_version_id: version.to_string(),
+        model: model.to_string(),
         kind: "tool-result".into(),
         text: Some(
             json!({"id": tc.id, "name": tc.name, "output": result, "is_error": is_error})
@@ -599,9 +614,12 @@ fn run_loop(session: &mut Session) -> Result<(), Error> {
             if let Seg::ToolUse { call, .. } = &seg {
                 tool_calls.push(call.clone());
             }
-            session
-                .blocks
-                .push(seg.into_block(&session.agent_version_id, finished, &turn_usage));
+            session.blocks.push(seg.into_block(
+                &session.agent_version_id,
+                &session.model,
+                finished,
+                &turn_usage,
+            ));
         }
 
         if tool_calls.is_empty() {
@@ -638,6 +656,7 @@ fn run_loop(session: &mut Session) -> Result<(), Error> {
             );
             session.blocks.push(tool_result_block(
                 &session.agent_version_id,
+                &session.model,
                 tc,
                 result,
                 is_error,

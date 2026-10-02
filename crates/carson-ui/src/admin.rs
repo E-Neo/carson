@@ -440,11 +440,9 @@ fn AgentsPanel() -> impl IntoView {
     let agents = RwSignal::new(Vec::<Value>::new());
     let kind = RwSignal::new(String::new());
     let system_prompt = RwSignal::new(String::new());
-    let model = RwSignal::new(String::new());
     let notice = RwSignal::new(None::<String>);
     let editing = RwSignal::new(None::<Value>);
     let edit_system_prompt = RwSignal::new(String::new());
-    let edit_model = RwSignal::new(String::new());
     let edit_instances = RwSignal::new(String::new());
     let edit_max_history = RwSignal::new(String::new());
     let edit_context_window = RwSignal::new(String::new());
@@ -462,9 +460,8 @@ fn AgentsPanel() -> impl IntoView {
     let create = move || {
         let k = kind.get();
         let sp = system_prompt.get();
-        let m = model.get();
-        if k.is_empty() || m.is_empty() {
-            show_notice(&notice, false, "kind and model are required".to_string());
+        if k.is_empty() {
+            show_notice(&notice, false, "kind is required".to_string());
             return;
         }
         let agents = agents;
@@ -473,7 +470,6 @@ fn AgentsPanel() -> impl IntoView {
             let body = json!({
                 "name": k,
                 "system_prompt": sp,
-                "model": m,
                 "instances": 1,
                 "max_history": 20,
                 "context_window": 4000,
@@ -487,7 +483,6 @@ fn AgentsPanel() -> impl IntoView {
             if status == 201 {
                 kind.set(String::new());
                 system_prompt.set(String::new());
-                model.set(String::new());
                 show_notice(&notice, true, "agent created".to_string());
                 fetch_agents(&agents).await;
             } else {
@@ -515,12 +510,6 @@ fn AgentsPanel() -> impl IntoView {
         };
         edit_system_prompt.set(
             item.get("system_prompt")
-                .and_then(|n| n.as_str())
-                .unwrap_or("")
-                .to_string(),
-        );
-        edit_model.set(
-            item.get("model")
                 .and_then(|n| n.as_str())
                 .unwrap_or("")
                 .to_string(),
@@ -568,7 +557,6 @@ fn AgentsPanel() -> impl IntoView {
             let body = json!({
                 "name": k,
                 "system_prompt": edit_system_prompt.get(),
-                "model": edit_model.get(),
                 "instances": edit_instances.get().parse::<usize>().unwrap_or(1),
                 "max_history": edit_max_history.get().parse::<usize>().unwrap_or(20),
                 "context_window": edit_context_window.get().parse::<usize>().unwrap_or(4000),
@@ -603,10 +591,6 @@ fn AgentsPanel() -> impl IntoView {
                     <input prop:value=move || kind.get() on:input=move |ev| kind.set(event_target_value(&ev)) placeholder="assistant"/>
                 </div>
                 <div class="field">
-                    <label>"Model (provider/model)"</label>
-                    <input prop:value=move || model.get() on:input=move |ev| model.set(event_target_value(&ev)) placeholder="groq/llama-3.3-70b-versatile"/>
-                </div>
-                <div class="field">
                     <label>"System prompt"</label>
                     <textarea prop:value=move || system_prompt.get() on:input=move |ev| system_prompt.set(event_target_value(&ev))></textarea>
                 </div>
@@ -630,11 +614,6 @@ fn AgentsPanel() -> impl IntoView {
                                 .and_then(|n| n.as_str())
                                 .map(|v| v.chars().take(8).collect::<String>())
                                 .unwrap_or_default();
-                            let model = owned
-                                .get("model")
-                                .and_then(|n| n.as_str())
-                                .unwrap_or("")
-                                .to_string();
                             let instances = owned.get("instances").and_then(|n| n.as_u64()).unwrap_or(0);
                             let history = owned.get("max_history").and_then(|n| n.as_u64()).unwrap_or(0);
                             let auto = owned.get("auto_compact").and_then(|n| n.as_bool()).unwrap_or(false);
@@ -658,10 +637,6 @@ fn AgentsPanel() -> impl IntoView {
                                 view! {
                                     <div class="card">
                                         <h3>{kind}</h3>
-                                        <div class="field">
-                                            <label>"Model (provider/model)"</label>
-                                            <input prop:value=move || edit_model.get() on:input=move |ev| edit_model.set(event_target_value(&ev))/>
-                                        </div>
                                         <div class="field">
                                             <label>"System prompt"</label>
                                             <textarea prop:value=move || edit_system_prompt.get() on:input=move |ev| edit_system_prompt.set(event_target_value(&ev))></textarea>
@@ -708,7 +683,6 @@ fn AgentsPanel() -> impl IntoView {
                                                 <button class="btn danger" on:click=move |_| remove(k2.clone())>"Delete"</button>
                                             </div>
                                         </div>
-                                        <div class="muted">{model}</div>
                                         <div class="muted">{format!("version {version}")}</div>
                                         <div class="muted">{format!("instances {instances} · max_history {history} · auto_compact {auto}")}</div>
                                         <div class="muted">{format!("tools: {caps}")}</div>
