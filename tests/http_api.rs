@@ -1046,3 +1046,92 @@ async fn message_blocks_keep_their_original_agent_version() {
     assert!(v1_count >= 2, "turn-1 blocks keep v1: {versions:?}");
     assert!(v2_count >= 1, "turn-2 blocks stamped v2: {versions:?}");
 }
+
+/// Images sent with a message are stored as raw files, echoed back as
+/// attachment ids, served with the right mime, and cleaned up on destroy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_attachments_roundtrip_and_validate() {
+    let app = app().await;
+    use base64::Engine as _;
+    let (_, created) = post(
+        &app,
+        "/api/sessions",
+        r#"{"agent":"coder","model":"mock/mock"}"#,
+    )
+    .await;
+    let session_id = created["session_id"].as_str().unwrap().to_string();
+
+    // Malformed / non-image attachments are rejected.
+    let (status, _) = post(
+        &app,
+        &format!("/api/sessions/{session_id}/message"),
+        r#"{"content":"x","attachments":["data:text/plain;base64,aGk="]}"#,
+    )
+    .await;
+    assert_eq!(status, 400);
+    let (status, _) = post(
+        &app,
+        &format!("/api/sessions/{session_id}/message"),
+        r#"{"content":"x","attachments":["not-a-url"]}"#,
+    )
+    .await;
+    assert_eq!(status, 400);
+
+    // A real image is stored and echoed back as an attachment id.
+    let (status, _) = post(
+        &app,
+        &format!("/api/sessions/{session_id}/message"),
+        r#"{"content":"look","attachments":["data:image/png;base64,iVBORw0KGgo="]}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let (_, body) = get(&app, &format!("/api/sessions/{session_id}")).await;
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let user = &v["messages"][0];
+    assert_eq!(user["kind"], "user");
+    let aids = user["attachments"].as_array().unwrap();
+    assert_eq!(aids.len(), 1);
+    let aid = aids[0].as_str().unwrap();
+    assert!(aid.ends_with(".png"), "{aid}");
+    assert!(!aid.contains('/'), "no path traversal: {aid}");
+
+    // The stored raw bytes are served with the right mime.
+    let resp = app
+        .clone()
+        .oneshot(
+            authorized(Request::builder())
+                .uri(&format!("/api/sessions/{session_id}/attachments/{aid}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(ctype, "image/png");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let roundtrip = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    assert_eq!(roundtrip, "iVBORw0KGgo=");
+
+    // Destroying the session removes the attachment.
+    let (status, _) = del(&app, &format!("/api/sessions/{session_id}")).await;
+    assert_eq!(status, 200);
+    let resp = app
+        .clone()
+        .oneshot(
+            authorized(Request::builder())
+                .uri(&format!("/api/sessions/{session_id}/attachments/{aid}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+}

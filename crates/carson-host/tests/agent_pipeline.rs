@@ -88,7 +88,7 @@ async fn send_message(
     let guest = instance.agent.carson_agent_agent();
     let (result,) = guest
         .func_handle_message()
-        .call_async(&mut *store, (session_id, content))
+        .call_async(&mut *store, (session_id, content, &Vec::<String>::new()))
         .await
         .unwrap();
     result.unwrap();
@@ -170,6 +170,34 @@ async fn history_records_the_conversation() {
     let kinds: Vec<_> = blocks.iter().map(|b| b.kind.as_str()).collect();
     assert_eq!(kinds, ["user", "text"]);
     assert_eq!(blocks[1].text.as_deref(), Some("Echo: hi"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handle_message_stores_attachments_on_user_blocks() {
+    let (_hub, _registry, instance) = setup().await;
+    create_session(&instance, "s").await;
+
+    let mut store = instance.store.lock().await;
+    let guest = instance.agent.carson_agent_agent();
+    let (result,) = guest
+        .func_handle_message()
+        .call_async(
+            &mut *store,
+            ("s", "look at this", &vec!["a1.png".to_string()]),
+        )
+        .await
+        .unwrap();
+    result.unwrap();
+
+    let (result,) = guest
+        .func_session_history()
+        .call_async(&mut *store, ("s",))
+        .await
+        .unwrap();
+    drop(store);
+    let blocks = result.unwrap();
+    assert_eq!(blocks[0].kind, "user");
+    assert_eq!(blocks[0].attachments, vec!["a1.png".to_string()]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -264,7 +292,7 @@ async fn destroy_removes_the_session() {
     destroy.unwrap();
     let (message,) = guest
         .func_handle_message()
-        .call_async(&mut *store, ("5", "hi"))
+        .call_async(&mut *store, ("5", "hi", &Vec::<String>::new()))
         .await
         .unwrap();
     drop(store);
@@ -283,7 +311,7 @@ async fn stop_flag_aborts_a_turn() {
     let guest = instance.agent.carson_agent_agent();
     let (result,) = guest
         .func_handle_message()
-        .call_async(&mut *store, ("6", "hi"))
+        .call_async(&mut *store, ("6", "hi", &Vec::<String>::new()))
         .await
         .unwrap();
     drop(store);

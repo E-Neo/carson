@@ -22,6 +22,8 @@ interface llm {
     record message {
         role: string,
         content: option<string>,
+        /// Attachment ids (host-resolved to image data URLs at request time).
+        attachments: list<string>,
         tool-calls: option<list<tool-call>>,
         tool-call-id: option<string>,
     }
@@ -119,6 +121,8 @@ interface agent {
         model: string,
         kind: string,
         text: option<string>,
+        /// Attachment ids attached to this block (images for user messages).
+        attachments: list<string>,
         input-tokens: u32,
         cache-read-tokens: u32,
         cache-creation-tokens: u32,
@@ -146,7 +150,7 @@ interface agent {
     session-state: func(session-id: string) -> result<state, error>;
     compact-session: func(session-id: string) -> result<_, error>;
     reset-session: func(session-id: string) -> result<_, error>;
-    handle-message: func(session-id: string, message: string) -> result<_, error>;
+    handle-message: func(session-id: string, message: string, attachments: list<string>) -> result<_, error>;
     destroy-session: func(session-id: string) -> result<_, error>;
     set-model: func(session-id: string, model: string) -> result<_, error>;
 }

@@ -115,7 +115,11 @@ async fn main() -> Result<()> {
     let db_path = home.join("carson.db");
     let db = Db::open(&db_path)?;
 
-    let ctx = Arc::new(HostContext::with_sandbox_base(home.join("sandbox"))?);
+    let mut ctx = HostContext::with_sandbox_base(home.join("sandbox"))?;
+    ctx.attachments_base = home.join("attachments");
+    std::fs::create_dir_all(&ctx.attachments_base)
+        .with_context(|| format!("create {}", ctx.attachments_base.display()))?;
+    let ctx = Arc::new(ctx);
 
     for provider in db.list_providers()? {
         match host::openai_driver(&provider) {

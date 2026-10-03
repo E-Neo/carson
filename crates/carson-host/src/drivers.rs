@@ -2,7 +2,7 @@ use std::sync::mpsc;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DriverToolCall {
@@ -15,6 +15,8 @@ pub struct DriverToolCall {
 pub struct DriverMessage {
     pub role: String,
     pub content: Option<String>,
+    /// Image data URLs (resolved from attachments by the host).
+    pub images: Vec<String>,
     pub tool_calls: Vec<DriverToolCall>,
     pub tool_call_id: Option<String>,
 }
@@ -350,7 +352,24 @@ impl LlmDriver for OpenAiCompatDriver {
                     json!({"role": "tool", "tool_call_id": tool_call_id, "content": m.content}),
                 );
             } else {
-                messages.push(json!({"role": m.role, "content": m.content}));
+                // Multimodal: a message with images becomes a content array of
+                // text + image_url parts; otherwise it stays a plain string.
+                let content = if m.images.is_empty() {
+                    m.content
+                        .clone()
+                        .map(serde_json::Value::String)
+                        .unwrap_or(Value::Null)
+                } else {
+                    let mut parts: Vec<Value> = Vec::new();
+                    if let Some(text) = &m.content {
+                        parts.push(json!({"type": "text", "text": text}));
+                    }
+                    for url in &m.images {
+                        parts.push(json!({"type": "image_url", "image_url": {"url": url}}));
+                    }
+                    json!(parts)
+                };
+                messages.push(json!({"role": m.role, "content": content}));
             }
         }
         body.insert("messages".into(), json!(messages));
@@ -474,6 +493,7 @@ mod tests {
         DriverMessage {
             role: "user".into(),
             content: Some(content.into()),
+            images: vec![],
             tool_calls: vec![],
             tool_call_id: None,
         }
@@ -537,6 +557,7 @@ mod tests {
         let tool_message = DriverMessage {
             role: "tool".into(),
             content: Some("{\"time\":\"2026-01-01T00:00:00.000Z\"}".into()),
+            images: vec![],
             tool_calls: vec![],
             tool_call_id: Some("call_time".into()),
         };
@@ -762,6 +783,7 @@ mod tests {
         req.messages.push(DriverMessage {
             role: "assistant".into(),
             content: None,
+            images: vec![],
             tool_calls: vec![DriverToolCall {
                 id: "c0".into(),
                 name: "core/time".into(),
@@ -850,6 +872,41 @@ mod tests {
         assert_eq!(
             fns[2]["parameters"],
             serde_json::json!({"type":"object","properties":{"x":{"type":"number"}}})
+        );
+    }
+
+    /// Images serialize as a content array of text + image_url parts.
+    #[tokio::test]
+    async fn openai_serializes_images_as_content_parts() {
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Recorded::default()));
+        let base_url = stub_server(
+            "data: [DONE]\n\n",
+            "HTTP/1.1 200 OK",
+            std::sync::Arc::clone(&recorded),
+        )
+        .await;
+
+        let mut req = openai_request();
+        let mut image_msg = user("look at this");
+        image_msg.images = vec!["data:image/png;base64,AAAA".into()];
+        req.messages = vec![image_msg];
+        let (tx, _rx) = mpsc::channel();
+        OpenAiCompatDriver {
+            base_url,
+            api_key: String::new(),
+        }
+        .stream(req, tx)
+        .await
+        .unwrap();
+
+        let sent = recorded.lock().unwrap().body.clone();
+        let payload: serde_json::Value = serde_json::from_str(&sent).unwrap();
+        assert_eq!(
+            payload["messages"][0]["content"],
+            serde_json::json!([
+                {"type": "text", "text": "look at this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+            ])
         );
     }
 

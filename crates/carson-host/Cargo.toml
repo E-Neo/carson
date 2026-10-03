@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+base64 = "0.23"
 bytes = "1"
 carson-shell = { path = "../carson-shell" }
 futures-util.workspace = true

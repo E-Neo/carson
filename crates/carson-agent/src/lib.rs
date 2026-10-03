@@ -76,13 +76,14 @@ fn now_ms() -> u64 {
     events::now_ms()
 }
 
-fn user_block(version: &str, model: &str, text: String) -> Block {
+fn user_block(version: &str, model: &str, text: String, attachments: Vec<String>) -> Block {
     let now = now_ms();
     Block {
         agent_version_id: version.to_string(),
         model: model.to_string(),
         kind: "user".into(),
         text: Some(text),
+        attachments,
         input_tokens: 0,
         cache_read_tokens: 0,
         cache_creation_tokens: 0,
@@ -94,8 +95,10 @@ fn user_block(version: &str, model: &str, text: String) -> Block {
 
 /// Convert the ordered block log into role-based chat messages for an LLM
 /// request. Consecutive assistant-side blocks (thinking/text/tool-use) merge
-/// into one assistant message; thinking is excluded from the request.
-fn blocks_to_chat(blocks: &[Block]) -> Vec<Message> {
+/// into one assistant message; thinking is excluded from the request. User
+/// messages carry their attachment ids; the summary request (compaction)
+/// passes `include_attachments = false` so image bytes are not re-uploaded.
+fn blocks_to_chat(blocks: &[Block], include_attachments: bool) -> Vec<Message> {
     let mut out: Vec<Message> = Vec::new();
     let mut content = String::new();
     let mut calls: Vec<ToolCall> = Vec::new();
@@ -111,6 +114,7 @@ fn blocks_to_chat(blocks: &[Block]) -> Vec<Message> {
             } else {
                 Some(std::mem::take(content))
             },
+            attachments: Vec::new(),
             tool_calls: if calls.is_empty() {
                 None
             } else {
@@ -124,9 +128,15 @@ fn blocks_to_chat(blocks: &[Block]) -> Vec<Message> {
         match b.kind.as_str() {
             "user" | "system" => {
                 flush(&mut out, &mut content, &mut calls);
+                let attachments = if include_attachments && b.kind == "user" {
+                    b.attachments.clone()
+                } else {
+                    Vec::new()
+                };
                 out.push(Message {
                     role: b.kind.clone(),
                     content: b.text.clone(),
+                    attachments,
                     tool_calls: None,
                     tool_call_id: None,
                 });
@@ -158,6 +168,7 @@ fn blocks_to_chat(blocks: &[Block]) -> Vec<Message> {
                 out.push(Message {
                     role: "tool".into(),
                     content: Some(v["output"].as_str().unwrap_or_default().to_string()),
+                    attachments: Vec::new(),
                     tool_calls: None,
                     tool_call_id: Some(v["id"].as_str().unwrap_or_default().to_string()),
                 });
@@ -271,7 +282,11 @@ impl Guest for CarsonAgent {
             .ok_or(Error::NotFound)
     }
 
-    fn handle_message(session_id: String, message: String) -> Result<(), Error> {
+    fn handle_message(
+        session_id: String,
+        message: String,
+        attachments: Vec<String>,
+    ) -> Result<(), Error> {
         let mut sessions = sessions().lock().unwrap();
         let session = sessions.get_mut(&session_id).ok_or(Error::NotFound)?;
         session.turn_usage = TurnUsage::default();
@@ -279,6 +294,7 @@ impl Guest for CarsonAgent {
             &session.agent_version_id,
             &session.model,
             message,
+            attachments,
         ));
         let result = run_loop(session);
         // The user message's duration spans the whole turn: stamp its finish
@@ -469,6 +485,7 @@ impl Seg {
             model: model.to_string(),
             kind: kind.into(),
             text,
+            attachments: Vec::new(),
             input_tokens: usage.input_tokens,
             cache_read_tokens: usage.cache_read_tokens,
             cache_creation_tokens: usage.cache_creation_tokens,
@@ -496,6 +513,7 @@ fn tool_result_block(
             json!({"id": tc.id, "name": tc.name, "output": result, "is_error": is_error})
                 .to_string(),
         ),
+        attachments: Vec::new(),
         input_tokens: 0,
         cache_read_tokens: 0,
         cache_creation_tokens: 0,
@@ -520,7 +538,7 @@ fn run_loop(session: &mut Session) -> Result<(), Error> {
         let request = Request {
             session_id: session.id.clone(),
             model: session.model.clone(),
-            messages: blocks_to_chat(&session.blocks),
+            messages: blocks_to_chat(&session.blocks, true),
             system_prompt: Some(session.system_prompt.clone()),
             tools: tools::list_tools().to_vec(),
             temperature: None,
@@ -717,7 +735,7 @@ fn summarize(old: &[Block], session: &mut Session) -> Result<String, Error> {
     let request = Request {
         session_id: session.id.clone(),
         model: session.model.clone(),
-        messages: blocks_to_chat(old),
+        messages: blocks_to_chat(old, false),
         system_prompt: Some(SUMMARY_SYSTEM_PROMPT.to_string()),
         tools: Vec::new(),
         temperature: None,

@@ -27,6 +27,7 @@ pub struct State {
     pub drivers: Arc<RwLock<HashMap<String, Arc<dyn LlmDriver>>>>,
     pub tool_runner: Arc<ToolRunner>,
     pub sandbox_base: std::path::PathBuf,
+    pub attachments_base: std::path::PathBuf,
     pub sandbox_links: Arc<RwLock<HashMap<String, String>>>,
     pub caps: Capabilities,
     pub stop: Arc<AtomicBool>,
@@ -50,6 +51,23 @@ fn resolve_model(model: &str) -> Option<(String, String)> {
         }
         _ => None,
     }
+}
+
+/// Turn attachment ids (`<uuid>.<ext>`) into image data URLs by reading the
+/// stored files. Missing files are skipped.
+fn resolve_attachments(base: &std::path::Path, session_id: &str, ids: &[String]) -> Vec<String> {
+    let dir = base.join(session_id);
+    ids.iter()
+        .filter_map(|id| {
+            let bytes = std::fs::read(dir.join(id)).ok()?;
+            let ext = id.rsplit('.').next().unwrap_or("");
+            let mime = crate::host::mime_for_ext(ext);
+            Some(format!(
+                "data:{mime};base64,{}",
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)
+            ))
+        })
+        .collect()
 }
 
 fn to_wit_tool_call(tc: DriverToolCall) -> ToolCall {
@@ -133,12 +151,14 @@ impl crate::bindings::carson::agent::llm::Host for State {
         self.next_stream_id += 1;
 
         let (tx, rx) = mpsc::channel();
+        let session_id = &request.session_id;
         let messages = request
             .messages
             .iter()
             .map(|m| DriverMessage {
                 role: m.role.clone(),
                 content: m.content.clone(),
+                images: resolve_attachments(&self.attachments_base, session_id, &m.attachments),
                 tool_calls: m
                     .tool_calls
                     .as_deref()
@@ -371,6 +391,7 @@ mod tests {
             drivers: Arc::new(RwLock::new(drivers)),
             tool_runner,
             sandbox_base: temp,
+            attachments_base: std::env::temp_dir().join("carson-state-attachments"),
             sandbox_links: Arc::new(RwLock::new(HashMap::new())),
             caps: Capabilities::from_ids(tool_ids.iter().map(|s| s.to_string()).collect()),
             stop: Arc::new(AtomicBool::new(false)),

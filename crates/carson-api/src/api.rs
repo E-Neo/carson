@@ -53,8 +53,12 @@ pub struct SandboxReq {
 }
 
 #[derive(Deserialize, ToSchema)]
+#[schema(example = json!({"content": "hello", "attachments": ["data:image/png;base64,..."]}))]
 pub struct MessageReq {
     content: String,
+    /// Image attachments as `data:image/<mime>;base64,<data>` URLs.
+    #[serde(default)]
+    attachments: Vec<String>,
 }
 
 /// Login body: the configured `[server] token`.
@@ -128,6 +132,13 @@ pub(crate) struct SandboxPath {
 }
 
 #[derive(TypedPath, Deserialize)]
+#[typed_path("/api/sessions/{id}/attachments/{attachment_id}")]
+pub(crate) struct AttachmentPath {
+    id: String,
+    attachment_id: String,
+}
+
+#[derive(TypedPath, Deserialize)]
 #[typed_path("/api/agents/{name}")]
 pub(crate) struct AgentNamePath {
     name: String,
@@ -182,6 +193,7 @@ pub(crate) struct ToolIdPath {
         create_session,
         get_session,
         destroy_session,
+        get_attachment,
         send_message,
         send_stream,
         stop_session,
@@ -359,6 +371,7 @@ pub struct SessionCreateResponse {
     "arguments": null,
     "is_error": false,
     "model": "groq/llama-3",
+    "attachments": [],
     "input_tokens": 10,
     "cache_read_tokens": 0,
     "cache_creation_tokens": 0,
@@ -375,6 +388,8 @@ pub struct BlockInfo {
     pub is_error: bool,
     /// The model that produced this block.
     pub model: String,
+    /// Attachment ids (`<uuid>.<ext>`) for user-image blocks.
+    pub attachments: Vec<String>,
     pub input_tokens: u32,
     pub cache_read_tokens: u32,
     pub cache_creation_tokens: u32,
@@ -451,6 +466,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/sandboxes", get(list_sandboxes).post(create_sandbox))
         .route(SandboxPath::PATH, put(rename_sandbox))
+        .route(AttachmentPath::PATH, get(get_attachment))
         .route(MessagePath::PATH, post(send_message))
         .route(StreamPath::PATH, post(send_stream))
         .route(StopPath::PATH, post(stop_session))
@@ -1506,6 +1522,7 @@ pub(crate) async fn get_session(State(st): State<AppState>, path: SessionPath) -
                 "arguments": payload.get("arguments").and_then(|v| v.as_str()),
                 "is_error": payload.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false),
                 "model": b.model,
+                "attachments": b.attachments,
                 "input_tokens": b.input_tokens,
                 "cache_read_tokens": b.cache_read_tokens,
                 "cache_creation_tokens": b.cache_creation_tokens,
@@ -1621,6 +1638,45 @@ pub(crate) async fn update_session(
     }))
 }
 
+/// Serve a stored image attachment by id.
+#[utoipa::path(
+    get,
+    path = "/api/sessions/{id}/attachments/{attachment_id}",
+    params(
+        ("id" = String, Path, description = "Session id"),
+        ("attachment_id" = String, Path, description = "Attachment id (`<uuid>.<ext>`)")
+    ),
+    responses(
+        (status = 200, description = "Image bytes"),
+        (status = 404, description = "Attachment not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_attachment(State(st): State<AppState>, path: AttachmentPath) -> Response {
+    // Plain filenames only: block path traversal out of the session's dir.
+    if path.attachment_id.contains('/')
+        || path.attachment_id.contains('\\')
+        || path.attachment_id.contains("..")
+    {
+        return json_err(StatusCode::NOT_FOUND, "attachment not found");
+    }
+    let file = st
+        .ctx
+        .attachments_base
+        .join(&path.id)
+        .join(&path.attachment_id);
+    let Ok(bytes) = std::fs::read(&file) else {
+        return json_err(StatusCode::NOT_FOUND, "attachment not found");
+    };
+    let ext = path.attachment_id.rsplit('.').next().unwrap_or("");
+    let mime = carson_host::host::mime_for_ext(ext);
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, HeaderValue::from_static(mime))],
+        bytes,
+    )
+        .into_response()
+}
+
 /// List every sandbox in the pool.
 #[utoipa::path(
     get,
@@ -1702,6 +1758,7 @@ pub(crate) async fn destroy_session(State(st): State<AppState>, path: SessionPat
     drop(store);
     let _ = st.db.delete_session(&id);
     st.ctx.sandbox_links.write().unwrap().remove(&id);
+    remove_session_attachments(&st, &id);
     json_ok(json!({"status": "deleted", "session_id": id}))
 }
 
@@ -1865,13 +1922,14 @@ async fn run_message_blocking(
     instance: Arc<AgentInstance>,
     session_id: String,
     content: String,
+    attachments: Vec<String>,
 ) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("build blocking runtime");
-        rt.block_on(run_message(&instance, &session_id, &content))
+        rt.block_on(run_message(&instance, &session_id, &content, &attachments))
     })
     .await
     .unwrap_or_else(|err| Err(anyhow::anyhow!("agent task join failed: {err}")))
@@ -1881,14 +1939,86 @@ async fn run_message(
     instance: &AgentInstance,
     session_id: &str,
     content: &str,
+    attachments: &[String],
 ) -> anyhow::Result<()> {
     let mut store = instance.store.lock().await;
     let guest = instance.agent.carson_agent_agent();
     let (result,) = guest
         .func_handle_message()
-        .call_async(&mut *store, (session_id, content))
+        .call_async(&mut *store, (session_id, content, attachments))
         .await?;
     result.map_err(|err| anyhow::anyhow!("agent error: {err:?}"))
+}
+
+const MAX_ATTACHMENTS: usize = 8;
+const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
+const MAX_TOTAL_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Validate the request's image attachments and store their raw bytes as
+/// files under `<attachments_base>/<session_id>/`. Returns the attachment ids
+/// (`<uuid>.<ext>`), or a human-readable error (writing nothing on failure).
+fn store_attachments(
+    st: &AppState,
+    session_id: &str,
+    data_urls: &[String],
+) -> Result<Vec<String>, String> {
+    if data_urls.is_empty() {
+        return Ok(Vec::new());
+    }
+    if data_urls.len() > MAX_ATTACHMENTS {
+        return Err(format!("too many attachments (max {MAX_ATTACHMENTS})"));
+    }
+    let mut ids: Vec<String> = Vec::new();
+    let mut total: usize = 0;
+    let store = (|| -> Result<(), String> {
+        for url in data_urls {
+            let rest = url
+                .strip_prefix("data:")
+                .ok_or("attachment must be a data URL")?;
+            let (mime, b64) = rest
+                .split_once(';')
+                .and_then(|(mime, rest)| rest.strip_prefix("base64,").map(|b| (mime, b)))
+                .ok_or("attachment must be data:<mime>;base64,<data>")?;
+            let ext = carson_host::host::ext_for_mime(mime)
+                .ok_or("attachment must be an image (png/jpeg/gif/webp)")?;
+            let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+                .map_err(|_| "invalid base64 attachment")?;
+            if bytes.is_empty() {
+                return Err("attachment is empty".into());
+            }
+            if bytes.len() > MAX_ATTACHMENT_BYTES {
+                return Err(format!(
+                    "attachment too large (max {MAX_ATTACHMENT_BYTES} bytes)"
+                ));
+            }
+            total += bytes.len();
+            if total > MAX_TOTAL_ATTACHMENT_BYTES {
+                return Err(format!(
+                    "attachments too large in total (max {MAX_TOTAL_ATTACHMENT_BYTES} bytes)"
+                ));
+            }
+            let dir = st.ctx.attachments_base.join(session_id);
+            std::fs::create_dir_all(&dir)
+                .map_err(|err| format!("failed to create attachments dir: {err}"))?;
+            let id = format!("{}.{}", uuid::Uuid::new_v4().simple(), ext);
+            std::fs::write(dir.join(&id), &bytes)
+                .map_err(|err| format!("failed to store attachment: {err}"))?;
+            ids.push(id);
+        }
+        Ok(())
+    })();
+    if let Err(err) = store {
+        for id in &ids {
+            let _ = std::fs::remove_file(st.ctx.attachments_base.join(session_id).join(id));
+        }
+        return Err(err);
+    }
+    Ok(ids)
+}
+
+/// Remove every attachment file recorded for a session.
+fn remove_session_attachments(st: &AppState, session_id: &str) {
+    let _ = std::fs::remove_dir_all(st.ctx.attachments_base.join(session_id));
 }
 
 async fn session_usage(instance: &AgentInstance, session_id: &str) -> Usage {
@@ -1931,6 +2061,10 @@ pub(crate) async fn send_stream(
     let Some(pinned) = st.sessions.lock().await.get(&id).cloned() else {
         return json_err(StatusCode::NOT_FOUND, "session not found");
     };
+    let attachment_ids = match store_attachments(&st, &id, &req.attachments) {
+        Ok(ids) => ids,
+        Err(msg) => return json_err(StatusCode::BAD_REQUEST, &msg),
+    };
     let entry = sync_session_agent(&st, &id, &pinned).await;
     let (tx, rx) = mpsc::unbounded_channel::<SseItem>();
     st.hub.register(&id, tx.clone());
@@ -1942,8 +2076,13 @@ pub(crate) async fn send_stream(
 
     tokio::spawn(async move {
         instance.stop.store(false, Ordering::SeqCst);
-        let result =
-            run_message_blocking(instance.clone(), task_id.clone(), req.content.clone()).await;
+        let result = run_message_blocking(
+            instance.clone(),
+            task_id.clone(),
+            req.content.clone(),
+            attachment_ids,
+        )
+        .await;
         host::snapshot_session(&db, &instance, &task_id).await;
         if let Some(e) = sessions.lock().await.get_mut(&task_id) {
             e.updated_at = host::ms_since_epoch();
@@ -2004,6 +2143,10 @@ pub(crate) async fn send_message(
     let Some(pinned) = st.sessions.lock().await.get(&id).cloned() else {
         return json_err(StatusCode::NOT_FOUND, "session not found");
     };
+    let attachment_ids = match store_attachments(&st, &id, &req.attachments) {
+        Ok(ids) => ids,
+        Err(msg) => return json_err(StatusCode::BAD_REQUEST, &msg),
+    };
     let entry = sync_session_agent(&st, &id, &pinned).await;
     let (tx, mut rx) = mpsc::unbounded_channel::<SseItem>();
     st.hub.register(&id, tx.clone());
@@ -2015,8 +2158,13 @@ pub(crate) async fn send_message(
 
     let task = tokio::spawn(async move {
         instance.stop.store(false, Ordering::SeqCst);
-        let result =
-            run_message_blocking(instance.clone(), task_id.clone(), req.content.clone()).await;
+        let result = run_message_blocking(
+            instance.clone(),
+            task_id.clone(),
+            req.content.clone(),
+            attachment_ids,
+        )
+        .await;
         host::snapshot_session(&db, &instance, &task_id).await;
         if let Some(e) = sessions.lock().await.get_mut(&task_id) {
             e.updated_at = host::ms_since_epoch();

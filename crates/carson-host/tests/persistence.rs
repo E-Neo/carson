@@ -83,7 +83,7 @@ async fn send_message(instance: &AgentInstance, hub: &Arc<Hub>, id: &str, conten
     let guest = instance.agent.carson_agent_agent();
     let (result,) = guest
         .func_handle_message()
-        .call_async(&mut *store, (id, content))
+        .call_async(&mut *store, (id, content, &Vec::<String>::new()))
         .await
         .unwrap();
     result.unwrap();
@@ -268,6 +268,7 @@ fn stored_block_metadata_roundtrip() {
         model: "mock/mock".into(),
         kind: "thinking".into(),
         text: Some("hmm".into()),
+        attachments: vec!["a1.png".into()],
         input_tokens: 11,
         cache_read_tokens: 3,
         cache_creation_tokens: 1,
@@ -280,9 +281,11 @@ fn stored_block_metadata_roundtrip() {
     assert_eq!(wit.created_at_ms, 1234);
     assert_eq!(wit.finished_at_ms, 5678);
     assert_eq!(wit.model, "mock/mock");
+    assert_eq!(wit.attachments, vec!["a1.png".to_string()]);
     let back = StoredBlock::from(&wit);
     assert_eq!(back.input_tokens, 11);
     assert_eq!(back.cache_read_tokens, 3);
     assert_eq!(back.agent_version_id, "v9");
     assert_eq!(back.model, "mock/mock");
+    assert_eq!(back.attachments, vec!["a1.png".to_string()]);
 }

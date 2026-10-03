@@ -7,6 +7,8 @@ use leptos::task::spawn_local;
 use leptos_router::hooks::{use_navigate, use_params};
 use leptos_router::params::Params;
 use serde_json::{Value, json};
+use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::Closure;
 
 #[derive(Params, PartialEq, Debug, Clone)]
 struct ChatParams {
@@ -20,6 +22,8 @@ struct ChatParams {
 enum UiBlock {
     User {
         content: String,
+        /// Image sources: data URLs while live, attachment ids after reload.
+        images: Vec<String>,
     },
     Thinking {
         text: RwSignal<String>,
@@ -94,6 +98,15 @@ fn build_history(v: &Value, next_id: &RwSignal<u64>) -> Vec<MsgEntry> {
     };
     for m in arr {
         let model = str_of(m, "model");
+        let images = m
+            .get("attachments")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
         match m.get("kind").and_then(|k| k.as_str()).unwrap_or("") {
             "user" => out.push(MsgEntry {
                 id: alloc_id(next_id),
@@ -104,6 +117,7 @@ fn build_history(v: &Value, next_id: &RwSignal<u64>) -> Vec<MsgEntry> {
                 )),
                 block: UiBlock::User {
                     content: text_of(m),
+                    images,
                 },
             }),
             "thinking" => out.push(MsgEntry {
@@ -271,6 +285,8 @@ struct ChatSignals {
     next_id: RwSignal<u64>,
     /// The session's current model, stamped onto newly streamed blocks.
     session_model: RwSignal<String>,
+    /// Image data URLs queued for the next send (also shown as previews).
+    attachments: RwSignal<Vec<String>>,
     /// Called after a turn completes so the session list reorders.
     on_turn_done: Option<Callback<()>>,
 }
@@ -429,6 +445,7 @@ fn send(session_id: String, input: RwSignal<String>, st: ChatSignals) {
     let id = alloc_id(&st.next_id);
     let times = RwSignal::new((now_ms(), 0));
     let model = st.session_model.get_untracked();
+    let images = st.attachments.get();
     st.messages.update(|m| {
         m.push(MsgEntry {
             id,
@@ -436,10 +453,12 @@ fn send(session_id: String, input: RwSignal<String>, st: ChatSignals) {
             times,
             block: UiBlock::User {
                 content: text.clone(),
+                images: images.clone(),
             },
         });
     });
     input.set(String::new());
+    st.attachments.set(Vec::new());
     st.running.set(true);
     st.usage.set(None);
     st.error.set(None);
@@ -450,7 +469,7 @@ fn send(session_id: String, input: RwSignal<String>, st: ChatSignals) {
     st.scroll_tick.update(|t| *t += 1);
 
     let path = format!("/api/sessions/{session_id}/stream");
-    let body = json!({ "content": text });
+    let body = json!({ "content": text, "attachments": images });
     spawn_local(async move {
         let result = sse::stream_post(&path, &body, move |ev| {
             match apply_stream_event(&st, now_ms(), &ev) {
@@ -578,6 +597,21 @@ fn append_last_tool(messages: &RwSignal<Vec<MsgEntry>>, text: &str) {
     }
 }
 
+/// Read a file as a data URL and hand it to `on_done`.
+fn read_as_data_url(file: web_sys::File, on_done: impl FnOnce(String) + 'static) {
+    let reader = web_sys::FileReader::new().expect("file reader");
+    let reader2 = reader.clone();
+    let closure = Closure::<dyn FnMut()>::once(move || {
+        let url = reader2.result().ok().and_then(|r| r.as_string());
+        if let Some(url) = url {
+            on_done(url);
+        }
+    });
+    reader.set_onloadend(Some(closure.as_ref().unchecked_ref()));
+    closure.forget();
+    let _ = reader.read_as_data_url(&file);
+}
+
 /// The SSE layer frames every payload as a JSON string, so an object payload
 /// (tool events) arrives as a JSON string literal containing JSON text: e.g.
 /// `data: "{\"id\":\"c1\",...}"`. Unwrap that outer layer so field access
@@ -598,7 +632,19 @@ fn last_is_thinking(block: &UiBlock) -> bool {
     matches!(block, UiBlock::Thinking { .. })
 }
 
-fn block_child(entry: &MsgEntry) -> AnyView {
+/// Resolve an image source for rendering: data URLs pass through, attachment
+/// ids point at the session's attachment endpoint.
+fn attachment_src(id: &str, session_id: Option<&str>) -> String {
+    if id.starts_with("data:") {
+        id.to_string()
+    } else if let Some(sid) = session_id {
+        format!("/api/sessions/{sid}/attachments/{id}")
+    } else {
+        String::new()
+    }
+}
+
+fn block_child(entry: &MsgEntry, session_id: Option<&str>) -> AnyView {
     match &entry.block {
         UiBlock::Thinking { text } => {
             let t = *text;
@@ -611,8 +657,15 @@ fn block_child(entry: &MsgEntry) -> AnyView {
             let t = *text;
             view! { <div class="thinking">{move || t.get()}</div> }.into_any()
         }
-        UiBlock::User { content } => {
-            view! { <div class="msg user">{content.clone()}</div> }.into_any()
+        UiBlock::User { content, images } => {
+            let imgs = images
+                .iter()
+                .map(|id| {
+                    let src = attachment_src(id, session_id);
+                    view! { <img class="msg-img" src=src alt="attached image"/> }
+                })
+                .collect::<Vec<_>>();
+            view! { <div class="msg user">{content.clone()} {imgs}</div> }.into_any()
         }
     }
 }
@@ -691,7 +744,7 @@ fn time_tail(times: RwSignal<(u64, u64)>) -> AnyView {
 /// signals, so streamed text grows in place and tool cards update live.
 /// Every card carries a header (start time, then a kind label) and a footer
 /// (duration); the user's duration spans the whole turn.
-fn entry_view(entry: &MsgEntry) -> AnyView {
+fn entry_view(entry: &MsgEntry, session_id: Option<&str>) -> AnyView {
     let kind = match &entry.block {
         UiBlock::Thinking { .. } => Some("Thinking"),
         UiBlock::Tool { .. } => Some("Tool"),
@@ -705,7 +758,7 @@ fn entry_view(entry: &MsgEntry) -> AnyView {
     };
     let head = time_head(kind, model, entry.times);
     let tail = time_tail(entry.times);
-    let child = block_child(entry);
+    let child = block_child(entry, session_id);
     match &entry.block {
         UiBlock::User { .. } => {
             view! { <div class="msg user">{head} {child} {tail}</div> }.into_any()
@@ -786,6 +839,8 @@ pub fn ChatPage() -> impl IntoView {
     let selected_sandbox = RwSignal::new(None::<String>);
     // The session's current model; streamed blocks are stamped with it.
     let session_model = RwSignal::new(String::new());
+    // Image data URLs attached to the next message (also shown as previews).
+    let attachments = RwSignal::new(Vec::<String>::new());
     // Which session-item (if any) has its action menu open, plus where to anchor it.
     let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
     // Inline rename of a session-item row.
@@ -817,6 +872,7 @@ pub fn ChatPage() -> impl IntoView {
         at_latest,
         next_id,
         session_model,
+        attachments,
         on_turn_done: Some(Callback::new(move |()| {
             let sessions = sessions;
             spawn_local(async move {
@@ -911,6 +967,24 @@ pub fn ChatPage() -> impl IntoView {
     let do_send = move || {
         if let Some(id) = active.get() {
             send(id, input, stream_signals);
+        }
+    };
+
+    // Attach image files selected in the composer.
+    let on_attach_files = move |ev: web_sys::Event| {
+        let input = ev
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+            .expect("file input");
+        let files = input.files();
+        input.set_value("");
+        if let Some(files) = files {
+            for i in 0..files.length() {
+                if let Some(file) = files.get(i) {
+                    let attachments = attachments;
+                    read_as_data_url(file, move |url| attachments.update(|v| v.push(url)));
+                }
+            }
         }
     };
 
@@ -1388,7 +1462,10 @@ pub fn ChatPage() -> impl IntoView {
                                     }
                                 >
                                     <div class="messages-column">
-                                        <For each=move || messages.get() key=|e: &MsgEntry| e.id children=move |e| entry_view(&e)/>
+                                        <For each=move || messages.get() key=|e: &MsgEntry| e.id children=move |e| {
+                                            let sid = active.get_untracked();
+                                            entry_view(&e, sid.as_deref())
+                                        }/>
                                     </div>
                                 </div>
                                 {move || {
@@ -1404,7 +1481,42 @@ pub fn ChatPage() -> impl IntoView {
                                     })
     }}
                                 <div class="composer">
+                                    {move || {
+                                        let previews = attachments
+                                            .get()
+                                            .into_iter()
+                                            .enumerate()
+                                            .map(|(i, url)| {
+                                                let i = i;
+                                                view! {
+                                                    <span class="attach-preview">
+                                                        <img class="attach-thumb" src=url alt="attachment"/>
+                                                        <button
+                                                            class="attach-remove"
+                                                            title="Remove"
+                                                            on:click=move |_| attachments.update(|v| { v.remove(i); })
+                                                        >
+                                                            "×"
+                                                        </button>
+                                                    </span>
+                                                }
+                                            })
+                                            .collect::<Vec<_>>();
+                                        (!previews.is_empty()).then(|| {
+                                            view! { <div class="attach-row">{previews}</div> }
+                                        })
+                                    }}
                                     <div class="composer-inner">
+                                        <label class="btn attach-btn" title="Attach an image">
+                                            <input
+                                                type="file"
+                                                accept="image/png,image/jpeg,image/gif,image/webp"
+                                                multiple
+                                                hidden
+                                                on:change=on_attach_files
+                                            />
+                                            "Attach"
+                                        </label>
                                         <textarea
                                             name="message"
                                             aria-label="Message"
@@ -1758,6 +1870,7 @@ mod tests {
                 model: "mock/mock".into(),
                 block: UiBlock::User {
                     content: "hi".into(),
+                    images: vec![],
                 },
             },
             MsgEntry {
@@ -1791,7 +1904,7 @@ mod tests {
     fn history_fixture() -> Value {
         json!({
             "messages": [
-                {"kind": "user", "text": "hi", "model": "mock/mock", "created_at_ms": 1000, "finished_at_ms": 1000},
+                {"kind": "user", "text": "hi", "model": "mock/mock", "attachments": ["a1.png", "data:image/png;base64,AAAA"], "created_at_ms": 1000, "finished_at_ms": 1000},
                 {"kind": "thinking", "text": "reasoning", "model": "mock/mock", "created_at_ms": 2000, "finished_at_ms": 2500},
                 {"kind": "tool-use", "tool_call_id": "c1", "tool_name": "time",
                  "arguments": "{}", "model": "mock/mock", "created_at_ms": 3000, "finished_at_ms": 3000},
@@ -1823,6 +1936,19 @@ mod tests {
             entries[0].model, "mock/mock",
             "model provenance survives history"
         );
+        match &entries[0].block {
+            UiBlock::User { images, .. } => {
+                assert_eq!(
+                    images,
+                    &vec![
+                        "a1.png".to_string(),
+                        "data:image/png;base64,AAAA".to_string()
+                    ],
+                    "attachment ids survive history"
+                );
+            }
+            other => panic!("expected user block, got {other:?}"),
+        }
 
         match &entries[2].block {
             UiBlock::Tool { text } => {
@@ -1918,6 +2044,7 @@ mod tests {
             at_latest: RwSignal::new(true),
             next_id: RwSignal::new(0u64),
             session_model: RwSignal::new("mock/mock".into()),
+            attachments: RwSignal::new(Vec::new()),
             on_turn_done: None,
         }
     }

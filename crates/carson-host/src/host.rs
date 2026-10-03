@@ -122,6 +122,28 @@ pub fn builtin_by_id(id: &str) -> Option<ToolDef> {
     builtin_tools().into_iter().find(|t| t.id == id)
 }
 
+/// Extension for a supported image mime type, or `None`.
+pub fn ext_for_mime(mime: &str) -> Option<&'static str> {
+    match mime {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        _ => None,
+    }
+}
+
+/// Mime type for a stored image extension.
+pub fn mime_for_ext(ext: &str) -> &'static str {
+    match ext {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "application/octet-stream",
+    }
+}
+
 /// Shared, immutable state used to build every agent instance. Providers and tools are registered
 /// at runtime via the API; the shared maps are the live source of truth.
 pub struct HostContext {
@@ -132,6 +154,9 @@ pub struct HostContext {
     pub tool_runner: Arc<ToolRunner>,
     /// Parent directory of every sandbox: `$CARSON_HOME/sandbox`.
     pub sandbox_base: PathBuf,
+    /// Parent directory of message attachments: `$CARSON_HOME/attachments`,
+    /// organised as `<attachments_base>/<session_id>/<attachment_id>`.
+    pub attachments_base: PathBuf,
     /// Live `session_id -> sandbox_id` links, seeded on create/restore and
     /// updated when a session switches sandbox.
     pub sandbox_links: Arc<RwLock<HashMap<String, String>>>,
@@ -154,6 +179,7 @@ impl HostContext {
             drivers: Arc::new(RwLock::new(HashMap::new())),
             tool_runner,
             sandbox_base: sandbox_base.into(),
+            attachments_base: std::env::temp_dir().join("carson-attachments"),
             sandbox_links: Arc::new(RwLock::new(HashMap::new())),
         })
     }
@@ -304,6 +330,7 @@ pub async fn build_instance(ctx: &HostContext, def: &AgentDef) -> Result<AgentIn
         drivers: ctx.drivers.clone(),
         tool_runner: ctx.tool_runner.clone(),
         sandbox_base: ctx.sandbox_base.clone(),
+        attachments_base: ctx.attachments_base.clone(),
         sandbox_links: ctx.sandbox_links.clone(),
         caps: Capabilities::from_ids(def.capabilities.clone()),
         stop: Arc::new(AtomicBool::new(false)),

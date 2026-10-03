@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS messages (
     seq INTEGER NOT NULL,
     agent_version_id TEXT NOT NULL,
     model TEXT NOT NULL DEFAULT '',
+    attachments_json TEXT NOT NULL DEFAULT '[]',
     kind TEXT NOT NULL,
     content TEXT,
     input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -142,6 +143,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         "model",
         "ALTER TABLE messages ADD COLUMN model TEXT NOT NULL DEFAULT ''",
     )?;
+    add_column_if_missing(
+        conn,
+        "messages",
+        "attachments_json",
+        "ALTER TABLE messages ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'",
+    )?;
     // Backfill the model for sessions (and their blocks) that predate the
     // decoupling, from the agent version they are pinned to — while that
     // column still exists — then drop the now-unused agents.model column.
@@ -171,6 +178,8 @@ pub struct StoredBlock {
     /// Plain text for user/thinking/text/system; a JSON payload for tool
     /// kinds (`{"id","name","arguments"}` / `{"id","name","output","is_error"}`).
     pub text: Option<String>,
+    /// Attachment ids (`<uuid>.<ext>`) attached to this block (user images).
+    pub attachments: Vec<String>,
     pub input_tokens: u32,
     pub cache_read_tokens: u32,
     pub cache_creation_tokens: u32,
@@ -186,6 +195,7 @@ impl From<&crate::bindings::exports::carson::agent::agent::Block> for StoredBloc
             model: b.model.clone(),
             kind: b.kind.clone(),
             text: b.text.clone(),
+            attachments: b.attachments.clone(),
             input_tokens: b.input_tokens,
             cache_read_tokens: b.cache_read_tokens,
             cache_creation_tokens: b.cache_creation_tokens,
@@ -203,6 +213,7 @@ impl From<&StoredBlock> for crate::bindings::exports::carson::agent::agent::Bloc
             model: b.model.clone(),
             kind: b.kind.clone(),
             text: b.text.clone(),
+            attachments: b.attachments.clone(),
             input_tokens: b.input_tokens,
             cache_read_tokens: b.cache_read_tokens,
             cache_creation_tokens: b.cache_creation_tokens,
@@ -533,16 +544,17 @@ impl Db {
         )?;
         for (seq, block) in session.messages.iter().enumerate() {
             tx.execute(
-                "INSERT INTO messages (session_id, seq, agent_version_id, model, kind, content, \
+                "INSERT INTO messages (session_id, seq, agent_version_id, model, attachments_json, kind, content, \
                  input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, \
                  created_at, finished_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
                 params![
                     session.id,
                     seq as i64,
                     // Per-block provenance: which agent version produced it.
                     block.agent_version_id,
                     block.model,
+                    serde_json::to_string(&block.attachments)?,
                     block.kind,
                     block.text,
                     block.input_tokens,
@@ -564,7 +576,7 @@ impl Db {
             "SELECT s.id, s.agent_name, s.agent_version_id, s.name, s.sandbox_id, s.model, s.summary, \
              s.input_tokens, s.cache_read_tokens, s.cache_creation_tokens, s.output_tokens, \
              s.updated_at, \
-             m.seq, m.agent_version_id, m.model, m.kind, m.content, m.input_tokens, \
+             m.seq, m.agent_version_id, m.model, m.attachments_json, m.kind, m.content, m.input_tokens, \
              m.cache_read_tokens, m.cache_creation_tokens, \
              m.output_tokens, m.created_at, m.finished_at \
              FROM sessions s LEFT JOIN messages m ON m.session_id = s.id \
@@ -572,17 +584,19 @@ impl Db {
         )?;
         let rows = stmt.query_map([], |row| {
             let block = if row.get::<_, Option<i64>>(12)?.is_some() {
+                let attachments: String = row.get::<_, Option<String>>(15)?.unwrap_or_default();
                 Some(MessageRow(StoredBlock {
                     agent_version_id: row.get::<_, Option<String>>(13)?.unwrap_or_default(),
                     model: row.get::<_, Option<String>>(14)?.unwrap_or_default(),
-                    kind: row.get::<_, Option<String>>(15)?.unwrap_or_default(),
-                    text: row.get(16)?,
-                    input_tokens: row.get::<_, i64>(17)? as u32,
-                    cache_read_tokens: row.get::<_, i64>(18)? as u32,
-                    cache_creation_tokens: row.get::<_, i64>(19)? as u32,
-                    output_tokens: row.get::<_, i64>(20)? as u32,
-                    created_at_ms: row.get::<_, Option<i64>>(21)?.unwrap_or(0) as u64,
-                    finished_at_ms: row.get::<_, Option<i64>>(22)?.unwrap_or(0) as u64,
+                    attachments: serde_json::from_str(&attachments).unwrap_or_default(),
+                    kind: row.get::<_, Option<String>>(16)?.unwrap_or_default(),
+                    text: row.get(17)?,
+                    input_tokens: row.get::<_, i64>(18)? as u32,
+                    cache_read_tokens: row.get::<_, i64>(19)? as u32,
+                    cache_creation_tokens: row.get::<_, i64>(20)? as u32,
+                    output_tokens: row.get::<_, i64>(21)? as u32,
+                    created_at_ms: row.get::<_, Option<i64>>(22)?.unwrap_or(0) as u64,
+                    finished_at_ms: row.get::<_, Option<i64>>(23)?.unwrap_or(0) as u64,
                 }))
             } else {
                 None
@@ -787,6 +801,7 @@ mod tests {
             model: "mock/mock".into(),
             kind: kind.into(),
             text: Some(text.into()),
+            attachments: Vec::new(),
             input_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
