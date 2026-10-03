@@ -322,11 +322,61 @@ body {
 }
 
 .attach-btn {
-  flex-shrink: 0;
-  align-self: stretch;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
 }
+
+.attach-btn:hover { color: var(--text); background: var(--bg-panel); }
+
+.attach-btn svg { width: 18px; height: 18px; }
+
+/* Click-to-enlarge lightbox for attachment images */
+.attach-thumb, .msg-img { cursor: zoom-in; }
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.75);
+  cursor: zoom-out;
+}
+
+.lightbox img {
+  max-width: 92vw;
+  max-height: 92vh;
+  object-fit: contain;
+  border-radius: 6px;
+}
+
+.lightbox-close {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  background: rgba(0, 0, 0, 0.4);
+  color: #fff;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.lightbox-close:hover { background: rgba(0, 0, 0, 0.6); }
 
 /* Timestamp + duration stay readable on the accent user bubble in both themes. */
 .msg.user .msg-start,
@@ -465,27 +515,57 @@ body {
 }
 
 /* Align the input row with the centered message column while the bar
-   itself stays full-width. */
+   itself stays full-width. The row is a rounded input container. */
 .composer-inner {
   display: flex;
-  gap: 8px;
+  align-items: flex-end;
+  gap: 6px;
   width: 100%;
   max-width: 860px;
   margin-inline: auto;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 8px 10px;
 }
 
 .composer textarea {
   flex: 1;
   resize: none;
-  background: var(--bg-input);
+  background: transparent;
   color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 10px 12px;
+  border: none;
+  outline: none;
+  padding: 8px 4px;
   font: inherit;
-  min-height: 42px;
+  min-height: 44px;
   max-height: 160px;
 }
+
+.send-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  border-radius: 999px;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+
+.send-btn:hover:not(:disabled) { filter: brightness(1.1); }
+
+.send-btn:disabled {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  cursor: not-allowed;
+}
+
+.send-btn svg { width: 18px; height: 18px; }
 
 .empty {
   margin: auto;

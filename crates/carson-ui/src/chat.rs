@@ -439,13 +439,13 @@ fn apply_stream_event(st: &ChatSignals, now: u64, ev: &sse::SseEvent) -> EventOu
 /// arrive and surface their outcomes.
 fn send(session_id: String, input: RwSignal<String>, st: ChatSignals) {
     let text = input.get().trim().to_string();
-    if text.is_empty() || st.running.get() {
+    let images = st.attachments.get();
+    if (text.is_empty() && images.is_empty()) || st.running.get() {
         return;
     }
     let id = alloc_id(&st.next_id);
     let times = RwSignal::new((now_ms(), 0));
     let model = st.session_model.get_untracked();
-    let images = st.attachments.get();
     st.messages.update(|m| {
         m.push(MsgEntry {
             id,
@@ -644,7 +644,11 @@ fn attachment_src(id: &str, session_id: Option<&str>) -> String {
     }
 }
 
-fn block_child(entry: &MsgEntry, session_id: Option<&str>) -> AnyView {
+fn block_child(
+    entry: &MsgEntry,
+    session_id: Option<&str>,
+    lightbox: RwSignal<Option<String>>,
+) -> AnyView {
     match &entry.block {
         UiBlock::Thinking { text } => {
             let t = *text;
@@ -662,7 +666,15 @@ fn block_child(entry: &MsgEntry, session_id: Option<&str>) -> AnyView {
                 .iter()
                 .map(|id| {
                     let src = attachment_src(id, session_id);
-                    view! { <img class="msg-img" src=src alt="attached image"/> }
+                    let lb = lightbox;
+                    view! {
+                        <img
+                            class="msg-img"
+                            src=src.clone()
+                            alt="attached image"
+                            on:click=move |_| lb.set(Some(src.clone()))
+                        />
+                    }
                 })
                 .collect::<Vec<_>>();
             view! { <div class="msg user">{content.clone()} {imgs}</div> }.into_any()
@@ -744,7 +756,11 @@ fn time_tail(times: RwSignal<(u64, u64)>) -> AnyView {
 /// signals, so streamed text grows in place and tool cards update live.
 /// Every card carries a header (start time, then a kind label) and a footer
 /// (duration); the user's duration spans the whole turn.
-fn entry_view(entry: &MsgEntry, session_id: Option<&str>) -> AnyView {
+fn entry_view(
+    entry: &MsgEntry,
+    session_id: Option<&str>,
+    lightbox: RwSignal<Option<String>>,
+) -> AnyView {
     let kind = match &entry.block {
         UiBlock::Thinking { .. } => Some("Thinking"),
         UiBlock::Tool { .. } => Some("Tool"),
@@ -758,7 +774,7 @@ fn entry_view(entry: &MsgEntry, session_id: Option<&str>) -> AnyView {
     };
     let head = time_head(kind, model, entry.times);
     let tail = time_tail(entry.times);
-    let child = block_child(entry, session_id);
+    let child = block_child(entry, session_id, lightbox);
     match &entry.block {
         UiBlock::User { .. } => {
             view! { <div class="msg user">{head} {child} {tail}</div> }.into_any()
@@ -841,6 +857,8 @@ pub fn ChatPage() -> impl IntoView {
     let session_model = RwSignal::new(String::new());
     // Image data URLs attached to the next message (also shown as previews).
     let attachments = RwSignal::new(Vec::<String>::new());
+    // Full-size attachment source shown in the enlarge overlay, if any.
+    let lightbox = RwSignal::new(None::<String>);
     // Which session-item (if any) has its action menu open, plus where to anchor it.
     let menu_popover = RwSignal::new(None::<(String, f64, f64)>);
     // Inline rename of a session-item row.
@@ -1464,7 +1482,7 @@ pub fn ChatPage() -> impl IntoView {
                                     <div class="messages-column">
                                         <For each=move || messages.get() key=|e: &MsgEntry| e.id children=move |e| {
                                             let sid = active.get_untracked();
-                                            entry_view(&e, sid.as_deref())
+                                            entry_view(&e, sid.as_deref(), lightbox)
                                         }/>
                                     </div>
                                 </div>
@@ -1488,9 +1506,16 @@ pub fn ChatPage() -> impl IntoView {
                                             .enumerate()
                                             .map(|(i, url)| {
                                                 let i = i;
+                                                let lb = lightbox;
+                                                let url = url.clone();
                                                 view! {
                                                     <span class="attach-preview">
-                                                        <img class="attach-thumb" src=url alt="attachment"/>
+                                                        <img
+                                                            class="attach-thumb"
+                                                            src=url.clone()
+                                                            alt="attachment"
+                                                            on:click=move |_| lb.set(Some(url.clone()))
+                                                        />
                                                         <button
                                                             class="attach-remove"
                                                             title="Remove"
@@ -1507,7 +1532,7 @@ pub fn ChatPage() -> impl IntoView {
                                         })
                                     }}
                                     <div class="composer-inner">
-                                        <label class="btn attach-btn" title="Attach an image">
+                                        <label class="attach-btn" title="Attach an image">
                                             <input
                                                 type="file"
                                                 accept="image/png,image/jpeg,image/gif,image/webp"
@@ -1515,7 +1540,16 @@ pub fn ChatPage() -> impl IntoView {
                                                 hidden
                                                 on:change=on_attach_files
                                             />
-                                            "Attach"
+                                            <svg
+                                                viewBox="0 0 24 24"
+                                                fill="none"
+                                                stroke="currentColor"
+                                                stroke-width="2"
+                                                stroke-linecap="round"
+                                                stroke-linejoin="round"
+                                            >
+                                                <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                                            </svg>
                                         </label>
                                         <textarea
                                             name="message"
@@ -1531,8 +1565,23 @@ pub fn ChatPage() -> impl IntoView {
                                                 }
                                             }
                                         ></textarea>
-                                        <button class="btn primary" disabled=move || running.get() on:click=move |_| do_send()>
-                                            "Send"
+                                        <button
+                                            class="send-btn"
+                                            title="Send"
+                                            disabled=move || running.get() || (input.get().trim().is_empty() && attachments.get().is_empty())
+                                            on:click=move |_| do_send()
+                                        >
+                                            <svg
+                                                viewBox="0 0 24 24"
+                                                fill="none"
+                                                stroke="currentColor"
+                                                stroke-width="2"
+                                                stroke-linecap="round"
+                                                stroke-linejoin="round"
+                                            >
+                                                <line x1="19" y1="12" x2="5" y2="12"/>
+                                                <polyline points="12 19 5 12 12 5"/>
+                                            </svg>
                                         </button>
                                     </div>
                                 </div>
@@ -1750,6 +1799,19 @@ pub fn ChatPage() -> impl IntoView {
                         }
                     })
                 }}
+                {move || lightbox.get().map(|src| {
+                    view! {
+                        <div
+                            class="lightbox"
+                            role="dialog"
+                            aria-label="Attachment preview"
+                            on:click=move |_| lightbox.set(None)
+                        >
+                            <img src=src alt="enlarged attachment"/>
+                            <button class="lightbox-close" aria-label="Close" on:click=move |_| lightbox.set(None)>"×"</button>
+                        </div>
+                    }
+                })}
             </div>
         }
 }
