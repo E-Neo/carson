@@ -1135,3 +1135,42 @@ async fn message_attachments_roundtrip_and_validate() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 404);
 }
+
+/// `/api/sessions/models` lists distinct models used across sessions, most
+/// recent first; `/api/providers/{name}/models` 404s for unknown providers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_suggestion_endpoints() {
+    let app = app().await;
+    let (_, a) = post(
+        &app,
+        "/api/sessions",
+        r#"{"agent":"coder","model":"mock/mock"}"#,
+    )
+    .await;
+    assert_ne!(a["session_id"].as_str(), None);
+    let (_, b) = post(
+        &app,
+        "/api/sessions",
+        r#"{"agent":"coder","model":"mock/other"}"#,
+    )
+    .await;
+    assert_ne!(b["session_id"].as_str(), None);
+
+    let (status, body) = get(&app, "/api/sessions/models").await;
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let models: Vec<String> = v["models"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(models.contains(&"mock/mock".to_string()), "{models:?}");
+    assert!(models.contains(&"mock/other".to_string()), "{models:?}");
+
+    // Unknown provider -> 404.
+    let (status, _) = get(&app, "/api/providers/nope/models").await;
+    assert_eq!(status, 404);
+}

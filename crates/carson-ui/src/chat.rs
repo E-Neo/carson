@@ -55,6 +55,10 @@ fn now_ms() -> u64 {
     js_sys::Date::now() as u64
 }
 
+/// The default model (provider/model) the new-chat field starts with and the
+/// first suggestion in the model dropdown.
+const DEFAULT_MODEL: &str = "deepseek/deepseek-flash";
+
 fn alloc_id(next_id: &RwSignal<u64>) -> u64 {
     let mut id = 0;
     next_id.update(|n| {
@@ -824,6 +828,79 @@ fn sanitize_hrefs(html: &str) -> String {
     out
 }
 
+/// A model picker: a raw `provider/model` input with a dropdown listing model
+/// suggestions. Clicking the field or the toggle opens the full list; typing
+/// filters it; selecting fills the input.
+#[component]
+fn ModelCombobox(value: RwSignal<String>, suggestions: RwSignal<Vec<String>>) -> impl IntoView {
+    let open = RwSignal::new(false);
+    let query = RwSignal::new(String::new());
+
+    let filtered = Memo::new(move |_| {
+        let q = query.get().trim().to_lowercase();
+        let all = suggestions.get();
+        if q.is_empty() {
+            all
+        } else {
+            all.into_iter()
+                .filter(|s| s.to_lowercase().contains(&q))
+                .collect()
+        }
+    });
+
+    let open_all = move || {
+        query.set(String::new());
+        open.set(true);
+    };
+
+    view! {
+        <div class="model-combo">
+            <input
+                prop:value=move || value.get()
+                placeholder="provider/model or pick one"
+                on:input=move |ev| {
+                    let v = event_target_value(&ev);
+                    value.set(v.clone());
+                    query.set(v);
+                    open.set(true);
+                }
+                on:focus=move |_| open_all()
+            />
+            {move || open.get().then(|| view! {
+                <>
+                    <div class="model-combo-backdrop" on:click=move |_| open.set(false)></div>
+                    <div class="model-combo-menu">
+                        {move || {
+                            let items = filtered.get();
+                            if items.is_empty() {
+                                view! { <div class="model-combo-empty">"No matching models"</div> }.into_any()
+                            } else {
+                                items.into_iter().map(|m| {
+                                    let m = m.clone();
+                                    let label = m.clone();
+                                    view! {
+                                        <button
+                                            class="model-combo-item"
+                                            type="button"
+                                            on:mousedown=move |ev| {
+                                                ev.prevent_default();
+                                                value.set(m.clone());
+                                                open.set(false);
+                                            }
+                                        >
+                                            {label}
+                                        </button>
+                                    }
+                                }).collect::<Vec<_>>().into_any()
+                            }
+                        }}
+                    </div>
+                </>
+            })}
+        </div>
+    }
+}
+
 #[component]
 pub fn ChatPage() -> impl IntoView {
     let navigate = use_navigate();
@@ -840,7 +917,9 @@ pub fn ChatPage() -> impl IntoView {
     let status_line = RwSignal::new(None::<String>);
     let active = RwSignal::new(None::<String>);
     let selected_agent = RwSignal::new(String::new());
-    let new_model = RwSignal::new(String::new());
+    let new_model = RwSignal::new(DEFAULT_MODEL.to_string());
+    // Model suggestions for the comboboxes (recently used + provider catalogs).
+    let model_suggestions = RwSignal::new(vec![DEFAULT_MODEL.to_string()]);
     let next_id = RwSignal::new(1u64);
     let drawer_open = RwSignal::new(false);
 
@@ -918,6 +997,7 @@ pub fn ChatPage() -> impl IntoView {
     };
 
     spawn_local(async move { refresh_sessions_async(sessions).await });
+    spawn_local(async move { load_model_suggestions(model_suggestions).await });
     spawn_local(async move {
         if let Ok((_, v)) = api::get("/api/agents").await
             && let Some(list) = v.get("agents").and_then(|x| x.as_array())
@@ -1626,14 +1706,8 @@ pub fn ChatPage() -> impl IntoView {
                                                     </select>
                                                 </div>
                                                 <div class="field">
-                                                    <label for="new-model">"Model (provider/model)"</label>
-                                                    <input
-                                                        id="new-model"
-                                                        name="model"
-                                                        placeholder="groq/llama-3.3-70b-versatile"
-                                                        prop:value=move || new_model.get()
-                                                        on:input=move |ev| new_model.set(event_target_value(&ev))
-                                                    />
+                                                    <label>"Model (provider/model)"</label>
+                                                    <ModelCombobox value=new_model suggestions=model_suggestions/>
                                                 </div>
                                                 <button class="btn primary" on:click=move |_| create_session()>
                                                     "Start"
@@ -1678,15 +1752,9 @@ pub fn ChatPage() -> impl IntoView {
                                                 "Save"
                                             </button>
                                         </div>
-                                        <label for="session-model">"Model (provider/model)"</label>
+                                        <label>"Model (provider/model)"</label>
                                         <div class="settings-row">
-                                            <input
-                                                id="session-model"
-                                                name="session-model"
-                                                placeholder="groq/llama-3.3-70b-versatile"
-                                                prop:value=move || model_edit.get()
-                                                on:input=move |ev| model_edit.set(event_target_value(&ev))
-                                            />
+                                            <ModelCombobox value=model_edit suggestions=model_suggestions/>
                                             <button class="btn primary" on:click=move |_| save_session_model()>
                                                 "Save"
                                             </button>
@@ -1814,6 +1882,55 @@ pub fn ChatPage() -> impl IntoView {
                 })}
             </div>
         }
+}
+
+async fn load_model_suggestions(suggestions: RwSignal<Vec<String>>) {
+    let mut merged: Vec<String> = Vec::new();
+    // Recently-used models, most recent first.
+    if let Ok((_, v)) = api::get("/api/sessions/models").await
+        && let Some(list) = v.get("models").and_then(|x| x.as_array())
+    {
+        for model in list {
+            if let Some(s) = model.as_str() {
+                merged.push(s.to_string());
+            }
+        }
+    }
+    // Provider catalogs, qualified as provider/model.
+    if let Ok((_, v)) = api::get("/api/providers").await
+        && let Some(providers) = v.get("providers").and_then(|x| x.as_array())
+    {
+        for provider in providers {
+            let name = provider
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
+            if let Ok((_, v)) = api::get(&format!("/api/providers/{name}/models")).await
+                && let Some(list) = v.get("models").and_then(|x| x.as_array())
+            {
+                for model in list {
+                    if let Some(id) = model.as_str() {
+                        merged.push(format!("{name}/{id}"));
+                    }
+                }
+            }
+        }
+    }
+    // Dedupe, keeping the default model first.
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    seen.insert(DEFAULT_MODEL.to_string());
+    out.push(DEFAULT_MODEL.to_string());
+    for model in merged {
+        if seen.insert(model.clone()) {
+            out.push(model);
+        }
+    }
+    suggestions.set(out);
 }
 
 async fn refresh_sessions_async(sessions: RwSignal<Vec<SessionSummary>>) {

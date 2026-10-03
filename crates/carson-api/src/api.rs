@@ -74,6 +74,13 @@ pub struct MeResponse {
     pub authenticated: bool,
 }
 
+/// A list of model ids.
+#[derive(ToSchema)]
+#[schema(example = json!({"models": ["groq/llama-3.3-70b-versatile"]}))]
+pub struct ModelListResponse {
+    pub models: Vec<String>,
+}
+
 /// Request body for registering or updating a custom tool. The wasm is
 /// base64-encoded; on update, omitting `wasm_b64` keeps the stored module.
 #[derive(Deserialize, ToSchema)]
@@ -157,6 +164,12 @@ pub(crate) struct ProviderNamePath {
 }
 
 #[derive(TypedPath, Deserialize)]
+#[typed_path("/api/providers/{name}/models")]
+pub(crate) struct ProviderModelsPath {
+    name: String,
+}
+
+#[derive(TypedPath, Deserialize)]
 #[typed_path("/api/tools/{*id}")]
 pub(crate) struct ToolIdPath {
     id: String,
@@ -185,6 +198,8 @@ pub(crate) struct ToolIdPath {
         create_provider,
         update_provider,
         delete_provider,
+        session_models,
+        provider_models,
         list_tools,
         create_tool,
         update_tool,
@@ -209,6 +224,7 @@ pub(crate) struct ToolIdPath {
         MessageReq,
         LoginRequest,
         MeResponse,
+        ModelListResponse,
         Usage,
         HealthResponse,
         StatusResponse,
@@ -457,6 +473,8 @@ pub fn router(state: AppState) -> Router {
             ProviderNamePath::PATH,
             put(update_provider).delete(delete_provider),
         )
+        .route(ProviderModelsPath::PATH, get(provider_models))
+        .route("/api/sessions/models", get(session_models))
         .route("/api/tools", get(list_tools).post(create_tool))
         .route(ToolIdPath::PATH, put(update_tool).delete(delete_tool))
         .route("/api/sessions", post(create_session).get(list_sessions))
@@ -1135,6 +1153,50 @@ pub(crate) async fn delete_provider(
     }
 }
 
+/// Models used recently across sessions, most recent first.
+#[utoipa::path(
+    get,
+    path = "/api/sessions/models",
+    responses(
+        (status = 200, description = "Distinct models used recently", body = ModelListResponse)
+    )
+)]
+pub(crate) async fn session_models(State(st): State<AppState>) -> Response {
+    match st.db.recent_models() {
+        Ok(models) => json_ok(json!({"models": models})),
+        Err(err) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("db error: {err}"),
+        ),
+    }
+}
+
+/// List a provider's available models via its OpenAI-compatible `/models`
+/// endpoint (cached server-side). Empty when the provider can't be reached.
+#[utoipa::path(
+    get,
+    path = "/api/providers/{name}/models",
+    params(
+        ("name" = String, Path, description = "Provider name")
+    ),
+    responses(
+        (status = 200, description = "Model ids", body = ModelListResponse),
+        (status = 404, description = "Unknown provider", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn provider_models(
+    State(st): State<AppState>,
+    path: ProviderModelsPath,
+) -> Response {
+    let Some(def) = st.db.get_provider(&path.name).ok().flatten() else {
+        return json_err(StatusCode::NOT_FOUND, "provider not found");
+    };
+    let api_key = def.api_key.clone().unwrap_or_default();
+    let models =
+        carson_host::host::list_provider_models(&st.ctx, &path.name, &def.base_url, &api_key).await;
+    json_ok(json!({"models": models}))
+}
+
 /// List tools as two distinct groups: bundled (immutable) and custom
 /// (editable). Names are bare; identity is the `id`.
 #[utoipa::path(
@@ -1453,6 +1515,9 @@ pub(crate) async fn create_session(
                 },
             );
             host::snapshot_session(&st.db, &instance, &session_id).await;
+            // A fresh session has no message blocks yet, so the snapshot has
+            // no model to derive; persist the one it was created with.
+            let _ = st.db.set_session_model(&session_id, &model);
             let _ = st.db.set_session_sandbox(&session_id, &sandbox_id);
             json_created(json!({
                 "session_id": session_id,

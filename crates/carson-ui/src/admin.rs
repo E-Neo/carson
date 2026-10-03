@@ -245,8 +245,8 @@ fn StatusPanel() -> impl IntoView {
 #[component]
 fn ProvidersPanel() -> impl IntoView {
     let providers = RwSignal::new(Vec::<Value>::new());
-    let name = RwSignal::new(String::new());
-    let base_url = RwSignal::new(String::new());
+    let name = RwSignal::new("deepseek".to_string());
+    let base_url = RwSignal::new("https://api.deepseek.com".to_string());
     let api_key = RwSignal::new(String::new());
     let notice = RwSignal::new(None::<String>);
     let editing = RwSignal::new(None::<Value>);
@@ -280,8 +280,8 @@ fn ProvidersPanel() -> impl IntoView {
             .await
             .unwrap_or((0, Value::Null));
             if status == 201 {
-                name.set(String::new());
-                base_url.set(String::new());
+                name.set("deepseek".to_string());
+                base_url.set("https://api.deepseek.com".to_string());
                 api_key.set(String::new());
                 show_notice(&notice, true, "provider created".to_string());
                 fetch_providers(&providers).await;
@@ -361,11 +361,11 @@ fn ProvidersPanel() -> impl IntoView {
                 <h3>"Add provider"</h3>
                 <div class="field">
                     <label>"Name"</label>
-                    <input prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) placeholder="groq"/>
+                    <input prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) placeholder="deepseek"/>
                 </div>
                 <div class="field">
                     <label>"Base URL"</label>
-                    <input prop:value=move || base_url.get() on:input=move |ev| base_url.set(event_target_value(&ev)) placeholder="https://api.groq.com/openai/v1"/>
+                    <input prop:value=move || base_url.get() on:input=move |ev| base_url.set(event_target_value(&ev)) placeholder="https://api.deepseek.com"/>
                 </div>
                 <div class="field">
                     <label>"API key (optional)"</label>

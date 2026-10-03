@@ -759,6 +759,74 @@ body {
 
 .settings-row input { flex: 1; }
 
+/* Model picker: raw input + dropdown suggestions */
+.model-combo {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.settings-row .model-combo { flex: 1; min-width: 0; }
+
+.model-combo input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font: inherit;
+}
+
+.model-combo input:focus { outline: none; border-color: var(--accent); }
+
+.model-combo-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+}
+
+.model-combo-menu {
+  position: absolute;
+  z-index: 91;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+}
+
+.model-combo-item {
+  background: none;
+  border: none;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 6px;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.model-combo-item:hover { background: var(--bg-input); }
+
+.model-combo-empty {
+  padding: 8px 10px;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
 .settings-hint {
   color: var(--text-dim);
   font-size: 13px;

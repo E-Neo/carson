@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Engine, Store};
 use wasmtime_wasi::WasiCtxBuilder;
@@ -160,6 +161,9 @@ pub struct HostContext {
     /// Live `session_id -> sandbox_id` links, seeded on create/restore and
     /// updated when a session switches sandbox.
     pub sandbox_links: Arc<RwLock<HashMap<String, String>>>,
+    /// TTL cache of `provider name -> (cached_at_ms, model ids)` so UI
+    /// reloads don't hammer each provider's `/models` endpoint.
+    pub provider_models: Arc<Mutex<HashMap<String, (i64, Vec<String>)>>>,
 }
 
 impl HostContext {
@@ -181,6 +185,7 @@ impl HostContext {
             sandbox_base: sandbox_base.into(),
             attachments_base: std::env::temp_dir().join("carson-attachments"),
             sandbox_links: Arc::new(RwLock::new(HashMap::new())),
+            provider_models: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -228,6 +233,69 @@ pub fn openai_driver(def: &ProviderDef) -> Result<Arc<dyn LlmDriver>> {
         base_url: def.base_url.clone(),
         api_key,
     }))
+}
+
+/// How long a provider's model list is cached between re-fetches.
+const PROVIDER_MODELS_TTL_MS: i64 = 30 * 60 * 1000;
+
+/// List a provider's available models via its OpenAI-compatible `/models`
+/// endpoint, cached for a short TTL. Empty on failure (e.g. the provider does
+/// not expose `/models`), so the UI can degrade to other sources.
+pub async fn list_provider_models(
+    ctx: &HostContext,
+    name: &str,
+    base_url: &str,
+    api_key: &str,
+) -> Vec<String> {
+    let now = ms_since_epoch();
+    if let Some((cached_at, models)) = ctx.provider_models.lock().unwrap().get(name) {
+        if now.saturating_sub(*cached_at) < PROVIDER_MODELS_TTL_MS {
+            return models.clone();
+        }
+    }
+    let models = match fetch_provider_models(base_url, api_key).await {
+        Ok(models) => models,
+        Err(err) => {
+            tracing::warn!(provider = %name, error = %err, "failed to list provider models");
+            Vec::new()
+        }
+    };
+    ctx.provider_models
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), (now, models.clone()));
+    models
+}
+
+async fn fetch_provider_models(base_url: &str, api_key: &str) -> Result<Vec<String>> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let mut builder = client
+        .get(&url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
+    if !api_key.is_empty() {
+        builder = builder.bearer_auth(api_key);
+    }
+    let resp = builder
+        .send()
+        .await
+        .with_context(|| format!("fetch models from {url}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("provider returned {}", resp.status());
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .with_context(|| format!("parse models from {url}"))?;
+    let models = body["data"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m["id"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(models)
 }
 
 pub async fn build_registry(ctx: &HostContext, agents: &[AgentDef]) -> Result<AgentRegistry> {
@@ -347,4 +415,59 @@ pub async fn build_instance(ctx: &HostContext, def: &AgentDef) -> Result<AgentIn
         agent,
         stop,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// A one-shot HTTP server returning a canned OpenAI `/models` payload.
+    async fn spawn_models_stub(payload: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        base_url
+    }
+
+    #[tokio::test]
+    async fn list_provider_models_parses_and_caches() {
+        let base_url = spawn_models_stub(
+            r#"{"object":"list","data":[{"id":"deepseek-chat"},{"id":"deepseek-flash"}]}"#,
+        )
+        .await;
+        let ctx = HostContext::new().unwrap();
+        let models = list_provider_models(&ctx, "deepseek", &base_url, "").await;
+        assert_eq!(
+            models,
+            vec!["deepseek-chat".to_string(), "deepseek-flash".to_string()]
+        );
+        // Second call is served from the cache (the stub answered only once).
+        let cached = list_provider_models(&ctx, "deepseek", &base_url, "").await;
+        assert_eq!(models, cached);
+    }
+
+    #[tokio::test]
+    async fn list_provider_models_is_empty_on_failure() {
+        // Nothing listening on this port.
+        let ctx = HostContext::new().unwrap();
+        let url = "http://127.0.0.1:1";
+        assert!(
+            list_provider_models(&ctx, "deepseek", url, "")
+                .await
+                .is_empty()
+        );
+    }
 }

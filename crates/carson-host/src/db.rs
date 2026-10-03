@@ -420,6 +420,32 @@ impl Db {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    pub fn get_provider(&self, name: &str) -> Result<Option<ProviderDef>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT name, base_url, api_key FROM providers WHERE name = ?1")?;
+        let mut rows = stmt.query([name])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(ProviderDef {
+                name: row.get(0)?,
+                base_url: row.get(1)?,
+                api_key: row.get(2)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Distinct models used across sessions, most recently used first.
+    pub fn recent_models(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT model FROM sessions WHERE model != '' \
+             GROUP BY model ORDER BY MAX(updated_at) DESC",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     pub fn upsert_provider(&self, def: &ProviderDef) -> Result<()> {
         let now = now_ms();
         let conn = self.conn.lock().unwrap();
@@ -519,10 +545,10 @@ impl Db {
             "INSERT INTO sessions (id, agent_name, agent_version_id, name, sandbox_id, model, summary, \
              input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, created_at, \
              updated_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) \
              ON CONFLICT(id) DO UPDATE SET agent_name=?2, agent_version_id=?3, name=?4, \
              sandbox_id=?5, model=?6, summary=?7, input_tokens=?8, cache_read_tokens=?9, \
-             cache_creation_tokens=?10, output_tokens=?11, updated_at=?12",
+             cache_creation_tokens=?10, output_tokens=?11, updated_at=?13",
             params![
                 session.id,
                 session.agent_name,
@@ -535,7 +561,8 @@ impl Db {
                 session.usage.cache_read_tokens,
                 session.usage.cache_creation_tokens,
                 session.usage.output_tokens,
-                now
+                now,
+                session.updated_at
             ],
         )?;
         tx.execute(
@@ -1040,5 +1067,35 @@ mod tests {
             Some("light")
         );
         assert_eq!(db.get_setting("missing").unwrap(), None);
+    }
+
+    #[test]
+    fn recent_models_dedupe_and_order_by_last_use() {
+        let db = Db::open_in_memory().unwrap();
+        let session = |id: &str, model: &str, updated_at: i64| PersistedSession {
+            id: id.into(),
+            agent_name: "coder".into(),
+            agent_version_id: "v1".into(),
+            name: None,
+            sandbox_id: None,
+            model: model.into(),
+            updated_at,
+            summary: None,
+            usage: Usage::default(),
+            messages: Vec::new(),
+        };
+        db.upsert_session(&session("a", "groq/llama", 3_000))
+            .unwrap();
+        db.upsert_session(&session("b", "mock/mock", 1_000))
+            .unwrap();
+        // Same model again, used later: deduped but promoted to the top.
+        db.upsert_session(&session("c", "groq/llama", 4_000))
+            .unwrap();
+        // No-model sessions are ignored.
+        db.upsert_session(&session("d", "", 5_000)).unwrap();
+        assert_eq!(
+            db.recent_models().unwrap(),
+            vec!["groq/llama".to_string(), "mock/mock".to_string(),]
+        );
     }
 }
