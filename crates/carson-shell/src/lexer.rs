@@ -251,6 +251,8 @@ impl Lexer {
                 }
                 '"' => {
                     self.pos += 1;
+                    self.flush(&mut lit, &mut parts);
+                    let mut quoted = String::new();
                     loop {
                         let Some(c) = self.peek() else {
                             return Err(LexError {
@@ -265,27 +267,28 @@ impl Lexer {
                             }
                             '\\' => match self.peek_at(1) {
                                 Some(q @ ('"' | '\\' | '$')) => {
-                                    lit.push(q);
+                                    quoted.push(q);
                                     self.pos += 2;
                                 }
                                 Some('\n') => {
                                     self.pos += 2;
                                 }
                                 _ => {
-                                    lit.push('\\');
+                                    quoted.push('\\');
                                     self.pos += 1;
                                 }
                             },
                             '$' => {
-                                self.flush(&mut lit, &mut parts);
+                                self.flush_quoted(&mut quoted, &mut parts);
                                 parts.push(self.scan_dollar(true)?);
                             }
                             _ => {
-                                lit.push(c);
+                                quoted.push(c);
                                 self.pos += 1;
                             }
                         }
                     }
+                    self.flush_quoted(&mut quoted, &mut parts);
                 }
                 '\\' => {
                     self.pos += 1;
@@ -317,6 +320,14 @@ impl Lexer {
     fn flush(&self, lit: &mut String, parts: &mut Vec<WordPart>) {
         if !lit.is_empty() {
             parts.push(WordPart::Lit(std::mem::take(lit)));
+        }
+    }
+
+    /// Flush double-quoted literal text as a `Quoted` part, so tilde expansion
+    /// (which must skip quoted text) can tell the two apart.
+    fn flush_quoted(&self, lit: &mut String, parts: &mut Vec<WordPart>) {
+        if !lit.is_empty() {
+            parts.push(WordPart::Quoted(std::mem::take(lit)));
         }
     }
 

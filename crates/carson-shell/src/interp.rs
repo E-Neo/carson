@@ -449,11 +449,20 @@ impl Interp<'_> {
     /// Expand a word into argv fields, applying word splitting to unquoted
     /// parameter and command substitutions.
     pub(crate) fn expand_word(&mut self, w: &Word) -> Vec<String> {
+        let mut parts = w.parts.clone();
+        // Tilde expansion: a leading unquoted `~` or `~/…` means the home dir.
+        if let Some(WordPart::Lit(first)) = parts.first() {
+            if first == "~" {
+                parts[0] = WordPart::Lit(self.home());
+            } else if let Some(rest) = first.strip_prefix("~/") {
+                parts[0] = WordPart::Lit(format!("{}/{}", self.home(), rest));
+            }
+        }
         let mut fields: Vec<String> = Vec::new();
         let mut cur = String::new();
         let mut after_expansion = false;
         let mut saw_literal = false;
-        for part in &w.parts {
+        for part in &parts {
             match part {
                 WordPart::Lit(s) | WordPart::Quoted(s) => {
                     if after_expansion && !fields.is_empty() {
@@ -525,6 +534,15 @@ impl Interp<'_> {
             "#" => "0".to_string(),
             n => self.state.env.get(n).cloned().unwrap_or_default(),
         }
+    }
+
+    /// The home directory used by `~` expansion and bare `cd`.
+    fn home(&self) -> String {
+        self.state
+            .env
+            .get("HOME")
+            .cloned()
+            .unwrap_or_else(|| "/".to_string())
     }
     fn command_sub(&mut self, src: &str) -> String {
         let list = match parse(src) {

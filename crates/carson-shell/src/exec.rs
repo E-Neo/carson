@@ -24,6 +24,7 @@ pub const EXTERNAL_COMMANDS: &[&str] = &[
     "factor",
     "fmt",
     "fold",
+    "gwen",
     "head",
     "join",
     "link",

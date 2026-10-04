@@ -648,6 +648,33 @@ fn attachment_src(id: &str, session_id: Option<&str>) -> String {
     }
 }
 
+/// Extract `wrote <guest-path>/….pptx` lines from a tool result and turn them
+/// into download links served from the session's sandbox endpoint.
+fn pptx_links(text: &str, session_id: Option<&str>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let Some(sid) = session_id else {
+        return out;
+    };
+    let mut rest = text;
+    while let Some(start) = rest.find("wrote ") {
+        let after = &rest[start + "wrote ".len()..];
+        let end = after
+            .find(|c: char| c == '\n' || c == '\r')
+            .unwrap_or(after.len());
+        let path = after[..end].trim();
+        if path.ends_with(".pptx") {
+            let url = format!(
+                "/api/sessions/{sid}/sandbox/{}",
+                path.trim_start_matches('/')
+            );
+            let label = path.rsplit('/').next().unwrap_or(path).to_string();
+            out.push((label, url));
+        }
+        rest = &after[end.min(after.len())..];
+    }
+    out
+}
+
 fn block_child(
     entry: &MsgEntry,
     session_id: Option<&str>,
@@ -663,7 +690,24 @@ fn block_child(
         UiBlock::Tool { text } => {
             // Same style as thinking; the header's "Tool" label distinguishes it.
             let t = *text;
-            view! { <div class="thinking">{move || t.get()}</div> }.into_any()
+            let links = pptx_links(&t.get_untracked(), session_id);
+            let links = links
+                .into_iter()
+                .map(|(label, url)| {
+                    view! {
+                        <div class="file-link">
+                            <a href=url target="_blank" rel="noopener">{label}</a>
+                        </div>
+                    }
+                })
+                .collect::<Vec<_>>();
+            view! {
+                <div class="thinking">
+                    {move || t.get()}
+                    {links}
+                </div>
+            }
+            .into_any()
         }
         UiBlock::User { content, images } => {
             let imgs = images

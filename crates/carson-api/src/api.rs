@@ -146,6 +146,13 @@ pub(crate) struct AttachmentPath {
 }
 
 #[derive(TypedPath, Deserialize)]
+#[typed_path("/api/sessions/{id}/sandbox/{*path}")]
+pub(crate) struct SandboxFilePath {
+    id: String,
+    path: String,
+}
+
+#[derive(TypedPath, Deserialize)]
 #[typed_path("/api/agents/{name}")]
 pub(crate) struct AgentNamePath {
     name: String,
@@ -209,6 +216,7 @@ pub(crate) struct ToolIdPath {
         get_session,
         destroy_session,
         get_attachment,
+        get_sandbox_file,
         send_message,
         send_stream,
         stop_session,
@@ -485,6 +493,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sandboxes", get(list_sandboxes).post(create_sandbox))
         .route(SandboxPath::PATH, put(rename_sandbox))
         .route(AttachmentPath::PATH, get(get_attachment))
+        .route(SandboxFilePath::PATH, get(get_sandbox_file))
         .route(MessagePath::PATH, post(send_message))
         .route(StreamPath::PATH, post(send_stream))
         .route(StopPath::PATH, post(stop_session))
@@ -1737,6 +1746,56 @@ pub(crate) async fn get_attachment(State(st): State<AppState>, path: AttachmentP
     (
         StatusCode::OK,
         [(CONTENT_TYPE, HeaderValue::from_static(mime))],
+        bytes,
+    )
+        .into_response()
+}
+
+/// Content type for a file served from the sandbox.
+fn file_content_type(rel: &str) -> &'static str {
+    let ext = rel.rsplit('.').next().unwrap_or("");
+    match ext {
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        _ => carson_host::host::mime_for_ext(ext),
+    }
+}
+
+/// Download a file from the session's sandbox (guest path relative to the
+/// sandbox root, e.g. `home/carson/deck/target/deck.pptx`).
+#[utoipa::path(
+    get,
+    path = "/api/sessions/{id}/sandbox/{path}",
+    params(
+        ("id" = String, Path, description = "Session id"),
+        ("path" = String, Path, description = "File path inside the sandbox")
+    ),
+    responses(
+        (status = 200, description = "File bytes"),
+        (status = 404, description = "Session or file not found", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn get_sandbox_file(
+    State(st): State<AppState>,
+    path: SandboxFilePath,
+) -> Response {
+    let Some(entry) = st.sessions.lock().await.get(&path.id).cloned() else {
+        return json_err(StatusCode::NOT_FOUND, "session not found");
+    };
+    let rel = path.path.trim_start_matches('/');
+    if rel.is_empty() || path.path.contains('\\') || rel.split('/').any(|seg| seg == "..") {
+        return json_err(StatusCode::NOT_FOUND, "file not found");
+    }
+    let root = st
+        .ctx
+        .sandbox_base
+        .join(carson_host::tools::sanitize(&entry.sandbox_id));
+    let Ok(bytes) = std::fs::read(root.join(rel)) else {
+        return json_err(StatusCode::NOT_FOUND, "file not found");
+    };
+    let ctype = file_content_type(rel);
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, HeaderValue::from_static(ctype))],
         bytes,
     )
         .into_response()

@@ -232,6 +232,17 @@ fn word_splitting_and_quotes() {
 }
 
 #[test]
+fn tilde_expands_to_home() {
+    let h = Harness::new().with_env("HOME", "/home/carson");
+    assert_eq!(h.run("echo ~").out(), "/home/carson");
+    assert_eq!(h.run("echo ~/deck").out(), "/home/carson/deck");
+    assert_eq!(h.run("echo ~/a/b").out(), "/home/carson/a/b");
+    // Only a leading, unquoted tilde expands.
+    assert_eq!(h.run("echo x~y").out(), "x~y");
+    assert_eq!(h.run("echo \"~\"").out(), "~");
+}
+
+#[test]
 fn exit_status_dollar_question() {
     let h = Harness::new();
     let r = h.run("false; echo $?");

@@ -108,7 +108,7 @@ type ExecResult = crate::bash_bindings::carson::shell::exec::ExecResult;
 impl crate::bash_bindings::carson::shell::exec::Host for ShellCtx {
     fn run(
         &mut self,
-        _prog: String,
+        prog: String,
         argv: Vec<String>,
         env: Vec<(String, String)>,
         cwd: String,
@@ -117,7 +117,109 @@ impl crate::bash_bindings::carson::shell::exec::Host for ShellCtx {
         let engine = self.engine.clone();
         let coreutils = self.coreutils.clone();
         let root = self.root.clone();
-        run_coreutils(&engine, &coreutils, &root, &argv, &env, &cwd, &stdin)
+        if prog == "gwen" {
+            run_gwen_host(&root, &argv, &cwd, &stdin)
+        } else {
+            run_coreutils(&engine, &coreutils, &root, &argv, &env, &cwd, &stdin)
+        }
+    }
+}
+
+/// Resolve a guest path (relative to the guest cwd, or absolute under `/`)
+/// into a host path guaranteed to stay inside the sandbox root.
+fn resolve_guest_path(
+    root: &std::path::Path,
+    guest_cwd: &str,
+    rel: &str,
+) -> Result<PathBuf, String> {
+    use std::path::Component;
+    let base = if rel.starts_with('/') {
+        root.to_path_buf()
+    } else {
+        root.join(resolve_guest_cwd(guest_cwd).trim_start_matches('/'))
+    };
+    let mut out = base;
+    for comp in PathBuf::from(rel.trim_start_matches('/')).components() {
+        match comp {
+            Component::Normal(s) => out.push(s),
+            Component::ParentDir => return Err("path escapes the sandbox".into()),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// Map a host path under the sandbox root back to a guest path (`/…`).
+fn host_to_guest(root: &std::path::Path, host: &std::path::Path) -> String {
+    use std::path::Component;
+    let mut s = String::from("/");
+    let mut first = true;
+    let rel = host.strip_prefix(root).unwrap_or(host);
+    for comp in rel.components() {
+        if let Component::Normal(c) = comp {
+            if !first {
+                s.push('/');
+            }
+            s.push_str(&c.to_string_lossy());
+            first = false;
+        }
+    }
+    s
+}
+
+/// Run the `gwen` shell command natively (host-linked), rendering a pptx deck
+/// inside the session's sandbox. The bash guest call is synchronous, so this
+/// blocks on a helper thread like the coreutils runner.
+fn run_gwen_host(
+    root: &std::path::Path,
+    argv: &[String],
+    cwd: &str,
+    _stdin: &[u8],
+) -> Result<ExecResult, String> {
+    if argv.len() != 3 || argv[1] != "build" {
+        return Ok(ExecResult {
+            stdout: Vec::new(),
+            stderr: b"usage: gwen build <deck>\n".to_vec(),
+            status: 2,
+        });
+    }
+    let root = root.to_path_buf();
+    let root_for_thread = root.clone();
+    let guest_cwd = cwd.to_string();
+    let deck = argv[2].clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<PathBuf, String> {
+            let project_dir = resolve_guest_path(&root_for_thread, &guest_cwd, &deck)?;
+            if !project_dir.is_dir() {
+                return Err(format!("{deck}: not a directory"));
+            }
+            gwen::build(&project_dir).map_err(|err| format!("{err:?}"))
+        })();
+        let _ = tx.send(result);
+    });
+    let result = rx
+        .recv()
+        .unwrap_or_else(|_| Err("gwen runner thread failed".to_string()));
+    match result {
+        Ok(out) => {
+            let mut stdout = format!("wrote {}\n", host_to_guest(&root, &out)).into_bytes();
+            stdout.truncate(SHELL_MAX_OUTPUT);
+            Ok(ExecResult {
+                stdout,
+                stderr: Vec::new(),
+                status: 0,
+            })
+        }
+        Err(err) => {
+            let mut stderr = format!("gwen: {err}\n").into_bytes();
+            stderr.truncate(SHELL_MAX_OUTPUT);
+            Ok(ExecResult {
+                stdout: Vec::new(),
+                stderr,
+                status: 1,
+            })
+        }
     }
 }
 
@@ -396,7 +498,7 @@ fn apply_env_defaults<'a>(
     }
 }
 
-pub(crate) fn sanitize(id: &str) -> String {
+pub fn sanitize(id: &str) -> String {
     id.chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect()
@@ -578,5 +680,63 @@ mod tests {
         let caps = Capabilities::default();
         let specs = vec![time_spec("id-1")];
         assert!(caps.resolve_bare_name(&specs, "time").is_none());
+    }
+
+    /// `gwen build` renders a real `.pptx` into the sandbox via the host runner.
+    #[test]
+    fn gwen_builds_a_pptx_in_the_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join("deck/slides")).unwrap();
+        std::fs::write(
+            root.join("deck/main.toml"),
+            "[presentation]\ntitle = \"Test\"\n\n[[sections]]\ntitle = \"Intro\"\nslides = [\"a.toml\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("deck/slides/a.toml"),
+            "[[shapes]]\ntype = \"text\"\nx = 0\ny = 0\nw = \"100%\"\nh = \"1in\"\ntext = \"hello\"\n",
+        )
+        .unwrap();
+
+        let res = run_gwen_host(
+            &root,
+            &["gwen".to_string(), "build".to_string(), "deck".to_string()],
+            "/",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            res.status,
+            0,
+            "stderr: {}",
+            String::from_utf8_lossy(&res.stderr)
+        );
+        let out = String::from_utf8_lossy(&res.stdout).to_string();
+        assert!(out.starts_with("wrote /deck/target/Test.pptx"), "{out}");
+        assert!(root.join("deck/target/Test.pptx").exists());
+    }
+
+    #[test]
+    fn gwen_usage_and_escaping() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let res =
+            run_gwen_host(&root, &["gwen".to_string(), "nope".to_string()], "/", &[]).unwrap();
+        assert_eq!(res.status, 2);
+
+        // A deck path that tries to escape the sandbox is rejected.
+        let res = run_gwen_host(
+            &root,
+            &[
+                "gwen".to_string(),
+                "build".to_string(),
+                "../../etc".to_string(),
+            ],
+            "/",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(res.status, 1);
     }
 }

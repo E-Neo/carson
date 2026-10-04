@@ -493,6 +493,11 @@ body {
   white-space: pre-wrap;
 }
 
+/* Download link for files the tool generated in the sandbox. */
+.file-link { margin-top: 6px; }
+.file-link a { color: var(--accent); font-size: 13px; text-decoration: none; }
+.file-link a:hover { text-decoration: underline; }
+
 .status-line { align-self: center; color: var(--text-dim); font-size: 13px; }
 
 .usage-line { margin-left: auto; color: var(--text-dim); font-size: 12px; font-family: var(--mono); }

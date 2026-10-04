@@ -1174,3 +1174,64 @@ async fn model_suggestion_endpoints() {
     let (status, _) = get(&app, "/api/providers/nope/models").await;
     assert_eq!(status, 404);
 }
+
+/// Files generated in a session's sandbox are downloadable, and path traversal
+/// is rejected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sandbox_download_endpoint() {
+    let app = app().await;
+    let (_, created) = post(
+        &app,
+        "/api/sessions",
+        r#"{"agent":"coder","model":"mock/mock"}"#,
+    )
+    .await;
+    let session_id = created["session_id"].as_str().unwrap().to_string();
+    let (_, body) = get(&app, &format!("/api/sessions/{session_id}")).await;
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let sandbox_id = v["sandbox_id"].as_str().unwrap();
+
+    let base = std::env::temp_dir().join("carson-sandbox").join(sandbox_id);
+    std::fs::create_dir_all(base.join("home/carson/deck/target")).unwrap();
+    std::fs::write(
+        base.join("home/carson/deck/target/test.pptx"),
+        b"PK\x03\x04",
+    )
+    .unwrap();
+
+    let url = format!("/api/sessions/{session_id}/sandbox/home/carson/deck/target/test.pptx");
+    let resp = app
+        .clone()
+        .oneshot(
+            authorized(Request::builder())
+                .uri(&url)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&bytes[..], b"PK\x03\x04");
+
+    // Path traversal is rejected.
+    let resp = app
+        .clone()
+        .oneshot(
+            authorized(Request::builder())
+                .uri(&format!("/api/sessions/{session_id}/sandbox/../secret"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+}
