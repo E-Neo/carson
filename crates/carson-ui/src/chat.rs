@@ -1758,6 +1758,12 @@ pub fn ChatPage() -> impl IntoView {
                                     </div>
                                 </div>
                                 <div class="statusbar">
+                                    {move || running.get().then(|| view! {
+                                        <span class="status-line working">
+                                            <span class="spinner"></span>
+                                            "Working…"
+                                        </span>
+                                    })}
                                     {move || status_line.get().map(|s| view! { <span class="status-line">{s}</span> })}
                                     {move || error.get().map(|e| view! { <span class="error-line">{e}</span> })}
                                     {move || usage.get().map(|u| view! { <span class="usage-line">{u}</span> })}

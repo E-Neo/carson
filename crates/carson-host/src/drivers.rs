@@ -71,6 +71,9 @@ pub enum DriverEvent {
     Thinking(String),
     ToolCallStart(DriverToolCall),
     ToolCallEnd(DriverToolCall),
+    /// Non-stream progress, e.g. a retry backoff — relayed to the session's
+    /// SSE stream so the user knows the request is being retried.
+    Status(String),
     Failed(DriverError),
 }
 
@@ -562,6 +565,10 @@ impl LlmDriver for OpenAiCompatDriver {
                 return Err(err);
             }
             tracing::warn!(url = %url, sleep_ms = sleep, attempt, "llm request retry");
+            let _ = tx.send(DriverEvent::Status(format!(
+                "retrying in {}ms (attempt {})",
+                sleep, attempt
+            )));
             tokio::time::sleep(std::time::Duration::from_millis(sleep)).await;
         };
 
@@ -1235,9 +1242,15 @@ mod tests {
             base_url,
             api_key: String::new(),
         };
-        let (tx, _rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
         assert!(driver.stream(req, tx).await.is_ok());
         assert_eq!(hits.load(Ordering::SeqCst), 2, "503 retried once");
+        // The client is told about the retry before any content streams.
+        assert!(matches!(
+            rx.recv().unwrap(),
+            DriverEvent::Status(s) if s.contains("retrying")
+        ));
+        assert_eq!(rx.recv().unwrap(), DriverEvent::Text("hi".into()));
     }
 
     #[tokio::test]

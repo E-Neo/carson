@@ -572,6 +572,11 @@ fn start_stream(session: &mut Session) -> Option<u64> {
                     return None;
                 }
                 compactions += 1;
+                let _ = emit(
+                    &session.id,
+                    "status",
+                    "context window exceeded; compacting…",
+                );
                 if compact(session).is_err() {
                     trim_history(session);
                 }

@@ -16,6 +16,7 @@ use crate::hub::Hub;
 use crate::tools::{Capabilities, ToolRunner, sanitize};
 
 pub struct StreamHandle {
+    session_id: String,
     rx: mpsc::Receiver<DriverEvent>,
     usage: Arc<Mutex<Option<Usage>>>,
 }
@@ -236,6 +237,7 @@ impl crate::bindings::carson::agent::llm::Host for State {
         self.streams.insert(
             handle,
             StreamHandle {
+                session_id: request.session_id.clone(),
                 rx,
                 usage: usage_slot,
             },
@@ -244,42 +246,60 @@ impl crate::bindings::carson::agent::llm::Host for State {
     }
 
     fn stream_next(&mut self, handle: u64) -> Result<Option<Chunk>, LlmError> {
-        let Some(stream) = self.streams.get_mut(&handle) else {
-            return Err(LlmError::Internal("unknown stream handle".into()));
-        };
-        // Skip empty text/thinking deltas so the guest never sees a phantom
-        // empty chunk (which would otherwise surface as a blank block and
-        // persist as an empty message).
         loop {
-            match stream.rx.recv() {
-                Ok(DriverEvent::Text(text)) if text.is_empty() => continue,
-                Ok(DriverEvent::Thinking(text)) if text.is_empty() => continue,
-                Ok(DriverEvent::Text(text)) => {
+            let (session_id, event) = {
+                let Some(stream) = self.streams.get_mut(&handle) else {
+                    return Err(LlmError::Internal("unknown stream handle".into()));
+                };
+                // Skip empty text/thinking deltas so the guest never sees a
+                // phantom empty chunk (which would otherwise surface as a blank
+                // block and persist as an empty message).
+                match stream.rx.recv() {
+                    Err(_) => return Ok(None),
+                    Ok(DriverEvent::Text(text)) if text.is_empty() => continue,
+                    Ok(DriverEvent::Thinking(text)) if text.is_empty() => continue,
+                    Ok(event) => (stream.session_id.clone(), event),
+                }
+            };
+            match event {
+                DriverEvent::Text(text) => {
                     return Ok(Some(Chunk {
                         text: Some(text),
                         ..chunk()
                     }));
                 }
-                Ok(DriverEvent::Thinking(text)) => {
+                DriverEvent::Thinking(text) => {
                     return Ok(Some(Chunk {
                         thinking: Some(text),
                         ..chunk()
                     }));
                 }
-                Ok(DriverEvent::ToolCallStart(tc)) => {
+                DriverEvent::ToolCallStart(tc) => {
                     return Ok(Some(Chunk {
                         tool_call_start: Some(to_wit_tool_call(tc)),
                         ..chunk()
                     }));
                 }
-                Ok(DriverEvent::ToolCallEnd(tc)) => {
+                DriverEvent::ToolCallEnd(tc) => {
                     return Ok(Some(Chunk {
                         tool_call_end: Some(to_wit_tool_call(tc)),
                         ..chunk()
                     }));
                 }
-                Ok(DriverEvent::Failed(err)) => return Err(to_llm_error(err)),
-                Err(_) => return Ok(None),
+                // Non-stream progress (e.g. a driver retry backoff); relay it
+                // to the session's SSE stream and keep polling for real events.
+                DriverEvent::Status(msg) => {
+                    if self.hub.send(
+                        &session_id,
+                        crate::hub::SseItem {
+                            event: "status".into(),
+                            data: serde_json::Value::String(msg),
+                        },
+                    ) {
+                        continue;
+                    }
+                }
+                DriverEvent::Failed(err) => return Err(to_llm_error(err)),
             }
         }
     }
@@ -562,6 +582,7 @@ mod tests {
         state.streams.insert(
             777,
             StreamHandle {
+                session_id: "s".into(),
                 rx,
                 usage: Arc::new(Mutex::new(None)),
             },
@@ -576,5 +597,37 @@ mod tests {
         // Stream closed afterwards.
         drop(tx);
         assert!(state.stream_next(777).unwrap().is_none());
+    }
+
+    /// A driver status (e.g. a retry backoff) is relayed to the session's SSE
+    /// stream rather than surfacing as a chunk.
+    #[tokio::test]
+    async fn stream_next_relays_driver_status_to_the_hub() {
+        let mut state = test_state(&[]);
+        let (hub_tx, mut hub_rx) = tokio::sync::mpsc::unbounded_channel::<crate::hub::SseItem>();
+        state.hub.register("s-status", hub_tx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.streams.insert(
+            778,
+            StreamHandle {
+                session_id: "s-status".into(),
+                rx,
+                usage: Arc::new(Mutex::new(None)),
+            },
+        );
+        tx.send(DriverEvent::Status("retrying in 20ms (attempt 2)".into()))
+            .unwrap();
+        tx.send(DriverEvent::Text("hi".into())).unwrap();
+        drop(tx);
+        while state.stream_next(778).unwrap().is_some() {}
+        let item = hub_rx.try_recv().expect("a status event was relayed");
+        assert_eq!(item.event, "status");
+        assert!(
+            item.data
+                .as_str()
+                .map(|s| s.contains("retrying"))
+                .unwrap_or(false),
+            "retry progress reaches the client"
+        );
     }
 }
