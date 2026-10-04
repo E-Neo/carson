@@ -29,6 +29,8 @@ pub struct State {
     pub sandbox_base: std::path::PathBuf,
     pub attachments_base: std::path::PathBuf,
     pub sandbox_links: Arc<RwLock<HashMap<String, String>>>,
+    /// Per-session LLM retry tuning, keyed by session id.
+    pub session_retry: Arc<RwLock<HashMap<String, crate::drivers::RetryConfig>>>,
     pub caps: Capabilities,
     pub stop: Arc<AtomicBool>,
     pub streams: HashMap<u64, StreamHandle>,
@@ -87,6 +89,7 @@ fn to_llm_error(err: DriverError) -> LlmError {
         DriverError::RateLimited => LlmError::RateLimited,
         DriverError::Timeout => LlmError::Timeout,
         DriverError::Cancelled => LlmError::Cancelled,
+        DriverError::ContextExceeded => LlmError::ContextExceeded,
         DriverError::Internal(msg) => LlmError::Internal(msg),
     }
 }
@@ -126,6 +129,15 @@ impl crate::bindings::carson::agent::events::Host for State {
 
     fn now_ms(&mut self) -> u64 {
         now_ms()
+    }
+
+    fn retry_budget_ms(&mut self, session_id: String) -> u64 {
+        self.session_retry
+            .read()
+            .unwrap()
+            .get(&session_id)
+            .map(|c| c.max_ms)
+            .unwrap_or_else(|| crate::drivers::RetryConfig::default().max_ms)
     }
 }
 
@@ -193,6 +205,14 @@ impl crate::bindings::carson::agent::llm::Host for State {
             tools,
             temperature: request.temperature,
             max_tokens: request.max_tokens,
+            retry: self
+                .session_retry
+                .read()
+                .unwrap()
+                .get(&request.session_id)
+                .copied()
+                .unwrap_or_default(),
+            cancel: self.stop.clone(),
         };
 
         let usage_slot = Arc::new(Mutex::new(None::<Usage>));
@@ -393,6 +413,7 @@ mod tests {
             sandbox_base: temp,
             attachments_base: std::env::temp_dir().join("carson-state-attachments"),
             sandbox_links: Arc::new(RwLock::new(HashMap::new())),
+            session_retry: Arc::new(RwLock::new(HashMap::new())),
             caps: Capabilities::from_ids(tool_ids.iter().map(|s| s.to_string()).collect()),
             stop: Arc::new(AtomicBool::new(false)),
             streams: HashMap::new(),

@@ -1235,3 +1235,37 @@ async fn sandbox_download_endpoint() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 404);
 }
+
+/// The per-session retry budget is settable and echoed back by get_session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_retry_config_roundtrip() {
+    let app = app().await;
+    let (_, created) = post(
+        &app,
+        "/api/sessions",
+        r#"{"agent":"coder","model":"mock/mock"}"#,
+    )
+    .await;
+    let session_id = created["session_id"].as_str().unwrap().to_string();
+
+    let (_, body) = get(&app, &format!("/api/sessions/{session_id}")).await;
+    let v: Value = serde_json::from_str(&body).unwrap();
+    // Defaults are present.
+    assert_eq!(v["retry"]["base_backoff_ms"], 1000);
+    assert_eq!(v["retry"]["max_backoff_ms"], 60000);
+    assert_eq!(v["retry"]["max_ms"], 1800000);
+
+    let (status, body) = put(
+        &app,
+        &format!("/api/sessions/{session_id}"),
+        r#"{"retry":{"base_backoff_ms":250,"max_backoff_ms":5000,"max_ms":30000}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (_, body) = get(&app, &format!("/api/sessions/{session_id}")).await;
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["retry"]["base_backoff_ms"], 250);
+    assert_eq!(v["retry"]["max_backoff_ms"], 5000);
+    assert_eq!(v["retry"]["max_ms"], 30000);
+}

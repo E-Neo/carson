@@ -973,6 +973,9 @@ pub fn ChatPage() -> impl IntoView {
     let sandboxes = RwSignal::new(Vec::<SandboxSummary>::new());
     let name_edit = RwSignal::new(String::new());
     let model_edit = RwSignal::new(String::new());
+    let retry_base = RwSignal::new(String::new());
+    let retry_max_backoff = RwSignal::new(String::new());
+    let retry_max_ms = RwSignal::new(String::new());
     let rename_alias = RwSignal::new(String::new());
     let new_sandbox_name = RwSignal::new(String::new());
     let selected_sandbox = RwSignal::new(None::<String>);
@@ -1189,10 +1192,32 @@ pub fn ChatPage() -> impl IntoView {
                 .unwrap_or_default(),
         );
         let model_edit = model_edit;
+        let retry_base = retry_base;
+        let retry_max_backoff = retry_max_backoff;
+        let retry_max_ms = retry_max_ms;
         let sid2 = sid.clone();
         spawn_local(async move {
             if let Ok((_, v)) = api::get(&format!("/api/sessions/{sid2}")).await {
                 model_edit.set(str_of(&v, "model"));
+                let r = &v["retry"];
+                retry_base.set(
+                    r.get("base_backoff_ms")
+                        .and_then(|x| x.as_u64())
+                        .map(|x| x.to_string())
+                        .unwrap_or_default(),
+                );
+                retry_max_backoff.set(
+                    r.get("max_backoff_ms")
+                        .and_then(|x| x.as_u64())
+                        .map(|x| x.to_string())
+                        .unwrap_or_default(),
+                );
+                retry_max_ms.set(
+                    r.get("max_ms")
+                        .and_then(|x| x.as_u64())
+                        .map(|x| x.to_string())
+                        .unwrap_or_default(),
+                );
             }
         });
         settings_open.set(true);
@@ -1297,6 +1322,29 @@ pub fn ChatPage() -> impl IntoView {
             let _ = api::put(&format!("/api/sessions/{id}"), &json!({ "model": model })).await;
             // Newly streamed blocks are stamped with the new model.
             session_model.set(model);
+        });
+    };
+
+    let save_session_retry = move || {
+        let id = settings_target();
+        if id.is_empty() {
+            return;
+        }
+        let base = retry_base.get().trim().parse::<u64>().unwrap_or(0);
+        let max_backoff = retry_max_backoff.get().trim().parse::<u64>().unwrap_or(0);
+        let max_ms = retry_max_ms.get().trim().parse::<u64>().unwrap_or(0);
+        spawn_local(async move {
+            let _ = api::put(
+                &format!("/api/sessions/{id}"),
+                &json!({
+                    "retry": {
+                        "base_backoff_ms": base,
+                        "max_backoff_ms": max_backoff,
+                        "max_ms": max_ms,
+                    }
+                }),
+            )
+            .await;
         });
     };
 
@@ -1800,6 +1848,41 @@ pub fn ChatPage() -> impl IntoView {
                                         <div class="settings-row">
                                             <ModelCombobox value=model_edit suggestions=model_suggestions/>
                                             <button class="btn primary" on:click=move |_| save_session_model()>
+                                                "Save"
+                                            </button>
+                                        </div>
+                                        <label>"Retry budget (ms)"</label>
+                                        <div class="settings-row">
+                                            <input
+                                                name="retry-base"
+                                                type="number"
+                                                min="0"
+                                                placeholder="Base backoff"
+                                                title="Base backoff (ms)"
+                                                prop:value=move || retry_base.get()
+                                                on:input=move |ev| retry_base.set(event_target_value(&ev))
+                                            />
+                                            <input
+                                                name="retry-max-backoff"
+                                                type="number"
+                                                min="0"
+                                                placeholder="Max backoff"
+                                                title="Max backoff (ms)"
+                                                prop:value=move || retry_max_backoff.get()
+                                                on:input=move |ev| retry_max_backoff.set(event_target_value(&ev))
+                                            />
+                                        </div>
+                                        <div class="settings-row">
+                                            <input
+                                                name="retry-max-ms"
+                                                type="number"
+                                                min="0"
+                                                placeholder="Total budget"
+                                                title="Total retry budget (ms)"
+                                                prop:value=move || retry_max_ms.get()
+                                                on:input=move |ev| retry_max_ms.set(event_target_value(&ev))
+                                            />
+                                            <button class="btn primary" on:click=move |_| save_session_retry()>
                                                 "Save"
                                             </button>
                                         </div>

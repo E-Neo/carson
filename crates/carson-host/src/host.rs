@@ -164,6 +164,8 @@ pub struct HostContext {
     /// TTL cache of `provider name -> (cached_at_ms, model ids)` so UI
     /// reloads don't hammer each provider's `/models` endpoint.
     pub provider_models: Arc<Mutex<HashMap<String, (i64, Vec<String>)>>>,
+    /// Per-session LLM retry tuning, keyed by session id.
+    pub session_retry: Arc<RwLock<HashMap<String, crate::drivers::RetryConfig>>>,
 }
 
 impl HostContext {
@@ -186,6 +188,7 @@ impl HostContext {
             attachments_base: std::env::temp_dir().join("carson-attachments"),
             sandbox_links: Arc::new(RwLock::new(HashMap::new())),
             provider_models: Arc::new(Mutex::new(HashMap::new())),
+            session_retry: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -339,6 +342,9 @@ pub async fn snapshot_session(db: &Arc<Db>, instance: &AgentInstance, session_id
         // The model is session metadata managed by the API layer; the message
         // snapshot derives it from the latest block if there is one.
         model: messages.last().map(|b| b.model.clone()).unwrap_or_default(),
+        // Retry budget is session metadata managed by the API layer; the
+        // snapshot's upsert does not touch the retry columns on conflict.
+        retry: crate::drivers::RetryConfig::default(),
         updated_at: ms_since_epoch(),
         summary: state.summary,
         usage: Usage {
@@ -400,6 +406,7 @@ pub async fn build_instance(ctx: &HostContext, def: &AgentDef) -> Result<AgentIn
         sandbox_base: ctx.sandbox_base.clone(),
         attachments_base: ctx.attachments_base.clone(),
         sandbox_links: ctx.sandbox_links.clone(),
+        session_retry: ctx.session_retry.clone(),
         caps: Capabilities::from_ids(def.capabilities.clone()),
         stop: Arc::new(AtomicBool::new(false)),
         streams: HashMap::new(),

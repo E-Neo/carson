@@ -242,10 +242,17 @@ async fn main() -> Result<()> {
                 name: persisted.name.clone(),
                 sandbox_id,
                 model: persisted.model.clone(),
+                retry: persisted.retry,
                 updated_at: persisted.updated_at,
                 instance,
             },
         );
+        app_state
+            .ctx
+            .session_retry
+            .write()
+            .unwrap()
+            .insert(persisted.id.clone(), persisted.retry);
         tracing::info!(session = %persisted.id, agent = %persisted.agent_name, "restored session");
     }
 

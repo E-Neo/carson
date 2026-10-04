@@ -32,6 +32,8 @@ pub struct SessionEntry {
     pub sandbox_id: String,
     /// The session's model (`provider/model`); switchable via the API.
     pub model: String,
+    /// The session's LLM retry budget.
+    pub retry: crate::drivers::RetryConfig,
     /// Last activity (message, rename or sandbox switch) in ms since epoch.
     /// Drives the session list ordering.
     pub updated_at: i64,

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
 use async_trait::async_trait;
@@ -36,6 +38,31 @@ pub struct LlmRequest {
     pub tools: Vec<DriverToolDef>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    /// Per-session retry budget for transient request-phase failures.
+    pub retry: RetryConfig,
+    /// Flipped by the host when the turn is stopped; aborts retries.
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Per-session retry tuning. `max_ms` is the budget for a burst of
+/// consecutive failures (reset per turn and after each successful request).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+pub struct RetryConfig {
+    pub base_backoff_ms: u64,
+    pub max_backoff_ms: u64,
+    pub max_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            base_backoff_ms: 1000,
+            max_backoff_ms: 60_000,
+            max_ms: 1_800_000,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -64,6 +91,7 @@ pub enum DriverError {
     RateLimited,
     Timeout,
     Cancelled,
+    ContextExceeded,
     Internal(String),
 }
 
@@ -109,10 +137,14 @@ impl SseDecoder {
         &self.usage
     }
 
-    /// Emits a `ToolCallEnd` for every tool call that never completed.
+    /// Emits a `ToolCallEnd` for every announced tool call that never
+    /// completed. Never-announced stubs (an `index`/`id` with no function
+    /// name) are dropped so an interrupted call can't leave an empty-named
+    /// tool call behind.
     pub fn finish(&mut self) -> Vec<DriverEvent> {
         std::mem::take(&mut self.tool_state)
             .into_values()
+            .filter(|tc| !tc.name.is_empty())
             .map(DriverEvent::ToolCallEnd)
             .collect()
     }
@@ -294,6 +326,70 @@ impl LlmDriver for EchoDriver {
     }
 }
 
+/// Classify a failed request phase into a [`DriverError`] and whether it is
+/// worth a backoff retry. `send_err` is non-None when the request never
+/// produced a response; otherwise `status`/`detail` describe the rejection.
+fn classify_upstream(
+    status: Option<reqwest::StatusCode>,
+    send_err: Option<&reqwest::Error>,
+    detail: &str,
+) -> (DriverError, bool) {
+    if let Some(status) = status {
+        if is_context_exceeded(detail) {
+            return (DriverError::ContextExceeded, false);
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return (DriverError::Auth, false);
+        }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return (DriverError::RateLimited, true);
+        }
+        let shown = excerpt(detail, 512);
+        if status.as_u16() == 408 || status.as_u16() == 425 || status.is_server_error() {
+            return (
+                DriverError::Internal(format!("upstream status {status}: {shown}")),
+                true,
+            );
+        }
+        return (
+            DriverError::Internal(format!("upstream status {status}: {shown}")),
+            false,
+        );
+    }
+    if let Some(err) = send_err {
+        if err.is_timeout() {
+            return (DriverError::Timeout, true);
+        }
+        if err.is_connect() {
+            return (DriverError::Network, true);
+        }
+        return (
+            DriverError::Internal(format!("request to provider failed: {err}")),
+            false,
+        );
+    }
+    (
+        DriverError::Internal("no response from provider".into()),
+        false,
+    )
+}
+
+/// True when a rejection body indicates the request exceeded the model's
+/// context window (a permanent error — never retry; the agent compacts).
+fn is_context_exceeded(detail: &str) -> bool {
+    let d = detail.to_lowercase();
+    [
+        "context length",
+        "maximum context",
+        "too many tokens",
+        "token limit",
+        "context window",
+        "reduce the length",
+    ]
+    .iter()
+    .any(|marker| d.contains(marker))
+}
+
 pub struct OpenAiCompatDriver {
     pub base_url: String,
     pub api_key: String,
@@ -407,41 +503,67 @@ impl LlmDriver for OpenAiCompatDriver {
         );
         tracing::debug!(body = %payload, "llm request body");
 
-        let client = reqwest::Client::new();
-        let builder = client
-            .post(&url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(payload.clone());
-        let builder = if self.api_key.is_empty() {
-            builder
-        } else {
-            builder.bearer_auth(&self.api_key)
-        };
-        let resp = match builder.send().await {
-            Ok(resp) => resp,
-            Err(err) => {
-                tracing::warn!(url = %url, error = %err, "llm request failed");
-                return Err(DriverError::Internal(format!(
-                    "request to provider failed: {err}"
-                )));
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|err| DriverError::Internal(format!("build http client: {err}")))?;
+        let retry = req.retry;
+        let burst_start = std::time::Instant::now();
+        let mut attempt = 0u32;
+        let mut backoff = retry.base_backoff_ms.clamp(1, retry.max_backoff_ms.max(1));
+        let resp = loop {
+            attempt += 1;
+            if req.cancel.load(Ordering::SeqCst) {
+                return Err(DriverError::Cancelled);
             }
-        };
-        if !resp.status().is_success() {
-            let status = resp.status();
-            // The rejection body carries the provider's actual reason (unknown
-            // model, context length exceeded, ...): log it fully and surface
-            // an excerpt to clients.
-            let detail = resp.text().await.unwrap_or_default();
-            let shown = excerpt(&detail, 512);
-            tracing::warn!(status = %status, url = %url, body = %detail, "upstream rejected llm request");
-            return Err(if status == reqwest::StatusCode::UNAUTHORIZED {
-                DriverError::Auth
-            } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                DriverError::RateLimited
+            let builder = client
+                .post(&url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(payload.clone());
+            let builder = if self.api_key.is_empty() {
+                builder
             } else {
-                DriverError::Internal(format!("upstream status {status}: {shown}"))
-            });
-        }
+                builder.bearer_auth(&self.api_key)
+            };
+            let send = builder.send().await;
+            let (status, send_err, retry_after_ms, detail) = match send {
+                Ok(resp) if resp.status().is_success() => break resp,
+                Ok(resp) => {
+                    let status = resp.status();
+                    let retry_after_ms = resp
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .map(|secs| secs.saturating_mul(1000));
+                    let detail = resp.text().await.unwrap_or_default();
+                    tracing::warn!(
+                        status = %status,
+                        url = %url,
+                        body = %detail,
+                        "upstream rejected llm request"
+                    );
+                    (Some(status), None, retry_after_ms, detail)
+                }
+                Err(err) => {
+                    tracing::warn!(url = %url, error = %err, "llm request failed");
+                    (None, Some(err), None, String::new())
+                }
+            };
+            let (err, retryable) = classify_upstream(status, send_err.as_ref(), &detail);
+            if !retryable || retry.max_ms == 0 {
+                return Err(err);
+            }
+            let jitter = 75 + (attempt.wrapping_mul(37) % 51) as u64;
+            let sleep = backoff.saturating_mul(jitter) / 100;
+            backoff = (backoff.saturating_mul(2)).min(retry.max_backoff_ms.max(1));
+            let sleep = sleep.max(retry_after_ms.unwrap_or(0));
+            if burst_start.elapsed().as_millis() as u64 + sleep > retry.max_ms {
+                return Err(err);
+            }
+            tracing::warn!(url = %url, sleep_ms = sleep, attempt, "llm request retry");
+            tokio::time::sleep(std::time::Duration::from_millis(sleep)).await;
+        };
 
         let mut chunks = resp.bytes_stream();
         let mut decoder = SseDecoder::new();
@@ -487,7 +609,6 @@ impl LlmDriver for OpenAiCompatDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
 
     fn user(content: &str) -> DriverMessage {
         DriverMessage {
@@ -507,6 +628,8 @@ mod tests {
             tools,
             temperature: None,
             max_tokens: None,
+            retry: RetryConfig::default(),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -918,6 +1041,8 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            retry: RetryConfig::default(),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1028,28 +1153,161 @@ mod tests {
 
     #[tokio::test]
     async fn openai_maps_http_status_errors() {
-        for (status_line, expected) in [
-            ("HTTP/1.1 401 Unauthorized", DriverError::Auth),
-            ("HTTP/1.1 429 Too Many Requests", DriverError::RateLimited),
+        for (status_line, expected, retryable) in [
+            ("HTTP/1.1 401 Unauthorized", DriverError::Auth, false),
+            (
+                "HTTP/1.1 429 Too Many Requests",
+                DriverError::RateLimited,
+                true,
+            ),
             (
                 "HTTP/1.1 500 Internal Server Error",
                 // Empty body: the excerpt suffix is empty.
                 DriverError::Internal("upstream status 500 Internal Server Error: ".into()),
+                true,
             ),
         ] {
-            let base_url = stub_server(
-                "",
-                status_line,
-                std::sync::Arc::new(std::sync::Mutex::new(Recorded::default())),
-            )
-            .await;
+            // A repeated stub so retries keep seeing the same status until the
+            // tiny budget gives up (otherwise the 5xx/429 retry loops forever).
+            let responses = vec![format!("{status_line}\r\ncontent-length: 0\r\n\r\n"); 20];
+            let (base_url, _hits) = stub_sequence(responses).await;
+            let mut req = openai_request();
+            if retryable {
+                req.retry = RetryConfig {
+                    base_backoff_ms: 1,
+                    max_backoff_ms: 1,
+                    max_ms: 5,
+                };
+            }
             let driver = OpenAiCompatDriver {
                 base_url,
                 api_key: String::new(),
             };
             let (tx, _rx) = mpsc::channel();
-            let result = driver.stream(openai_request(), tx).await;
-            assert_eq!(result, Err(expected));
+            assert_eq!(driver.stream(req, tx).await, Err(expected));
         }
+    }
+    /// A stub that answers each accepted connection with the next response in
+    /// `responses`, counting how many requests it served. Each response is a
+    /// full HTTP response string.
+    async fn stub_sequence(
+        responses: Vec<String>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            for response in responses {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    #[tokio::test]
+    async fn openai_retries_transient_then_succeeds() {
+        let ok_body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let responses = vec![
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n".to_string(),
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                ok_body.len(),
+                ok_body
+            ),
+        ];
+        let (base_url, hits) = stub_sequence(responses).await;
+        let mut req = openai_request();
+        req.retry = RetryConfig {
+            base_backoff_ms: 10,
+            max_backoff_ms: 10,
+            max_ms: 1000,
+        };
+        let driver = OpenAiCompatDriver {
+            base_url,
+            api_key: String::new(),
+        };
+        let (tx, _rx) = mpsc::channel();
+        assert!(driver.stream(req, tx).await.is_ok());
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "503 retried once");
+    }
+
+    #[tokio::test]
+    async fn openai_gives_up_on_rate_limit_within_budget() {
+        let responses = (0..10)
+            .map(|_| "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\n\r\n".to_string())
+            .collect();
+        let (base_url, _hits) = stub_sequence(responses).await;
+        let mut req = openai_request();
+        req.retry = RetryConfig {
+            base_backoff_ms: 1,
+            max_backoff_ms: 1,
+            max_ms: 3,
+        };
+        let driver = OpenAiCompatDriver {
+            base_url,
+            api_key: String::new(),
+        };
+        let (tx, _rx) = mpsc::channel();
+        assert_eq!(
+            driver.stream(req, tx).await.unwrap_err(),
+            DriverError::RateLimited,
+            "gives up with RateLimited once the retry budget is spent"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_detects_context_exceeded_without_retry() {
+        let body = r#"{"error":{"message":"This model's maximum context length is 4000 tokens"}}"#;
+        let responses = vec![format!(
+            "HTTP/1.1 400 Bad Request\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )];
+        let (base_url, hits) = stub_sequence(responses).await;
+        let driver = OpenAiCompatDriver {
+            base_url,
+            api_key: String::new(),
+        };
+        let (tx, _rx) = mpsc::channel();
+        assert_eq!(
+            driver.stream(openai_request(), tx).await.unwrap_err(),
+            DriverError::ContextExceeded
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "context-exceeded errors are not retried"
+        );
+    }
+
+    /// An interrupted tool call (index + id but no function name) must not be
+    /// promoted to a ToolCallEnd on stream flush — it has nothing to invoke.
+    #[test]
+    fn decoder_drops_incomplete_tool_call_without_a_name() {
+        let mut decoder = SseDecoder::new();
+        let events = decoder
+            .decode(
+                r#"{"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"c1","type":"function"}
+                ]}}]}"#,
+            )
+            .unwrap();
+        let SseEventBatch::Events(events) = events else {
+            panic!("expected an events batch, got a done marker");
+        };
+        assert!(events.is_empty(), "no events until the name arrives");
+        assert!(
+            decoder.finish().is_empty(),
+            "an unannounced partial call is dropped, not replayed"
+        );
     }
 }

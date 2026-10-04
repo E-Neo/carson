@@ -13,7 +13,7 @@ use axum::{Json, Router};
 use axum_extra::routing::TypedPath;
 use carson_host::app::{AppState, SessionEntry};
 use carson_host::auth::{SESSION_COOKIE, SESSION_COOKIE_MAX_AGE_MS};
-use carson_host::drivers::Usage;
+use carson_host::drivers::{RetryConfig, Usage};
 use carson_host::host;
 use carson_host::hub::{SseItem, sse_frame};
 use carson_host::registry::{AgentDef, AgentInstance, ProviderDef, ToolDef};
@@ -44,6 +44,17 @@ pub struct SessionUpdateReq {
     sandbox_id: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    retry: Option<RetryUpdateReq>,
+}
+
+/// A partial update of a session's LLM retry budget.
+#[derive(Deserialize, ToSchema)]
+#[schema(example = json!({"base_backoff_ms": 1000, "max_backoff_ms": 60000, "max_ms": 1800000}))]
+pub struct RetryUpdateReq {
+    base_backoff_ms: Option<u64>,
+    max_backoff_ms: Option<u64>,
+    max_ms: Option<u64>,
 }
 
 /// Create or rename a sandbox by its display alias.
@@ -230,6 +241,7 @@ pub(crate) struct ToolIdPath {
         ToolReq,
         CreateSessionReq,
         MessageReq,
+        RetryUpdateReq,
         LoginRequest,
         MeResponse,
         ModelListResponse,
@@ -1519,10 +1531,16 @@ pub(crate) async fn create_session(
                     name: None,
                     sandbox_id: sandbox_id.clone(),
                     model: model.clone(),
+                    retry: RetryConfig::default(),
                     updated_at: host::ms_since_epoch(),
                     instance: instance.clone(),
                 },
             );
+            st.ctx
+                .session_retry
+                .write()
+                .unwrap()
+                .insert(session_id.clone(), RetryConfig::default());
             host::snapshot_session(&st.db, &instance, &session_id).await;
             // A fresh session has no message blocks yet, so the snapshot has
             // no model to derive; persist the one it was created with.
@@ -1534,6 +1552,7 @@ pub(crate) async fn create_session(
                 "agent_version_id": def.id,
                 "model": model,
                 "sandbox_id": sandbox_id,
+                "retry": RetryConfig::default(),
             }))
         }
         Ok((Err(err),)) => json_err(
@@ -1575,8 +1594,6 @@ pub(crate) async fn get_session(State(st): State<AppState>, path: SessionPath) -
         Ok((Ok(blocks),)) => blocks,
         _ => return json_err(StatusCode::NOT_FOUND, "session not found"),
     };
-    // The session's own model (switchable), not derived from the agent.
-    let model = entry.model.clone();
     // Tool blocks carry their identity/payload as a JSON envelope inside the
     // content; project it back into flat fields for clients.
     let messages: Vec<Value> = blocks
@@ -1612,7 +1629,8 @@ pub(crate) async fn get_session(State(st): State<AppState>, path: SessionPath) -
         "agent_version_id": entry.agent_version_id,
         "name": entry.name,
         "sandbox_id": entry.sandbox_id,
-        "model": model,
+        "model": entry.model,
+        "retry": entry.retry,
         "message_count": messages.len(),
         "messages": messages,
     }))
@@ -1703,12 +1721,38 @@ pub(crate) async fn update_session(
             }
         }
     }
+    if let Some(retry) = &req.retry {
+        let base = retry.base_backoff_ms.unwrap_or(entry.retry.base_backoff_ms);
+        let max_backoff = retry.max_backoff_ms.unwrap_or(entry.retry.max_backoff_ms);
+        let max_inner = retry.max_ms.unwrap_or(entry.retry.max_ms);
+        if base > 3_600_000 || max_backoff > 3_600_000 || max_inner > 86_400_000 {
+            return json_err(StatusCode::BAD_REQUEST, "retry values out of range");
+        }
+        let new = RetryConfig {
+            base_backoff_ms: base,
+            max_backoff_ms: max_backoff,
+            max_ms: max_inner,
+        };
+        if st.db.set_session_retry(&id, &new).is_err() {
+            return json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to update retry budget",
+            );
+        }
+        entry.retry = new;
+        st.ctx
+            .session_retry
+            .write()
+            .unwrap()
+            .insert(id.clone(), new);
+    }
     st.sessions.lock().await.insert(id.clone(), entry.clone());
     json_ok(json!({
         "session_id": id,
         "name": entry.name,
         "sandbox_id": entry.sandbox_id,
         "model": entry.model,
+        "retry": entry.retry,
     }))
 }
 
@@ -1882,6 +1926,7 @@ pub(crate) async fn destroy_session(State(st): State<AppState>, path: SessionPat
     drop(store);
     let _ = st.db.delete_session(&id);
     st.ctx.sandbox_links.write().unwrap().remove(&id);
+    st.ctx.session_retry.write().unwrap().remove(&id);
     remove_session_attachments(&st, &id);
     json_ok(json!({"status": "deleted", "session_id": id}))
 }
@@ -2026,6 +2071,7 @@ async fn sync_session_agent(st: &AppState, id: &str, entry: &SessionEntry) -> Se
         name: entry.name.clone(),
         sandbox_id: entry.sandbox_id.clone(),
         model,
+        retry: entry.retry,
         updated_at: entry.updated_at,
         instance,
     };

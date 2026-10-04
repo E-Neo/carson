@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 
-use crate::drivers::Usage;
+use crate::drivers::{RetryConfig, Usage};
 use crate::registry::{AgentDef, ProviderDef, ToolDef};
 
 const SCHEMA: &str = r#"
@@ -49,6 +49,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     name TEXT,
     sandbox_id TEXT,
     model TEXT NOT NULL DEFAULT '',
+    retry_base_ms INTEGER NOT NULL DEFAULT 1000,
+    retry_max_backoff_ms INTEGER NOT NULL DEFAULT 60000,
+    retry_max_ms INTEGER NOT NULL DEFAULT 1800000,
     summary TEXT,
     input_tokens INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
@@ -136,6 +139,24 @@ fn migrate(conn: &Connection) -> Result<()> {
         "sessions",
         "model",
         "ALTER TABLE sessions ADD COLUMN model TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(
+        conn,
+        "sessions",
+        "retry_base_ms",
+        "ALTER TABLE sessions ADD COLUMN retry_base_ms INTEGER NOT NULL DEFAULT 1000",
+    )?;
+    add_column_if_missing(
+        conn,
+        "sessions",
+        "retry_max_backoff_ms",
+        "ALTER TABLE sessions ADD COLUMN retry_max_backoff_ms INTEGER NOT NULL DEFAULT 60000",
+    )?;
+    add_column_if_missing(
+        conn,
+        "sessions",
+        "retry_max_ms",
+        "ALTER TABLE sessions ADD COLUMN retry_max_ms INTEGER NOT NULL DEFAULT 1800000",
     )?;
     add_column_if_missing(
         conn,
@@ -237,6 +258,8 @@ pub struct PersistedSession {
     pub sandbox_id: Option<String>,
     /// The session's model (`provider/model`); empty means unknown (pre-decoupling).
     pub model: String,
+    /// The session's LLM retry budget.
+    pub retry: RetryConfig,
     pub updated_at: i64,
     pub summary: Option<String>,
     pub usage: Usage,
@@ -542,13 +565,15 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO sessions (id, agent_name, agent_version_id, name, sandbox_id, model, summary, \
+            "INSERT INTO sessions (id, agent_name, agent_version_id, name, sandbox_id, model, \
+             retry_base_ms, retry_max_backoff_ms, retry_max_ms, summary, \
              input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, created_at, \
              updated_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) \
              ON CONFLICT(id) DO UPDATE SET agent_name=?2, agent_version_id=?3, name=?4, \
-             sandbox_id=?5, model=?6, summary=?7, input_tokens=?8, cache_read_tokens=?9, \
-             cache_creation_tokens=?10, output_tokens=?11, updated_at=?13",
+             sandbox_id=?5, model=?6, \
+             summary=?10, input_tokens=?11, cache_read_tokens=?12, cache_creation_tokens=?13, \
+             output_tokens=?14, updated_at=?16",
             params![
                 session.id,
                 session.agent_name,
@@ -556,6 +581,9 @@ impl Db {
                 session.name,
                 session.sandbox_id,
                 session.model,
+                session.retry.base_backoff_ms as i64,
+                session.retry.max_backoff_ms as i64,
+                session.retry.max_ms as i64,
                 session.summary,
                 session.usage.input_tokens,
                 session.usage.cache_read_tokens,
@@ -600,7 +628,8 @@ impl Db {
     pub fn load_sessions(&self) -> Result<Vec<PersistedSession>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT s.id, s.agent_name, s.agent_version_id, s.name, s.sandbox_id, s.model, s.summary, \
+            "SELECT s.id, s.agent_name, s.agent_version_id, s.name, s.sandbox_id, s.model, \
+             s.retry_base_ms, s.retry_max_backoff_ms, s.retry_max_ms, s.summary, \
              s.input_tokens, s.cache_read_tokens, s.cache_creation_tokens, s.output_tokens, \
              s.updated_at, \
              m.seq, m.agent_version_id, m.model, m.attachments_json, m.kind, m.content, m.input_tokens, \
@@ -610,20 +639,20 @@ impl Db {
              ORDER BY s.rowid, m.seq",
         )?;
         let rows = stmt.query_map([], |row| {
-            let block = if row.get::<_, Option<i64>>(12)?.is_some() {
-                let attachments: String = row.get::<_, Option<String>>(15)?.unwrap_or_default();
+            let block = if row.get::<_, Option<i64>>(15)?.is_some() {
+                let attachments: String = row.get::<_, Option<String>>(18)?.unwrap_or_default();
                 Some(MessageRow(StoredBlock {
-                    agent_version_id: row.get::<_, Option<String>>(13)?.unwrap_or_default(),
-                    model: row.get::<_, Option<String>>(14)?.unwrap_or_default(),
+                    agent_version_id: row.get::<_, Option<String>>(16)?.unwrap_or_default(),
+                    model: row.get::<_, Option<String>>(17)?.unwrap_or_default(),
                     attachments: serde_json::from_str(&attachments).unwrap_or_default(),
-                    kind: row.get::<_, Option<String>>(16)?.unwrap_or_default(),
-                    text: row.get(17)?,
-                    input_tokens: row.get::<_, i64>(18)? as u32,
-                    cache_read_tokens: row.get::<_, i64>(19)? as u32,
-                    cache_creation_tokens: row.get::<_, i64>(20)? as u32,
-                    output_tokens: row.get::<_, i64>(21)? as u32,
-                    created_at_ms: row.get::<_, Option<i64>>(22)?.unwrap_or(0) as u64,
-                    finished_at_ms: row.get::<_, Option<i64>>(23)?.unwrap_or(0) as u64,
+                    kind: row.get::<_, Option<String>>(19)?.unwrap_or_default(),
+                    text: row.get(20)?,
+                    input_tokens: row.get::<_, i64>(21)? as u32,
+                    cache_read_tokens: row.get::<_, i64>(22)? as u32,
+                    cache_creation_tokens: row.get::<_, i64>(23)? as u32,
+                    output_tokens: row.get::<_, i64>(24)? as u32,
+                    created_at_ms: row.get::<_, Option<i64>>(25)?.unwrap_or(0) as u64,
+                    finished_at_ms: row.get::<_, Option<i64>>(26)?.unwrap_or(0) as u64,
                 }))
             } else {
                 None
@@ -635,12 +664,15 @@ impl Db {
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, i64>(7)? as u32,
-                row.get::<_, i64>(8)? as u32,
-                row.get::<_, i64>(9)? as u32,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, Option<String>>(9)?,
                 row.get::<_, i64>(10)? as u32,
-                row.get::<_, i64>(11)?,
+                row.get::<_, i64>(11)? as u32,
+                row.get::<_, i64>(12)? as u32,
+                row.get::<_, i64>(13)? as u32,
+                row.get::<_, i64>(14)?,
                 block,
             ))
         })?;
@@ -656,6 +688,9 @@ impl Db {
                 name,
                 sandbox_id,
                 model,
+                retry_base_ms,
+                retry_max_backoff_ms,
+                retry_max_ms,
                 summary,
                 input,
                 cache_read,
@@ -674,6 +709,11 @@ impl Db {
                         name,
                         sandbox_id,
                         model,
+                        retry: RetryConfig {
+                            base_backoff_ms: retry_base_ms.max(0) as u64,
+                            max_backoff_ms: retry_max_backoff_ms.max(0) as u64,
+                            max_ms: retry_max_ms.max(0) as u64,
+                        },
                         updated_at,
                         summary,
                         usage: Usage {
@@ -781,6 +821,23 @@ impl Db {
         Ok(())
     }
 
+    /// Set the session's LLM retry budget.
+    pub fn set_session_retry(&self, id: &str, retry: &RetryConfig) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET retry_base_ms = ?2, retry_max_backoff_ms = ?3, \
+             retry_max_ms = ?4, updated_at = ?5 WHERE id = ?1",
+            params![
+                id,
+                retry.base_backoff_ms as i64,
+                retry.max_backoff_ms as i64,
+                retry.max_ms as i64,
+                now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Read a persisted key-value setting.
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
@@ -851,6 +908,7 @@ mod tests {
             name: None,
             sandbox_id: Some(id.into()),
             model: "mock/mock".into(),
+            retry: RetryConfig::default(),
             updated_at: 5_000,
             summary: Some("summary".into()),
             usage: Usage {
@@ -1079,6 +1137,7 @@ mod tests {
             name: None,
             sandbox_id: None,
             model: model.into(),
+            retry: RetryConfig::default(),
             updated_at,
             summary: None,
             usage: Usage::default(),

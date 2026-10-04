@@ -152,9 +152,15 @@ fn blocks_to_chat(blocks: &[Block], include_attachments: bool) -> Vec<Message> {
                 else {
                     continue;
                 };
+                let name = v["name"].as_str().unwrap_or_default();
+                if name.is_empty() {
+                    // An interrupted tool call leaves no name behind; such a
+                    // call cannot be invoked, so do not replay it to the model.
+                    continue;
+                }
                 calls.push(ToolCall {
                     id: v["id"].as_str().unwrap_or_default().to_string(),
-                    name: v["name"].as_str().unwrap_or_default().to_string(),
+                    name: name.to_string(),
                     arguments_json: v["arguments"].as_str().unwrap_or_default().to_string(),
                 });
             }
@@ -362,6 +368,9 @@ fn describe_llm_error(err: &llm::LlmError) -> String {
         llm::LlmError::RateLimited => "rate limited by the provider".to_string(),
         llm::LlmError::Timeout => "request timed out".to_string(),
         llm::LlmError::Cancelled => "cancelled".to_string(),
+        llm::LlmError::ContextExceeded => {
+            "context length exceeded; compaction may help".to_string()
+        }
         llm::LlmError::Internal(msg) => msg.clone(),
     }
 }
@@ -523,6 +532,61 @@ fn tool_result_block(
     }
 }
 
+/// Max compaction retries after a `context-exceeded` error, a safety cap so a
+/// large per-session retry budget can't produce an unbounded compact loop.
+const MAX_COMPACTION_RETRIES: u32 = 8;
+
+/// Start an LLM stream, retrying after `context-exceeded` by compacting the
+/// session. Transient failures are retried by the driver itself (per the
+/// session's retry budget); this only handles the overflow case. `None` ends
+/// the turn (cancelled, a terminal error, or the budget / cap exhausted).
+fn start_stream(session: &mut Session) -> Option<u64> {
+    let budget = events::retry_budget_ms(&session.id);
+    let mut burst_start = now_ms();
+    let mut compactions = 0u32;
+    loop {
+        if events::cancelled(&session.id) {
+            return None;
+        }
+        let request = Request {
+            session_id: session.id.clone(),
+            model: session.model.clone(),
+            messages: blocks_to_chat(&session.blocks, true),
+            system_prompt: Some(session.system_prompt.clone()),
+            tools: tools::list_tools().to_vec(),
+            temperature: None,
+            max_tokens: None,
+        };
+        match llm::stream_start(&request) {
+            Ok(handle) => return Some(handle),
+            Err(llm::LlmError::ContextExceeded) => {
+                if budget == 0
+                    || now_ms().saturating_sub(burst_start) >= budget
+                    || compactions >= MAX_COMPACTION_RETRIES
+                {
+                    let _ = emit(
+                        &session.id,
+                        "error",
+                        "context length exceeded even after compaction",
+                    );
+                    return None;
+                }
+                compactions += 1;
+                if compact(session).is_err() {
+                    trim_history(session);
+                }
+                // A successful compaction is itself an LLM request, so the
+                // burst window restarts per the session's retry budget.
+                burst_start = now_ms();
+            }
+            Err(err) => {
+                let _ = emit(&session.id, "error", &describe_llm_error(&err));
+                return None;
+            }
+        }
+    }
+}
+
 fn run_loop(session: &mut Session) -> Result<(), Error> {
     let mut repeats: HashMap<String, usize> = HashMap::new();
 
@@ -535,22 +599,9 @@ fn run_loop(session: &mut Session) -> Result<(), Error> {
             trim_history(session);
         }
 
-        let request = Request {
-            session_id: session.id.clone(),
-            model: session.model.clone(),
-            messages: blocks_to_chat(&session.blocks, true),
-            system_prompt: Some(session.system_prompt.clone()),
-            tools: tools::list_tools().to_vec(),
-            temperature: None,
-            max_tokens: None,
-        };
-
-        let handle = match llm::stream_start(&request) {
-            Ok(handle) => handle,
-            Err(err) => {
-                let _ = emit(&session.id, "error", &describe_llm_error(&err));
-                return Ok(());
-            }
+        let handle = match start_stream(session) {
+            Some(handle) => handle,
+            None => return Ok(()),
         };
 
         let mut segs: Vec<Seg> = Vec::new();
@@ -584,6 +635,11 @@ fn run_loop(session: &mut Session) -> Result<(), Error> {
                         let _ = emit(&session.id, "tool_use", &tool_use_json(&tc));
                     }
                     if let Some(tc) = chunk.tool_call_end {
+                        if tc.name.is_empty() {
+                            // Never-announced partial call (interrupted before
+                            // the name arrived); skip it — nothing to invoke.
+                            continue;
+                        }
                         // The call is fully formed; the arguments streamed for
                         // `started -> now` (the time to yield the tool call).
                         let yielded = now_ms();

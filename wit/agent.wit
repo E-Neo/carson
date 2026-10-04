@@ -16,6 +16,10 @@ interface events {
     /// Host wall-clock time in milliseconds since the unix epoch. The sandbox
     /// has no clock of its own, so blocks stamp their timestamps through this.
     now-ms: func() -> u64;
+
+    /// The session's retry budget (`max_ms`): how long a burst of consecutive
+    /// failed LLM requests may spend before the agent gives up.
+    retry-budget-ms: func(session-id: string) -> u64;
 }
 
 interface llm {
@@ -70,6 +74,8 @@ interface llm {
         rate-limited,
         timeout,
         cancelled,
+        /// The request exceeded the model's context window.
+        context-exceeded,
         /// Carries a human-readable explanation of the failure.
         internal(string),
     }
