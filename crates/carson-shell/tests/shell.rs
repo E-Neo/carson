@@ -345,6 +345,43 @@ fn redirections() {
 }
 
 #[test]
+fn dup_redirects() {
+    let h = Harness::new();
+
+    // 2>&1 merges an external command's stderr into the tool's stdout.
+    let r = h.run("ls /nope 2>&1");
+    assert_eq!(r.status, 2, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "ls: /nope: no such file\n");
+    assert_eq!(r.stderr, "");
+
+    // Builtin stderr follows the dup too.
+    let r = h.run("echo boom 2>&1");
+    assert_eq!(r.out(), "boom");
+    assert_eq!(r.stderr, "");
+
+    // Order matters: `> f 2>&1` sends both to the file; `2>&1 > f` leaves
+    // stderr on the tool's stdout and only stdout in the file.
+    h.run("echo both > both.txt 2>&1");
+    assert_eq!(h.read("both.txt"), "both\n");
+    h.run("echo out 2>&1 > out.txt");
+    assert_eq!(h.read("out.txt"), "out\n");
+
+    // A dup target can point to an explicit fd instead of the default.
+    let r = h.run("echo x 2>&2");
+    assert_eq!(r.out(), "x");
+    assert_eq!(r.stderr, "");
+
+    // 2>&1 inside command substitution captures the combined stream.
+    let r = h.run("x=$(ls /nope 2>&1); echo $x");
+    assert_eq!(r.out(), "ls: /nope: no such file");
+    assert_eq!(r.stderr, "");
+
+    // 2>> append is unaffected by the new dup lexing.
+    h.run("echo pre > app.txt; echo more 2>> app.txt");
+    assert_eq!(h.read("app.txt"), "pre\n");
+}
+
+#[test]
 fn heredocs_and_here_strings() {
     let h = Harness::new();
 

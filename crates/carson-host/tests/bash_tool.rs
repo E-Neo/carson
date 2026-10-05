@@ -212,3 +212,147 @@ fn every_coreutils_command_runs_without_trapping() {
         assert!(code != 126, "{cmd} trapped: out={out:?} err={err:?}");
     }
 }
+
+#[test]
+fn dup_redirect_merges_stderr_into_stdout() {
+    let runner = bash_runner();
+    // Builtin: 2>&1 sends the write to stdout.
+    let (out, err, code) = run_bash(&runner, "echo boom 2>&1");
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out, "boom\n");
+    assert_eq!(err, "");
+
+    // External command: its stderr lands on the tool's stdout.
+    let (out, err, code) = run_bash(&runner, "ls /nope 2>&1");
+    assert_ne!(code, 0, "expected ls to fail");
+    assert!(out.contains("nope"), "stdout: {out:?}");
+    assert_eq!(err, "", "stderr should have been merged: {err:?}");
+}
+
+#[test]
+fn dup_redirect_flows_through_a_pipeline() {
+    let runner = bash_runner();
+    let (out, err, code) = run_bash(&runner, "ls /nope 2>&1 | wc -c");
+    assert_eq!(code, 0, "stderr: {err}");
+    let count: usize = out.trim().parse().expect("wc printed a count");
+    assert!(
+        count > 0,
+        "pipeline should carry the error text, got {out:?}"
+    );
+    assert_eq!(err, "");
+}
+
+#[test]
+fn dup_redirect_ordering_and_files() {
+    let runner = bash_runner();
+    // `> f 2>&1`: both streams into the file.
+    let (out, err, code) = run_bash(&runner, "ls /nope > log.txt 2>&1; cat log.txt");
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("nope"), "file should hold the error: {out:?}");
+    assert_eq!(err, "");
+
+    // `2>&1 > f`: stderr stays on stdout (tool output), file holds stdout only.
+    let (out, err, code) = run_bash(&runner, "ls /nope 2>&1 > log2.txt; cat log2.txt");
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("nope"),
+        "stderr belongs to the tool stdout: {out:?}"
+    );
+    assert_eq!(err, "");
+}
+
+#[test]
+fn dup_redirect_append_and_success_path() {
+    let runner = bash_runner();
+    // 2>> append is untouched by the new dup lexing.
+    let (out, err, code) = run_bash(
+        &runner,
+        "echo pre > app.txt; ls /nope 2>> app.txt; cat app.txt",
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("pre"), "stdout: {out:?}");
+    assert!(out.contains("nope"), "appended error missing: {out:?}");
+    assert_eq!(err, "");
+
+    // A success invocation carrying 2>&1 stays clean.
+    let (out, err, code) = run_bash(&runner, "touch /tmp/f 2>&1 && echo ok");
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out, "ok\n");
+    assert_eq!(err, "");
+}
+
+#[test]
+fn command_substitution_expands() {
+    let runner = bash_runner();
+    let (out, err, code) = run_bash(&runner, "x=$(echo hi); echo $x");
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out, "hi\n");
+
+    let (out, _, _) = run_bash(&runner, "echo $(echo a; echo b)");
+    assert_eq!(out, "a b\n");
+
+    let (out, _, _) = run_bash(&runner, "echo $(echo $(echo deep))");
+    assert_eq!(out, "deep\n");
+
+    let (out, err, code) = run_bash(&runner, "echo $(date)");
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(!out.trim().is_empty(), "date should print something");
+}
+
+#[test]
+fn command_substitution_splitting_and_quoting() {
+    let runner = bash_runner();
+    // Unquoted $() word-splits the result; quoted $() keeps it as one field.
+    let (out, _, code) = run_bash(&runner, "printf '%s|' $(echo a b)");
+    assert_eq!(code, 0);
+    assert_eq!(out, "a|b|");
+
+    let (out, _, _) = run_bash(&runner, "printf '%s|' \"$(echo a b)\"");
+    assert_eq!(out, "a b|");
+
+    // Embedded in a larger word.
+    let (out, _, _) = run_bash(&runner, "echo pre$(echo mid)post");
+    assert_eq!(out, "premidpost\n");
+}
+
+#[test]
+fn command_substitution_env_and_redirect_target() {
+    let runner = bash_runner();
+    // The outer environment is visible inside the substitution.
+    let (out, err, code) = run_bash(&runner, "v=hello; echo $(echo $v)");
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out, "hello\n");
+
+    // A substitution may name the redirect target.
+    let (out, err, code) = run_bash(&runner, "echo x > $(echo out.txt); cat out.txt");
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out, "x\n");
+}
+
+#[test]
+fn command_substitution_empty_and_errors() {
+    let runner = bash_runner();
+    // Empty substitution -> empty argument.
+    let (out, err, code) = run_bash(&runner, "echo \"$(true)\"");
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out, "\n");
+
+    // Inner failure prints to stderr and yields an empty substitution.
+    let (out, err, code) = run_bash(&runner, "echo $(nosuchbinary123)");
+    assert_eq!(code, 0, "the outer echo succeeds");
+    assert_eq!(out, "\n");
+    assert!(err.contains("command not found"), "stderr: {err:?}");
+}
+
+#[test]
+fn command_substitution_combines_with_dup_redirect() {
+    let runner = bash_runner();
+    // The originally broken path: $(...) capturing a merged 2>&1 stream.
+    let (out, err, code) = run_bash(&runner, "x=$(ls /nope 2>&1); echo $x");
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("nope"),
+        "substitution should hold the error: {out:?}"
+    );
+    assert_eq!(err, "");
+}

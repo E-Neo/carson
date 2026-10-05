@@ -182,25 +182,27 @@ impl Lexer {
         let tok = match self.peek() {
             Some('>') => {
                 self.pos += 1;
-                let append = self.eat('>');
-                Some(Tok::Redir(RedirectTok::Out { fd, append }))
+                if self.eat('&') {
+                    // `fd>&N`: duplicate the fd to another stream. The target
+                    // digit run follows the `&`.
+                    let to_start = self.pos;
+                    while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                        self.pos += 1;
+                    }
+                    let to: u32 = self.src[to_start..self.pos]
+                        .iter()
+                        .collect::<String>()
+                        .parse()
+                        .unwrap_or(0);
+                    Some(Tok::Redir(RedirectTok::Dup { fd, to }))
+                } else {
+                    let append = self.eat('>');
+                    Some(Tok::Redir(RedirectTok::Out { fd, append }))
+                }
             }
             Some('<') => {
                 self.pos += 1;
                 Some(Tok::Redir(RedirectTok::In { fd }))
-            }
-            Some('&') if self.peek_at(1) == Some('>') => {
-                self.pos += 2;
-                let to_start = self.pos;
-                while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                    self.pos += 1;
-                }
-                let to: u32 = self.src[to_start..self.pos]
-                    .iter()
-                    .collect::<String>()
-                    .parse()
-                    .unwrap_or(0);
-                Some(Tok::Redir(RedirectTok::Dup { fd, to }))
             }
             _ => None,
         };
@@ -455,5 +457,66 @@ impl Lexer {
         } else {
             false
         }
+    }
+}
+
+/// The redirect operator after a word, or `None` when the input is a plain word.
+fn redirs(toks: &[Tok]) -> Vec<RedirectTok> {
+    toks.iter()
+        .filter_map(|t| match t {
+            Tok::Redir(r) => Some(*r),
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fd_prefixed_dup_redirect_is_lexed() {
+        let toks = lex("echo x 2>&1").unwrap();
+        assert_eq!(redirs(&toks), vec![RedirectTok::Dup { fd: 2, to: 1 }]);
+    }
+
+    #[test]
+    fn fd_prefixed_dup_to_stderr() {
+        let toks = lex("echo x 2>&2").unwrap();
+        assert_eq!(redirs(&toks), vec![RedirectTok::Dup { fd: 2, to: 2 }]);
+    }
+
+    #[test]
+    fn bare_stderr_dup_redirect_is_lexed() {
+        let toks = lex("echo x >&2").unwrap();
+        assert_eq!(redirs(&toks), vec![RedirectTok::Dup { fd: 1, to: 2 }]);
+    }
+
+    #[test]
+    fn fd_prefixed_plain_and_append_redirects_unchanged() {
+        assert_eq!(
+            redirs(&lex("echo x 2> err.txt").unwrap()),
+            vec![RedirectTok::Out {
+                fd: 2,
+                append: false,
+            }]
+        );
+        assert_eq!(
+            redirs(&lex("echo x 2>> err.txt").unwrap()),
+            vec![RedirectTok::Out {
+                fd: 2,
+                append: true,
+            }]
+        );
+        assert_eq!(
+            redirs(&lex("cat < in.txt").unwrap()),
+            vec![RedirectTok::In { fd: 0 }]
+        );
+    }
+
+    #[test]
+    fn digits_without_redirect_remain_a_word() {
+        let toks = lex("echo 42").unwrap();
+        assert!(matches!(&toks[1], Tok::Word(w) if w.plain() == Some("42")));
     }
 }
