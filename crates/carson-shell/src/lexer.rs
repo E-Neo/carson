@@ -460,19 +460,19 @@ impl Lexer {
     }
 }
 
-/// The redirect operator after a word, or `None` when the input is a plain word.
-fn redirs(toks: &[Tok]) -> Vec<RedirectTok> {
-    toks.iter()
-        .filter_map(|t| match t {
-            Tok::Redir(r) => Some(*r),
-            _ => None,
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The redirect operators after a word, or `None` when the input has none.
+    fn redirs(toks: &[Tok]) -> Vec<RedirectTok> {
+        toks.iter()
+            .filter_map(|t| match t {
+                Tok::Redir(r) => Some(*r),
+                _ => None,
+            })
+            .collect()
+    }
 
     #[test]
     fn fd_prefixed_dup_redirect_is_lexed() {

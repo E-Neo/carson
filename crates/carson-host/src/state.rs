@@ -117,15 +117,16 @@ impl crate::bindings::carson::agent::events::Host for State {
             event: part.kind,
             data: serde_json::Value::String(part.data),
         };
-        if self.hub.send(&session_id, item) {
-            Ok(())
-        } else {
-            Err(EventError::Closed)
-        }
+        // A turn keeps running even when nobody is subscribed (the user left
+        // the session, or another tab/turn is busy); frames broadcast to any
+        // live subscriber and are dropped otherwise. Explicit stop/delete is
+        // the only abort, so switching sessions no longer kills the turn.
+        let _ = self.hub.send(&session_id, item);
+        Ok(())
     }
 
-    fn cancelled(&mut self, session_id: String) -> bool {
-        self.stop.load(Ordering::SeqCst) || !self.hub.alive(&session_id)
+    fn cancelled(&mut self, _session_id: String) -> bool {
+        self.stop.load(Ordering::SeqCst)
     }
 
     fn now_ms(&mut self) -> u64 {
@@ -463,8 +464,10 @@ mod tests {
     }
 
     #[test]
-    fn emit_event_closed_without_client() {
+    fn emit_event_drops_without_client_but_succeeds() {
         let mut state = test_state(&["time"]);
+        // With nobody subscribed the frame vanishes, but the turn must keep
+        // running (switching sessions never aborts it).
         let result = state.emit_event(
             "missing".into(),
             Part {
@@ -472,7 +475,7 @@ mod tests {
                 data: "x".into(),
             },
         );
-        assert_eq!(result, Err(EventError::Closed));
+        assert_eq!(result, Ok(()));
     }
 
     #[test]
@@ -485,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_tracks_stop_flag_and_hub() {
+    fn cancelled_tracks_only_the_stop_flag() {
         let mut state = test_state(&["time"]);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         state.hub.register("s3", tx.clone());
@@ -496,8 +499,10 @@ mod tests {
         state.stop.store(false, Ordering::SeqCst);
         assert!(!state.cancelled("s3".into()));
 
+        // Leaving the session (no live SSE subscriber) must NOT cancel the
+        // turn: switching sessions keeps the turn running in the background.
         state.hub.unregister("s3", &tx);
-        assert!(state.cancelled("s3".into()));
+        assert!(!state.cancelled("s3".into()));
     }
 
     #[test]

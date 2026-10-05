@@ -346,6 +346,31 @@ impl LlmDriver for EchoDriver {
 /// a timeout (so a stalled SSE stream can't hang the turn forever).
 const LLM_READ_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// The granularity at which a retry backoff checks the cancel flag, so a stop
+/// or session delete aborts the sleep within a bounded window instead of
+/// holding the session for the whole backoff.
+const BACKOFF_CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Sleep `ms` milliseconds unless `cancel` is raised in the meantime. Returns
+/// false when cancelled, so the caller can abort the request promptly.
+async fn sleep_cancellable(ms: u64, cancel: &std::sync::atomic::AtomicBool) -> bool {
+    use std::sync::atomic::Ordering;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        let step = deadline
+            .saturating_duration_since(now)
+            .min(BACKOFF_CANCEL_POLL);
+        tokio::time::sleep(step).await;
+    }
+}
+
 /// Classify a failed request phase into a [`DriverError`] and whether it is
 /// worth a backoff retry. `send_err` is non-None when the request never
 /// produced a response; otherwise `status`/`detail` describe the rejection.
@@ -585,7 +610,9 @@ impl LlmDriver for OpenAiCompatDriver {
             let _ = tx.send(DriverEvent::Status(
                 json!({"retry_in_ms": sleep, "attempt": attempt}).to_string(),
             ));
-            tokio::time::sleep(std::time::Duration::from_millis(sleep)).await;
+            if !sleep_cancellable(sleep, &req.cancel).await {
+                return Err(DriverError::Cancelled);
+            }
         };
 
         let mut chunks = resp.bytes_stream();
@@ -1288,6 +1315,43 @@ mod tests {
         assert!(status["retry_in_ms"].as_u64().unwrap_or(0) > 0);
         assert_eq!(status["attempt"], serde_json::json!(1));
         assert_eq!(rx.recv().unwrap(), DriverEvent::Text("hi".into()));
+    }
+
+    #[tokio::test]
+    async fn openai_aborts_a_backoff_when_cancelled() {
+        // A long backoff must not hold the turn hostage: raising the cancel
+        // flag (stop/delete) aborts the sleep within the poll window.
+        let responses = (0..10)
+            .map(|_| "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n".to_string())
+            .collect();
+        let (base_url, _hits) = stub_sequence(responses).await;
+        let mut req = openai_request();
+        req.retry = RetryConfig {
+            base_backoff_ms: 60_000,
+            max_backoff_ms: 120_000,
+            max_ms: 600_000,
+        };
+        let cancel = req.cancel.clone();
+        let driver = OpenAiCompatDriver {
+            base_url,
+            api_key: String::new(),
+        };
+        let (tx, mut rx) = mpsc::channel();
+        let task = tokio::spawn(async move { driver.stream(req, tx).await });
+        // The status announcing the retry is emitted before the sleep.
+        let status = tokio::task::spawn_blocking(move || match rx.recv().unwrap() {
+            DriverEvent::Status(s) => serde_json::from_str::<serde_json::Value>(&s).unwrap(),
+            other => panic!("expected a status event, got {other:?}"),
+        })
+        .await
+        .unwrap();
+        assert!(status["retry_in_ms"].as_u64().unwrap_or(0) >= 60_000);
+        cancel.store(true, Ordering::SeqCst);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(4), task)
+            .await
+            .expect("cancelled stream returned promptly, not after the backoff")
+            .expect("driver task joined");
+        assert_eq!(result, Err(DriverError::Cancelled));
     }
 
     #[tokio::test]

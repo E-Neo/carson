@@ -1583,20 +1583,45 @@ pub(crate) async fn get_session(State(st): State<AppState>, path: SessionPath) -
     let Some(entry) = st.sessions.lock().await.get(&id).cloned() else {
         return json_err(StatusCode::NOT_FOUND, "session not found");
     };
-    let mut store = entry.instance.store.lock().await;
-    let guest = entry.instance.agent.carson_agent_agent();
-    let result = guest
-        .func_session_history()
-        .call_async(&mut *store, (&id,))
-        .await;
-    drop(store);
-    let blocks = match result {
-        Ok((Ok(blocks),)) => blocks,
-        _ => return json_err(StatusCode::NOT_FOUND, "session not found"),
+    let blocks: Vec<carson_host::db::StoredBlock> = match entry.instance.store.try_lock() {
+        Ok(mut store) => {
+            let guest = entry.instance.agent.carson_agent_agent();
+            let result = guest
+                .func_session_history()
+                .call_async(&mut *store, (&id,))
+                .await;
+            match result {
+                Ok((Ok(blocks),)) => blocks
+                    .iter()
+                    .map(carson_host::db::StoredBlock::from)
+                    .collect(),
+                _ => return json_err(StatusCode::NOT_FOUND, "session not found"),
+            }
+        }
+        // A turn is streaming (possibly retrying) and holds the wasm store for
+        // the whole turn; the last persisted snapshot keeps reads (page loads,
+        // settings) from ever blocking on the retry budget.
+        Err(_) => st.db.load_session_messages(&id).unwrap_or_default(),
     };
-    // Tool blocks carry their identity/payload as a JSON envelope inside the
-    // content; project it back into flat fields for clients.
-    let messages: Vec<Value> = blocks
+    let messages = messages_from_blocks(&blocks);
+    json_ok(json!({
+        "session_id": id,
+        "agent": entry.agent_name,
+        "agent_version_id": entry.agent_version_id,
+        "name": entry.name,
+        "sandbox_id": entry.sandbox_id,
+        "model": entry.model,
+        "retry": entry.retry,
+        "message_count": messages.len(),
+        "messages": messages,
+    }))
+}
+
+/// Project persisted blocks into the flat JSON messages the client consumes.
+/// Tool blocks carry their identity/payload as a JSON envelope inside the
+/// content; this reconstructs the flat fields.
+fn messages_from_blocks(blocks: &[carson_host::db::StoredBlock]) -> Vec<Value> {
+    blocks
         .iter()
         .map(|b| {
             let payload: Value =
@@ -1622,18 +1647,7 @@ pub(crate) async fn get_session(State(st): State<AppState>, path: SessionPath) -
                 "finished_at_ms": b.finished_at_ms,
             })
         })
-        .collect();
-    json_ok(json!({
-        "session_id": id,
-        "agent": entry.agent_name,
-        "agent_version_id": entry.agent_version_id,
-        "name": entry.name,
-        "sandbox_id": entry.sandbox_id,
-        "model": entry.model,
-        "retry": entry.retry,
-        "message_count": messages.len(),
-        "messages": messages,
-    }))
+        .collect()
 }
 
 /// Update a session's name, sandbox and/or model.
@@ -1703,6 +1717,9 @@ pub(crate) async fn update_session(
         if st.db.set_session_model(&id, &model).is_err() {
             return json_err(StatusCode::INTERNAL_SERVER_ERROR, "failed to switch model");
         }
+        // Cancelling the in-flight turn is part of the model switch (retries
+        // against the old model never finish with the new one anyway).
+        entry.instance.stop.store(true, Ordering::SeqCst);
         // Push the new model into the live wasm session so the next turn uses it.
         let mut store = entry.instance.store.lock().await;
         let guest = entry.instance.agent.carson_agent_agent();
@@ -1917,6 +1934,9 @@ pub(crate) async fn destroy_session(State(st): State<AppState>, path: SessionPat
     let Some(entry) = st.sessions.lock().await.remove(&id) else {
         return json_err(StatusCode::NOT_FOUND, "session not found");
     };
+    // Abort any in-flight turn (including retries) so the store is released
+    // promptly instead of blocking the delete for the whole retry budget.
+    entry.instance.stop.store(true, Ordering::SeqCst);
     let mut store = entry.instance.store.lock().await;
     let guest = entry.instance.agent.carson_agent_agent();
     let _ = guest
@@ -1948,6 +1968,9 @@ pub(crate) async fn reset_session(State(st): State<AppState>, path: ResetPath) -
     let Some(entry) = st.sessions.lock().await.get(&id).cloned() else {
         return json_err(StatusCode::NOT_FOUND, "session not found");
     };
+    // Cancelling an in-flight turn is implied by resetting it, so abort retries
+    // before waiting on the store.
+    entry.instance.stop.store(true, Ordering::SeqCst);
     let mut store = entry.instance.store.lock().await;
     let guest = entry.instance.agent.carson_agent_agent();
     let result = guest
@@ -2003,6 +2026,9 @@ pub(crate) async fn compact_session(State(st): State<AppState>, path: CompactPat
     let Some(pinned) = st.sessions.lock().await.get(&id).cloned() else {
         return json_err(StatusCode::NOT_FOUND, "session not found");
     };
+    // Compaction is exclusive: abort any in-flight turn first so the store is
+    // not held by a retrying request while we wait for it.
+    pinned.instance.stop.store(true, Ordering::SeqCst);
     let entry = sync_session_agent(&st, &id, &pinned).await;
     let mut store = entry.instance.store.lock().await;
     let guest = entry.instance.agent.carson_agent_agent();

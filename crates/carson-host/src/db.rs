@@ -735,6 +735,38 @@ impl Db {
         Ok(sessions)
     }
 
+    /// Read one session's persisted message blocks in order. Used as a
+    /// non-blocking fallback for history reads while a turn holds the wasm
+    /// store; returns an empty list when nothing has been snapshotted yet.
+    pub fn load_session_messages(&self, id: &str) -> Result<Vec<StoredBlock>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT m.agent_version_id, m.model, m.attachments_json, m.kind, m.content, \
+             m.input_tokens, m.cache_read_tokens, m.cache_creation_tokens, m.output_tokens, \
+             m.created_at, m.finished_at \
+             FROM messages m WHERE m.session_id = ?1 ORDER BY m.seq",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        let mut blocks = Vec::new();
+        while let Some(row) = rows.next()? {
+            let attachments: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
+            blocks.push(StoredBlock {
+                agent_version_id: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                model: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                attachments: serde_json::from_str(&attachments).unwrap_or_default(),
+                kind: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                text: row.get(4)?,
+                input_tokens: row.get::<_, i64>(5)? as u32,
+                cache_read_tokens: row.get::<_, i64>(6)? as u32,
+                cache_creation_tokens: row.get::<_, i64>(7)? as u32,
+                output_tokens: row.get::<_, i64>(8)? as u32,
+                created_at_ms: row.get::<_, Option<i64>>(9)?.unwrap_or(0) as u64,
+                finished_at_ms: row.get::<_, Option<i64>>(10)?.unwrap_or(0) as u64,
+            });
+        }
+        Ok(blocks)
+    }
+
     pub fn delete_session(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
@@ -1036,6 +1068,26 @@ mod tests {
         let loaded = db.load_sessions().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].messages.len(), 2);
+    }
+
+    #[test]
+    fn load_session_messages_reads_blocks_in_order() {
+        let db = Db::open_in_memory().unwrap();
+        let agent = create_agent(&db, "coder");
+        db.upsert_session(&session(
+            "s",
+            "coder",
+            &agent.id,
+            vec![block("v", "user", "a"), block("v", "text", "b")],
+        ))
+        .unwrap();
+        let blocks = db.load_session_messages("s").unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].kind, "user");
+        assert_eq!(blocks[0].text.as_deref(), Some("a"));
+        assert_eq!(blocks[1].kind, "text");
+        // A session with no rows reads back as empty, not an error.
+        assert!(db.load_session_messages("nope").unwrap().is_empty());
     }
 
     #[test]
