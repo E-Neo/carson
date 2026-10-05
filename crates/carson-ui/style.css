@@ -292,6 +292,29 @@ body {
   margin-bottom: 8px;
 }
 
+/* Full-window hint while files are dragged over the chat area. */
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border: 2px dashed var(--accent);
+  pointer-events: none;
+}
+
+.drop-overlay-label {
+  padding: 10px 18px;
+  border-radius: 8px;
+  background: var(--bg-panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  font-weight: 600;
+  box-shadow: 0 4px 16px rgb(0 0 0 / 0.18);
+}
+
 .attach-preview {
   position: relative;
   display: inline-flex;

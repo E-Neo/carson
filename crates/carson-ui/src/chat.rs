@@ -210,7 +210,6 @@ async fn load_history(
     messages: &RwSignal<Vec<MsgEntry>>,
     error: &RwSignal<Option<String>>,
     scroll_tick: &RwSignal<u64>,
-    follow: &RwSignal<bool>,
     at_latest: &RwSignal<bool>,
     next_id: &RwSignal<u64>,
     session_model: &RwSignal<String>,
@@ -223,8 +222,7 @@ async fn load_history(
             error.set(Some(str_of(&v, "error")));
         }
     }
-    // Fresh content lands at the bottom; resume following there.
-    follow.set(true);
+    // Fresh content lands at the bottom; resume auto-scrolling there.
     at_latest.set(true);
     scroll_tick.update(|t| *t += 1);
 }
@@ -290,7 +288,8 @@ struct ChatSignals {
     /// the moment the provider sends content (or the backoff expires).
     retry: RwSignal<Option<(f64, u32, String)>>,
     scroll_tick: RwSignal<u64>,
-    follow: RwSignal<bool>,
+    /// Whether the view is currently at the bottom; new content auto-scrolls
+    /// only while this is true.
     at_latest: RwSignal<bool>,
     next_id: RwSignal<u64>,
     /// The session's current model, stamped onto newly streamed blocks.
@@ -511,8 +510,7 @@ fn send(session_id: String, input: RwSignal<String>, st: ChatSignals) {
     st.error.set(None);
     st.status_line.set(None);
     st.retry.set(None);
-    // The user asked for this reply; follow it regardless of prior scroll.
-    st.follow.set(true);
+    // The user asked for this reply; pin to the latest regardless of prior scroll.
     st.at_latest.set(true);
     st.scroll_tick.update(|t| *t += 1);
 
@@ -673,6 +671,43 @@ fn read_as_data_url(file: web_sys::File, on_done: impl FnOnce(String) + 'static)
     let _ = reader.read_as_data_url(&file);
 }
 
+/// How many image attachments a message may carry (mirrors the server cap).
+const MAX_ATTACHMENTS: usize = 8;
+
+/// Queue the image files in `files` as attachments for the next send.
+fn attach_files(files: &web_sys::FileList, attachments: RwSignal<Vec<String>>) {
+    for i in 0..files.length() {
+        let Some(file) = files.item(i) else {
+            continue;
+        };
+        if !file.type_().starts_with("image/") {
+            continue;
+        }
+        if attachments.get_untracked().len() >= MAX_ATTACHMENTS {
+            break;
+        }
+        read_as_data_url(file, move |url| {
+            attachments.update(|v| {
+                if v.len() < MAX_ATTACHMENTS {
+                    v.push(url);
+                }
+            });
+        });
+    }
+}
+
+/// Whether a drag event carries files (so text/image-from-the-page drags do
+/// not raise the drop overlay).
+fn drag_carries_files(ev: &web_sys::DragEvent) -> bool {
+    let Some(dt) = ev.data_transfer() else {
+        return false;
+    };
+    let types = dt.types();
+    types
+        .iter()
+        .any(|t| t.as_string().as_deref() == Some("Files"))
+}
+
 /// The SSE layer frames every payload as a JSON string, so an object payload
 /// (tool events) arrives as a JSON string literal containing JSON text: e.g.
 /// `data: "{\"id\":\"c1\",...}"`. Unwrap that outer layer so field access
@@ -787,25 +822,11 @@ fn block_child(
     }
 }
 
-/// Pure transition for one scroll event: returns `(at_latest, follow)`.
-///
-/// Our own pins (inside the suppression window) are ignored entirely.
-/// Following only resumes on a genuine away -> near transition: starting a
-/// drag while already at the bottom must never resurrect auto-scroll, or
-/// mobile/touch streams would yank the view back on the first tiny move.
-fn scroll_update(
-    now: f64,
-    pinned_until: f64,
-    near: bool,
-    follow: bool,
-    at_latest: bool,
-) -> (bool, bool) {
-    if now < pinned_until {
-        return (at_latest, follow);
-    }
-    let new_at_latest = near;
-    let new_follow = if !at_latest && near { true } else { follow };
-    (new_at_latest, new_follow)
+/// The new `at_latest` for one scroll event. Our own pins (inside the
+/// suppression window) are ignored entirely, so the programmatic scrolls of
+/// auto-scroll never flip the flag.
+fn scroll_update(now: f64, pinned_until: f64, near: bool, at_latest: bool) -> bool {
+    if now < pinned_until { at_latest } else { near }
 }
 
 fn fmt_clock(ms: u64) -> String {
@@ -1047,6 +1068,9 @@ pub fn ChatPage() -> impl IntoView {
     let session_model = RwSignal::new(String::new());
     // Image data URLs attached to the next message (also shown as previews).
     let attachments = RwSignal::new(Vec::<String>::new());
+    // How many file drags are currently over the chat area (enter/leave depth);
+    // the drop overlay shows while > 0.
+    let drag_depth = RwSignal::new(0u32);
     // Full-size attachment source shown in the enlarge overlay, if any.
     let lightbox = RwSignal::new(None::<String>);
     // Which session-item (if any) has its action menu open, plus where to anchor it.
@@ -1055,13 +1079,10 @@ pub fn ChatPage() -> impl IntoView {
     let editing_session = RwSignal::new(None::<String>);
     let rename_draft = RwSignal::new(String::new());
 
-    // Auto-scroll: follow the stream only while `follow` is engaged. Any
-    // user intent (wheel / touch / scrollbar grab) disengages it immediately
-    // and synchronously, so streaming never fights the user. Scrolling back
-    // to the bottom re-engages; sending a message or switching sessions
-    // resets it.
+    // Auto-scroll: when the view is at the bottom, new content scrolls to the
+    // latest. `at_latest` is tracked by the scroll handler (with our own pin
+    // echoes suppressed via `pinned_until`); scrolled away means no scroll.
     let messages_el = NodeRef::<leptos::html::Div>::new();
-    let follow = RwSignal::new(true);
     let at_latest = RwSignal::new(true);
     // Programmatic pins stamp this timestamp; scroll events within the window
     // are our own echo and are ignored, so they can never re-engage or
@@ -1081,7 +1102,6 @@ pub fn ChatPage() -> impl IntoView {
         status_line,
         retry,
         scroll_tick,
-        follow,
         at_latest,
         next_id,
         session_model,
@@ -1097,7 +1117,7 @@ pub fn ChatPage() -> impl IntoView {
     Effect::new(move |_| {
         scroll_tick.get();
         messages.track();
-        if !follow.get() {
+        if !at_latest.get() {
             return;
         }
         if let Some(el) = messages_el.get() {
@@ -1135,7 +1155,6 @@ pub fn ChatPage() -> impl IntoView {
     });
 
     let pin_to_latest = move || {
-        follow.set(true);
         at_latest.set(true);
         scroll_tick.update(|t| *t += 1);
     };
@@ -1162,7 +1181,6 @@ pub fn ChatPage() -> impl IntoView {
             let messages = messages;
             let error = error;
             let scroll_tick = scroll_tick;
-            let follow = follow;
             let at_latest = at_latest;
             let next_id = next_id;
             let session_model = session_model;
@@ -1172,7 +1190,6 @@ pub fn ChatPage() -> impl IntoView {
                     &messages,
                     &error,
                     &scroll_tick,
-                    &follow,
                     &at_latest,
                     &next_id,
                     &session_model,
@@ -1213,7 +1230,7 @@ pub fn ChatPage() -> impl IntoView {
         }
     };
 
-    // Attach image files selected in the composer.
+    // Attach image files selected in the composer (shared with drag-and-drop).
     let on_attach_files = move |ev: web_sys::Event| {
         let input = ev
             .target()
@@ -1222,12 +1239,7 @@ pub fn ChatPage() -> impl IntoView {
         let files = input.files();
         input.set_value("");
         if let Some(files) = files {
-            for i in 0..files.length() {
-                if let Some(file) = files.get(i) {
-                    let attachments = attachments;
-                    read_as_data_url(file, move |url| attachments.update(|v| v.push(url)));
-                }
-            }
+            attach_files(&files, attachments);
         }
     };
 
@@ -1743,7 +1755,38 @@ pub fn ChatPage() -> impl IntoView {
                 <DragRail/>
                 <MenuButton open=drawer_open/>
 
-                <main class="main">
+                <main
+                    class="main"
+                    on:dragenter=move |ev| {
+                        ev.prevent_default();
+                        if drag_carries_files(&ev) {
+                            drag_depth.update(|d| *d += 1);
+                        }
+                    }
+                    on:dragover=move |ev| ev.prevent_default()
+                    on:dragleave=move |ev| {
+                        ev.prevent_default();
+                        drag_depth.update(|d| {
+                            *d = d.saturating_sub(1);
+                        });
+                    }
+                    on:drop=move |ev| {
+                        ev.prevent_default();
+                        drag_depth.set(0);
+                        if let Some(files) = ev.data_transfer().and_then(|dt| dt.files()) {
+                            attach_files(&files, attachments);
+                        }
+                    }
+                >
+                    {move || {
+                        (drag_depth.get() > 0).then(|| {
+                            view! {
+                                <div class="drop-overlay">
+                                    <span class="drop-overlay-label">"Drop images to attach"</span>
+                                </div>
+                            }
+                        })
+                    }}
                     {move || {
                         if active.get().is_some() {
                             view! {
@@ -1758,22 +1801,16 @@ pub fn ChatPage() -> impl IntoView {
                                 <div
                                     class="messages"
                                     node_ref=messages_el
-                                    on:wheel=move |_| follow.set(false)
-                                    on:touchstart=move |_| follow.set(false)
-                                    on:mousedown=move |_| follow.set(false)
                                     on:scroll=move |_| {
                                         let Some(el) = messages_el.get() else { return };
                                         let near = el.scroll_top() + el.client_height()
                                             >= el.scroll_height() - 48;
-                                        let (a, f) = scroll_update(
+                                        at_latest.set(scroll_update(
                                             js_sys::Date::now(),
                                             pinned_until.get_untracked(),
                                             near,
-                                            follow.get_untracked(),
                                             at_latest.get_untracked(),
-                                        );
-                                        at_latest.set(a);
-                                        follow.set(f);
+                                        ));
                                     }
                                 >
                                     <div class="messages-column">
@@ -1784,7 +1821,7 @@ pub fn ChatPage() -> impl IntoView {
                                     </div>
                                 </div>
                                 {move || {
-                                    (!follow.get() && !at_latest.get()).then(|| {
+                                    (!at_latest.get()).then(|| {
                                         view! {
                                             <button
                                                 class="jump-pill"
@@ -2481,30 +2518,19 @@ mod tests {
     #[test]
     fn scroll_update_ignores_suppressed_echoes() {
         // Our own pin echoing back inside the suppression window changes
-        // nothing — this is the exact race that used to yank the user down.
-        assert_eq!(scroll_update(500.0, 600.0, true, true, true), (true, true));
-        assert_eq!(
-            scroll_update(500.0, 600.0, true, false, false),
-            (false, false)
-        );
+        // nothing.
+        assert!(scroll_update(500.0, 600.0, true, true));
+        assert!(!scroll_update(500.0, 600.0, true, false));
     }
 
     #[test]
     fn scroll_update_disengages_when_scrolled_away() {
-        assert_eq!(scroll_update(1000.0, 0.0, false, true, true), (false, true));
+        assert!(!scroll_update(1000.0, 0.0, false, true));
     }
 
     #[test]
-    fn scroll_update_resumes_follow_on_genuine_bottom_hit() {
-        assert_eq!(scroll_update(1000.0, 0.0, true, false, false), (true, true));
-    }
-
-    #[test]
-    fn scroll_update_never_resurrects_on_drag_start_at_bottom() {
-        // Starting a touch drag while already at the latest (follow off, but
-        // at_latest still true) must not re-engage follow on the first tiny
-        // near-bottom scroll event.
-        assert_eq!(scroll_update(1000.0, 0.0, true, false, true), (true, false));
+    fn scroll_update_resumes_on_bottom_hit() {
+        assert!(scroll_update(1000.0, 0.0, true, false));
     }
 
     #[test]
@@ -2541,7 +2567,6 @@ mod tests {
             status_line: RwSignal::new(None),
             retry: RwSignal::new(None),
             scroll_tick: RwSignal::new(0),
-            follow: RwSignal::new(true),
             at_latest: RwSignal::new(true),
             next_id: RwSignal::new(0u64),
             session_model: RwSignal::new("mock/mock".into()),

@@ -715,6 +715,35 @@ impl LlmDriver for OpenAiCompatDriver {
                             Ok(Some(chunk)) => match chunk {
                                 Ok(bytes) => bytes,
                                 Err(err) => {
+                                    // A connection dropped mid-stream.
+                                    // Rate-limited providers often cut the SSE
+                                    // this way; while nothing has reached the
+                                    // client yet it is just another failure to
+                                    // retry within the budget. After content
+                                    // has streamed, abort so the user never
+                                    // sees a replayed answer.
+                                    let read_err =
+                                        DriverError::Internal(format!("stream read failed: {err}"));
+                                    if !delivered_any
+                                        && retry_backoff(
+                                            &tx,
+                                            &url,
+                                            &req.cancel,
+                                            &retry,
+                                            &burst_start,
+                                            attempt,
+                                            &mut backoff,
+                                            &read_err,
+                                            None,
+                                        )
+                                        .await
+                                        .is_ok()
+                                    {
+                                        continue 'attempt;
+                                    }
+                                    if req.cancel.load(Ordering::SeqCst) {
+                                        return Err(DriverError::Cancelled);
+                                    }
                                     // Close out any announced-but-unfinished tool
                                     // call so the agent can act on it instead of a
                                     // dangling block.
@@ -723,9 +752,7 @@ impl LlmDriver for OpenAiCompatDriver {
                                             return Err(DriverError::Cancelled);
                                         }
                                     }
-                                    return Err(DriverError::Internal(format!(
-                                        "stream read failed: {err}"
-                                    )));
+                                    return Err(read_err);
                                 }
                             },
                         };
@@ -1647,6 +1674,78 @@ mod tests {
         };
         let reason = status["reason"].as_str().unwrap_or("");
         assert!(reason.contains("timed out"), "got reason: {reason}");
+        let mut saw_text = false;
+        while let Ok(event) = rx.recv() {
+            if matches!(event, DriverEvent::Text(_)) {
+                saw_text = true;
+            }
+        }
+        assert!(saw_text, "the retry streamed the response");
+    }
+
+    #[tokio::test]
+    async fn openai_retries_a_broken_stream_read_within_budget() {
+        // A 200 response whose body is truncated (connection closed before the
+        // declared content-length) surfaces as a stream read error. Nothing was
+        // delivered, so it must be retried within the budget, not aborted.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let ok_body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            for idx in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if idx == 0 {
+                    // Headers promise 200 body bytes but none arrive and the
+                    // connection closes: a truncated read.
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 200\r\nconnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    continue;
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                    ok_body.len(),
+                    ok_body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let mut req = openai_request();
+        req.retry = RetryConfig {
+            base_backoff_ms: 1000,
+            max_backoff_ms: 1000,
+            max_ms: 5000,
+            ..RetryConfig::default()
+        };
+        let driver = OpenAiCompatDriver {
+            base_url: format!("http://{addr}"),
+            api_key: String::new(),
+        };
+        let (tx, rx) = mpsc::channel();
+        assert!(driver.stream(req, tx).await.is_ok());
+        assert!(
+            hits.load(Ordering::SeqCst) >= 2,
+            "the broken stream should have been retried"
+        );
+        let status = match rx.recv().unwrap() {
+            DriverEvent::Status(s) => serde_json::from_str::<serde_json::Value>(&s).unwrap(),
+            other => panic!("expected a status event, got {other:?}"),
+        };
+        let reason = status["reason"].as_str().unwrap_or("");
+        assert!(
+            reason.contains("stream read failed"),
+            "got reason: {reason}"
+        );
         let mut saw_text = false;
         while let Ok(event) = rx.recv() {
             if matches!(event, DriverEvent::Text(_)) {
