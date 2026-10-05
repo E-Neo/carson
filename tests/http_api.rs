@@ -1236,7 +1236,8 @@ async fn sandbox_download_endpoint() {
     assert_eq!(resp.status().as_u16(), 404);
 }
 
-/// The per-session retry budget is settable and echoed back by get_session.
+/// The per-session retry budget and timeouts are settable and echoed back by
+/// get_session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_retry_config_roundtrip() {
     let app = app().await;
@@ -1254,11 +1255,14 @@ async fn session_retry_config_roundtrip() {
     assert_eq!(v["retry"]["base_backoff_ms"], 1000);
     assert_eq!(v["retry"]["max_backoff_ms"], 60000);
     assert_eq!(v["retry"]["max_ms"], 1800000);
+    assert_eq!(v["retry"]["connect_ms"], 10000);
+    assert_eq!(v["retry"]["first_byte_ms"], 60000);
+    assert_eq!(v["retry"]["idle_ms"], 120000);
 
     let (status, body) = put(
         &app,
         &format!("/api/sessions/{session_id}"),
-        r#"{"retry":{"base_backoff_ms":250,"max_backoff_ms":5000,"max_ms":30000}}"#,
+        r#"{"retry":{"base_backoff_ms":250,"max_backoff_ms":5000,"max_ms":30000,"connect_ms":2000,"first_byte_ms":900,"idle_ms":7000}}"#,
     )
     .await;
     assert_eq!(status, 200, "{body}");
@@ -1268,4 +1272,7 @@ async fn session_retry_config_roundtrip() {
     assert_eq!(v["retry"]["base_backoff_ms"], 250);
     assert_eq!(v["retry"]["max_backoff_ms"], 5000);
     assert_eq!(v["retry"]["max_ms"], 30000);
+    assert_eq!(v["retry"]["connect_ms"], 2000);
+    assert_eq!(v["retry"]["first_byte_ms"], 900);
+    assert_eq!(v["retry"]["idle_ms"], 7000);
 }

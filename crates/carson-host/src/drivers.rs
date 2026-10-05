@@ -44,8 +44,10 @@ pub struct LlmRequest {
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Per-session retry tuning. `max_ms` is the budget for a burst of
-/// consecutive failures (reset per turn and after each successful request).
+/// Per-session LLM tuning. `max_ms` is the budget for a burst of consecutive
+/// failures (reset per turn and after each successful request); the timeout
+/// fields bound how eagerly the driver gives up on a silent provider, so a
+/// stalled request feeds the retry loop instead of hanging the turn.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
 )]
@@ -53,6 +55,14 @@ pub struct RetryConfig {
     pub base_backoff_ms: u64,
     pub max_backoff_ms: u64,
     pub max_ms: u64,
+    /// How long a TCP/TLS connection may take before the attempt fails.
+    pub connect_ms: u64,
+    /// How long the provider may take to send response headers (the first
+    /// byte) before the attempt is retried.
+    pub first_byte_ms: u64,
+    /// How long the provider may stream nothing before the attempt is aborted
+    /// (and retried when nothing has been delivered yet).
+    pub idle_ms: u64,
 }
 
 impl Default for RetryConfig {
@@ -61,7 +71,26 @@ impl Default for RetryConfig {
             base_backoff_ms: 1000,
             max_backoff_ms: 60_000,
             max_ms: 1_800_000,
+            connect_ms: 10_000,
+            first_byte_ms: 60_000,
+            idle_ms: 120_000,
         }
+    }
+}
+
+/// A human-readable reason for a retry, shown while the backoff counts down.
+/// Status detail carries the provider's full message where available.
+fn retry_reason(err: &DriverError, retry_after_ms: Option<u64>) -> String {
+    let base = match err {
+        DriverError::Timeout => "timed out waiting for the provider".to_string(),
+        DriverError::Network => "network error reaching the provider".to_string(),
+        DriverError::RateLimited => "rate limited by the provider".to_string(),
+        DriverError::Internal(msg) => msg.clone(),
+        _ => "transient llm failure".to_string(),
+    };
+    match retry_after_ms {
+        Some(secs) if secs > 0 => format!("{base} (retry after {}s)", secs.div_ceil(1000)),
+        _ => base,
     }
 }
 
@@ -342,10 +371,6 @@ impl LlmDriver for EchoDriver {
     }
 }
 
-/// How long the provider may stream nothing before the request is aborted as
-/// a timeout (so a stalled SSE stream can't hang the turn forever).
-const LLM_READ_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
 /// The granularity at which a retry backoff checks the cancel flag, so a stop
 /// or session delete aborts the sleep within a bounded window instead of
 /// holding the session for the whole backoff.
@@ -369,6 +394,43 @@ async fn sleep_cancellable(ms: u64, cancel: &std::sync::atomic::AtomicBool) -> b
             .min(BACKOFF_CANCEL_POLL);
         tokio::time::sleep(step).await;
     }
+}
+
+/// Compute the backoff for the current attempt, emit the retry status (with a
+/// human-readable reason), and sleep it off — aborting early on cancel.
+/// Returns `Err(original error)` when the burst budget is exhausted, or
+/// `Err(Cancelled)` when the request was cancelled mid-sleep.
+async fn retry_backoff(
+    tx: &mpsc::Sender<DriverEvent>,
+    url: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+    retry: &RetryConfig,
+    burst_start: &std::time::Instant,
+    attempt: u32,
+    backoff: &mut u64,
+    err: &DriverError,
+    retry_after_ms: Option<u64>,
+) -> Result<(), DriverError> {
+    let jitter = 75 + (attempt.wrapping_mul(37) % 51) as u64;
+    let sleep = backoff.saturating_mul(jitter) / 100;
+    *backoff = (backoff.saturating_mul(2)).min(retry.max_backoff_ms.max(1));
+    let sleep = sleep.max(retry_after_ms.unwrap_or(0));
+    if burst_start.elapsed().as_millis() as u64 + sleep > retry.max_ms {
+        return Err(err.clone());
+    }
+    tracing::warn!(url = %url, sleep_ms = sleep, attempt, "llm request retry");
+    let _ = tx.send(DriverEvent::Status(
+        json!({
+            "retry_in_ms": sleep,
+            "attempt": attempt,
+            "reason": retry_reason(err, retry_after_ms),
+        })
+        .to_string(),
+    ));
+    if !sleep_cancellable(sleep, cancel).await {
+        return Err(DriverError::Cancelled);
+    }
+    Ok(())
 }
 
 /// Classify a failed request phase into a [`DriverError`] and whether it is
@@ -549,14 +611,20 @@ impl LlmDriver for OpenAiCompatDriver {
         tracing::debug!(body = %payload, "llm request body");
 
         let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_millis(req.retry.connect_ms))
             .build()
             .map_err(|err| DriverError::Internal(format!("build http client: {err}")))?;
         let retry = req.retry;
         let burst_start = std::time::Instant::now();
         let mut attempt = 0u32;
         let mut backoff = retry.base_backoff_ms.clamp(1, retry.max_backoff_ms.max(1));
-        let resp = loop {
+
+        // The send + stream phases are one retryable unit: a provider that is
+        // silent on connect, before the first byte, or before any streamed
+        // event is retried through the same backoff/budget machinery. The only
+        // stall that aborts is one that happens after content already reached
+        // the client, to avoid replaying what the user has seen.
+        'attempt: loop {
             attempt += 1;
             if req.cancel.load(Ordering::SeqCst) {
                 return Err(DriverError::Cancelled);
@@ -570,10 +638,131 @@ impl LlmDriver for OpenAiCompatDriver {
             } else {
                 builder.bearer_auth(&self.api_key)
             };
-            let send = builder.send().await;
-            let (status, send_err, retry_after_ms, detail) = match send {
-                Ok(resp) if resp.status().is_success() => break resp,
-                Ok(resp) => {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(retry.first_byte_ms),
+                builder.send(),
+            )
+            .await
+            {
+                Err(_) => {
+                    tracing::warn!(
+                        url = %url,
+                        first_byte_ms = retry.first_byte_ms,
+                        "provider did not send response headers in time"
+                    );
+                    let err = DriverError::Timeout;
+                    if let Err(e) = retry_backoff(
+                        &tx,
+                        &url,
+                        &req.cancel,
+                        &retry,
+                        &burst_start,
+                        attempt,
+                        &mut backoff,
+                        &err,
+                        None,
+                    )
+                    .await
+                    {
+                        return Err(if req.cancel.load(Ordering::SeqCst) {
+                            DriverError::Cancelled
+                        } else {
+                            e
+                        });
+                    }
+                }
+                Ok(Ok(resp)) if resp.status().is_success() => {
+                    let mut chunks = resp.bytes_stream();
+                    let mut decoder = SseDecoder::new();
+                    let mut buffer: Vec<u8> = Vec::new();
+                    let mut delivered_any = false;
+                    let mut stream_done = false;
+                    while !stream_done {
+                        let chunk = match tokio::time::timeout(
+                            std::time::Duration::from_millis(retry.idle_ms),
+                            chunks.next(),
+                        )
+                        .await
+                        {
+                            Err(_) => {
+                                // A provider that accepted the request but then
+                                // streams nothing. Safe to retry the request only
+                                // while nothing has reached the client yet.
+                                let err = DriverError::Timeout;
+                                if !delivered_any
+                                    && retry_backoff(
+                                        &tx,
+                                        &url,
+                                        &req.cancel,
+                                        &retry,
+                                        &burst_start,
+                                        attempt,
+                                        &mut backoff,
+                                        &err,
+                                        None,
+                                    )
+                                    .await
+                                    .is_ok()
+                                {
+                                    continue 'attempt;
+                                }
+                                return Err(DriverError::Timeout);
+                            }
+                            Ok(None) => {
+                                stream_done = true;
+                                continue;
+                            }
+                            Ok(Some(chunk)) => match chunk {
+                                Ok(bytes) => bytes,
+                                Err(err) => {
+                                    // Close out any announced-but-unfinished tool
+                                    // call so the agent can act on it instead of a
+                                    // dangling block.
+                                    for event in decoder.finish() {
+                                        if tx.send(translate(event)).is_err() {
+                                            return Err(DriverError::Cancelled);
+                                        }
+                                    }
+                                    return Err(DriverError::Internal(format!(
+                                        "stream read failed: {err}"
+                                    )));
+                                }
+                            },
+                        };
+                        buffer.extend_from_slice(&chunk);
+
+                        while let Some(line) = pop_line(&mut buffer) {
+                            let line = String::from_utf8_lossy(&line);
+                            let line = line.trim();
+                            let Some(data) = line.strip_prefix("data:") else {
+                                continue;
+                            };
+                            tracing::debug!(url = %url, line = %excerpt(data, 256), "llm sse data");
+                            let events = match decoder.decode(data) {
+                                Some(SseEventBatch::Done) => decoder.finish(),
+                                Some(SseEventBatch::Events(events)) => events,
+                                None => continue,
+                            };
+                            for event in events {
+                                delivered_any = true;
+                                if tx.send(translate(event)).is_err() {
+                                    return Err(DriverError::Cancelled);
+                                }
+                            }
+                            if data.trim() == "[DONE]" {
+                                return Ok(decoder.usage().clone());
+                            }
+                        }
+                    }
+                    let events = decoder.finish();
+                    for event in events {
+                        if tx.send(translate(event)).is_err() {
+                            return Err(DriverError::Cancelled);
+                        }
+                    }
+                    return Ok(decoder.usage().clone());
+                }
+                Ok(Ok(resp)) => {
                     let status = resp.status();
                     let retry_after_ms = resp
                         .headers()
@@ -588,89 +777,58 @@ impl LlmDriver for OpenAiCompatDriver {
                         body = %detail,
                         "upstream rejected llm request"
                     );
-                    (Some(status), None, retry_after_ms, detail)
+                    let (err, retryable) = classify_upstream(Some(status), None, &detail);
+                    if !retryable || retry.max_ms == 0 {
+                        return Err(err);
+                    }
+                    if let Err(e) = retry_backoff(
+                        &tx,
+                        &url,
+                        &req.cancel,
+                        &retry,
+                        &burst_start,
+                        attempt,
+                        &mut backoff,
+                        &err,
+                        retry_after_ms,
+                    )
+                    .await
+                    {
+                        return Err(if req.cancel.load(Ordering::SeqCst) {
+                            DriverError::Cancelled
+                        } else {
+                            e
+                        });
+                    }
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     tracing::warn!(url = %url, error = %err, "llm request failed");
-                    (None, Some(err), None, String::new())
-                }
-            };
-            let (err, retryable) = classify_upstream(status, send_err.as_ref(), &detail);
-            if !retryable || retry.max_ms == 0 {
-                return Err(err);
-            }
-            let jitter = 75 + (attempt.wrapping_mul(37) % 51) as u64;
-            let sleep = backoff.saturating_mul(jitter) / 100;
-            backoff = (backoff.saturating_mul(2)).min(retry.max_backoff_ms.max(1));
-            let sleep = sleep.max(retry_after_ms.unwrap_or(0));
-            if burst_start.elapsed().as_millis() as u64 + sleep > retry.max_ms {
-                return Err(err);
-            }
-            tracing::warn!(url = %url, sleep_ms = sleep, attempt, "llm request retry");
-            let _ = tx.send(DriverEvent::Status(
-                json!({"retry_in_ms": sleep, "attempt": attempt}).to_string(),
-            ));
-            if !sleep_cancellable(sleep, &req.cancel).await {
-                return Err(DriverError::Cancelled);
-            }
-        };
-
-        let mut chunks = resp.bytes_stream();
-        let mut decoder = SseDecoder::new();
-        let mut buffer: Vec<u8> = Vec::new();
-
-        loop {
-            // A stalled provider stream (no [DONE], no EOF) must not hang the
-            // turn forever: treat an idle read timeout as a retryable Timeout.
-            let chunk = match tokio::time::timeout(LLM_READ_IDLE_TIMEOUT, chunks.next()).await {
-                Err(_) => return Err(DriverError::Timeout),
-                Ok(None) => break,
-                Ok(Some(chunk)) => match chunk {
-                    Ok(bytes) => bytes,
-                    Err(err) => {
-                        // Close out any announced-but-unfinished tool call so
-                        // the agent can act on it instead of a dangling block.
-                        for event in decoder.finish() {
-                            if tx.send(translate(event)).is_err() {
-                                return Err(DriverError::Cancelled);
-                            }
-                        }
-                        return Err(DriverError::Internal(format!("stream read failed: {err}")));
+                    let (err, retryable) = classify_upstream(None, Some(&err), "");
+                    if !retryable || retry.max_ms == 0 {
+                        return Err(err);
                     }
-                },
-            };
-            buffer.extend_from_slice(&chunk);
-
-            while let Some(line) = pop_line(&mut buffer) {
-                let line = String::from_utf8_lossy(&line);
-                let line = line.trim();
-                let Some(data) = line.strip_prefix("data:") else {
-                    continue;
-                };
-                tracing::debug!(url = %url, line = %excerpt(data, 256), "llm sse data");
-                let events = match decoder.decode(data) {
-                    Some(SseEventBatch::Done) => decoder.finish(),
-                    Some(SseEventBatch::Events(events)) => events,
-                    None => continue,
-                };
-                for event in events {
-                    if tx.send(translate(event)).is_err() {
-                        return Err(DriverError::Cancelled);
+                    if let Err(e) = retry_backoff(
+                        &tx,
+                        &url,
+                        &req.cancel,
+                        &retry,
+                        &burst_start,
+                        attempt,
+                        &mut backoff,
+                        &err,
+                        None,
+                    )
+                    .await
+                    {
+                        return Err(if req.cancel.load(Ordering::SeqCst) {
+                            DriverError::Cancelled
+                        } else {
+                            e
+                        });
                     }
-                }
-                if data.trim() == "[DONE]" {
-                    return Ok(decoder.usage().clone());
                 }
             }
         }
-
-        let events = decoder.finish();
-        for event in events {
-            if tx.send(translate(event)).is_err() {
-                return Err(DriverError::Cancelled);
-            }
-        }
-        Ok(decoder.usage().clone())
     }
 }
 
@@ -1245,6 +1403,7 @@ mod tests {
                     base_backoff_ms: 1,
                     max_backoff_ms: 1,
                     max_ms: 5,
+                    ..RetryConfig::default()
                 };
             }
             let driver = OpenAiCompatDriver {
@@ -1298,6 +1457,7 @@ mod tests {
             base_backoff_ms: 10,
             max_backoff_ms: 10,
             max_ms: 1000,
+            ..RetryConfig::default()
         };
         let driver = OpenAiCompatDriver {
             base_url,
@@ -1314,6 +1474,11 @@ mod tests {
         };
         assert!(status["retry_in_ms"].as_u64().unwrap_or(0) > 0);
         assert_eq!(status["attempt"], serde_json::json!(1));
+        let reason = status["reason"].as_str().unwrap_or("");
+        assert!(
+            reason.contains("503"),
+            "expected the upstream status, got: {reason}"
+        );
         assert_eq!(rx.recv().unwrap(), DriverEvent::Text("hi".into()));
     }
 
@@ -1330,6 +1495,7 @@ mod tests {
             base_backoff_ms: 60_000,
             max_backoff_ms: 120_000,
             max_ms: 600_000,
+            ..RetryConfig::default()
         };
         let cancel = req.cancel.clone();
         let driver = OpenAiCompatDriver {
@@ -1346,12 +1512,148 @@ mod tests {
         .await
         .unwrap();
         assert!(status["retry_in_ms"].as_u64().unwrap_or(0) >= 60_000);
+        assert_eq!(status["attempt"], serde_json::json!(1));
+        assert!(status["reason"].as_str().is_some_and(|r| !r.is_empty()));
         cancel.store(true, Ordering::SeqCst);
         let result = tokio::time::timeout(std::time::Duration::from_secs(4), task)
             .await
             .expect("cancelled stream returned promptly, not after the backoff")
             .expect("driver task joined");
         assert_eq!(result, Err(DriverError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn openai_retries_when_provider_stalls_before_headers() {
+        // The first attempt waits past the first-byte timeout and closes
+        // without ever answering; the retry succeeds on the next connection.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let ok_body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            for idx in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if idx == 0 {
+                    // Accept the request but stay silent past the first-byte
+                    // timeout, then hang up.
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    continue;
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                    ok_body.len(),
+                    ok_body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let mut req = openai_request();
+        req.retry = RetryConfig {
+            base_backoff_ms: 1000,
+            max_backoff_ms: 1000,
+            max_ms: 5000,
+            first_byte_ms: 40,
+            ..RetryConfig::default()
+        };
+        let driver = OpenAiCompatDriver {
+            base_url: format!("http://{addr}"),
+            api_key: String::new(),
+        };
+        let (tx, rx) = mpsc::channel();
+        assert!(driver.stream(req, tx).await.is_ok());
+        assert!(
+            hits.load(Ordering::SeqCst) >= 2,
+            "the silent attempt should have been retried"
+        );
+        let status = match rx.recv().unwrap() {
+            DriverEvent::Status(s) => serde_json::from_str::<serde_json::Value>(&s).unwrap(),
+            other => panic!("expected a status event, got {other:?}"),
+        };
+        let reason = status["reason"].as_str().unwrap_or("");
+        assert!(reason.contains("timed out"), "got reason: {reason}");
+        let mut saw_text = false;
+        while let Ok(event) = rx.recv() {
+            if matches!(event, DriverEvent::Text(_)) {
+                saw_text = true;
+            }
+        }
+        assert!(saw_text, "the retry streamed the response");
+    }
+
+    #[tokio::test]
+    async fn openai_retries_when_provider_stalls_before_generating() {
+        // The provider answers 200 but never sends a body within the idle
+        // timeout, and nothing has been delivered yet: it is retried too.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let ok_body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            for idx in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if idx == 0 {
+                    // Send headers but then stall with no body past the idle
+                    // timeout.
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 64\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    continue;
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                    ok_body.len(),
+                    ok_body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let mut req = openai_request();
+        req.retry = RetryConfig {
+            base_backoff_ms: 1000,
+            max_backoff_ms: 1000,
+            max_ms: 5000,
+            idle_ms: 100,
+            ..RetryConfig::default()
+        };
+        let driver = OpenAiCompatDriver {
+            base_url: format!("http://{addr}"),
+            api_key: String::new(),
+        };
+        let (tx, rx) = mpsc::channel();
+        assert!(driver.stream(req, tx).await.is_ok());
+        assert!(
+            hits.load(Ordering::SeqCst) >= 2,
+            "the empty stream should have been retried"
+        );
+        let status = match rx.recv().unwrap() {
+            DriverEvent::Status(s) => serde_json::from_str::<serde_json::Value>(&s).unwrap(),
+            other => panic!("expected a status event, got {other:?}"),
+        };
+        let reason = status["reason"].as_str().unwrap_or("");
+        assert!(reason.contains("timed out"), "got reason: {reason}");
+        let mut saw_text = false;
+        while let Ok(event) = rx.recv() {
+            if matches!(event, DriverEvent::Text(_)) {
+                saw_text = true;
+            }
+        }
+        assert!(saw_text, "the retry streamed the response");
     }
 
     #[tokio::test]
@@ -1365,6 +1667,7 @@ mod tests {
             base_backoff_ms: 1,
             max_backoff_ms: 1,
             max_ms: 3,
+            ..RetryConfig::default()
         };
         let driver = OpenAiCompatDriver {
             base_url,

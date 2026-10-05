@@ -286,9 +286,9 @@ struct ChatSignals {
     usage: RwSignal<Option<String>>,
     error: RwSignal<Option<String>>,
     status_line: RwSignal<Option<String>>,
-    /// An in-flight retry backoff: `(deadline_ms, attempt)`. Cleared the
-    /// moment the provider sends content (or the backoff expires).
-    retry: RwSignal<Option<(f64, u32)>>,
+    /// An in-flight retry backoff: `(deadline_ms, attempt, reason)`. Cleared
+    /// the moment the provider sends content (or the backoff expires).
+    retry: RwSignal<Option<(f64, u32, String)>>,
     scroll_tick: RwSignal<u64>,
     follow: RwSignal<bool>,
     at_latest: RwSignal<bool>,
@@ -308,10 +308,11 @@ enum EventOutcome {
     Silent,
     Status(String),
     /// The driver backed off after a failed LLM request; `ms` is the backoff
-    /// duration and `attempt` the retry count (for a countdown).
+    /// duration, `attempt` the retry count, and `reason` why it is retrying.
     Retry {
         ms: u64,
         attempt: u32,
+        reason: String,
     },
     Error(String),
     /// `finished_ms` stamps any still-open blocks; `usage_text` is the
@@ -449,6 +450,11 @@ fn apply_stream_event(st: &ChatSignals, now: u64, ev: &sse::SseEvent) -> EventOu
                     return EventOutcome::Retry {
                         ms,
                         attempt: attempt as u32,
+                        reason: map
+                            .get("reason")
+                            .and_then(|r| r.as_str())
+                            .map(String::from)
+                            .unwrap_or_else(|| "transient llm failure".to_string()),
                     };
                 }
             }
@@ -516,9 +522,13 @@ fn send(session_id: String, input: RwSignal<String>, st: ChatSignals) {
         let result = sse::stream_post(&path, &body, move |ev| {
             match apply_stream_event(&st, now_ms(), &ev) {
                 EventOutcome::Status(text) => st.status_line.set(Some(text)),
-                EventOutcome::Retry { ms, attempt } => {
+                EventOutcome::Retry {
+                    ms,
+                    attempt,
+                    reason,
+                } => {
                     st.retry
-                        .set(Some((js_sys::Date::now() + ms as f64, attempt)));
+                        .set(Some((js_sys::Date::now() + ms as f64, attempt, reason)));
                 }
                 EventOutcome::Error(msg) => st.error.set(Some(msg)),
                 EventOutcome::Done {
@@ -1027,6 +1037,9 @@ pub fn ChatPage() -> impl IntoView {
     let retry_base = RwSignal::new("1000".to_string());
     let retry_max_backoff = RwSignal::new("60000".to_string());
     let retry_max_ms = RwSignal::new("1800000".to_string());
+    let connect_ms = RwSignal::new("10000".to_string());
+    let first_byte_ms = RwSignal::new("60000".to_string());
+    let idle_ms = RwSignal::new("120000".to_string());
     let rename_alias = RwSignal::new(String::new());
     let new_sandbox_name = RwSignal::new(String::new());
     let selected_sandbox = RwSignal::new(None::<String>);
@@ -1057,7 +1070,7 @@ pub fn ChatPage() -> impl IntoView {
     let scroll_tick = RwSignal::new(0u64);
     // An in-flight retry backoff `(deadline_ms, attempt)`; the statusbar shows
     // a live countdown until the deadline passes or the provider responds.
-    let retry = RwSignal::new(None::<(f64, u32)>);
+    let retry = RwSignal::new(None::<(f64, u32, String)>);
 
     let stream_signals = ChatSignals {
         messages,
@@ -1097,22 +1110,22 @@ pub fn ChatPage() -> impl IntoView {
     // the time remaining. Stops when the deadline passes (the statusbar drops
     // back to "Working…") or the retry is reset by a response.
     Effect::new(move |_| {
-        if let Some((deadline, attempt)) = retry.get() {
+        if let Some((deadline, attempt, reason)) = retry.get() {
             spawn_local(async move {
                 loop {
-                    if retry.get_untracked().map(|(d, _)| d) != Some(deadline) {
+                    if retry.get_untracked().map(|(d, _, _)| d) != Some(deadline) {
                         break;
                     }
                     let remaining = deadline - js_sys::Date::now();
                     if remaining <= 0.0 {
-                        if retry.get_untracked().map(|(d, _)| d) == Some(deadline) {
+                        if retry.get_untracked().map(|(d, _, _)| d) == Some(deadline) {
                             retry.set(None);
                             status_line.set(None);
                         }
                         break;
                     }
                     status_line.set(Some(format!(
-                        "Retrying in {:.1}s (attempt {attempt})",
+                        "Retrying in {:.1}s (attempt {attempt}) — {reason}",
                         remaining / 1000.0
                     )));
                     TimeoutFuture::new(100).await;
@@ -1280,6 +1293,9 @@ pub fn ChatPage() -> impl IntoView {
         let retry_base = retry_base;
         let retry_max_backoff = retry_max_backoff;
         let retry_max_ms = retry_max_ms;
+        let connect_ms = connect_ms;
+        let first_byte_ms = first_byte_ms;
+        let idle_ms = idle_ms;
         let sid2 = sid.clone();
         spawn_local(async move {
             if let Ok((_, v)) = api::get(&format!("/api/sessions/{sid2}")).await {
@@ -1299,6 +1315,24 @@ pub fn ChatPage() -> impl IntoView {
                 );
                 retry_max_ms.set(
                     r.get("max_ms")
+                        .and_then(|x| x.as_u64())
+                        .map(|x| x.to_string())
+                        .unwrap_or_default(),
+                );
+                connect_ms.set(
+                    r.get("connect_ms")
+                        .and_then(|x| x.as_u64())
+                        .map(|x| x.to_string())
+                        .unwrap_or_default(),
+                );
+                first_byte_ms.set(
+                    r.get("first_byte_ms")
+                        .and_then(|x| x.as_u64())
+                        .map(|x| x.to_string())
+                        .unwrap_or_default(),
+                );
+                idle_ms.set(
+                    r.get("idle_ms")
                         .and_then(|x| x.as_u64())
                         .map(|x| x.to_string())
                         .unwrap_or_default(),
@@ -1418,6 +1452,9 @@ pub fn ChatPage() -> impl IntoView {
         let base = retry_base.get().trim().parse::<u64>().unwrap_or(0);
         let max_backoff = retry_max_backoff.get().trim().parse::<u64>().unwrap_or(0);
         let max_ms = retry_max_ms.get().trim().parse::<u64>().unwrap_or(0);
+        let connect = connect_ms.get().trim().parse::<u64>().unwrap_or(0);
+        let first_byte = first_byte_ms.get().trim().parse::<u64>().unwrap_or(0);
+        let idle = idle_ms.get().trim().parse::<u64>().unwrap_or(0);
         spawn_local(async move {
             let _ = api::put(
                 &format!("/api/sessions/{id}"),
@@ -1426,6 +1463,9 @@ pub fn ChatPage() -> impl IntoView {
                         "base_backoff_ms": base,
                         "max_backoff_ms": max_backoff,
                         "max_ms": max_ms,
+                        "connect_ms": connect,
+                        "first_byte_ms": first_byte,
+                        "idle_ms": idle,
                     }
                 }),
             )
@@ -1985,6 +2025,41 @@ pub fn ChatPage() -> impl IntoView {
                                                 title="Total retry budget (ms)"
                                                 prop:value=move || retry_max_ms.get()
                                                 on:input=move |ev| retry_max_ms.set(event_target_value(&ev))
+                                            />
+                                            <button class="btn primary" on:click=move |_| save_session_retry()>
+                                                "Save"
+                                            </button>
+                                        </div>
+                                        <label>"Timeouts (ms)"</label>
+                                        <div class="settings-row">
+                                            <input
+                                                name="retry-connect-ms"
+                                                type="number"
+                                                min="0"
+                                                placeholder="Connect"
+                                                title="Connect timeout (ms)"
+                                                prop:value=move || connect_ms.get()
+                                                on:input=move |ev| connect_ms.set(event_target_value(&ev))
+                                            />
+                                            <input
+                                                name="retry-first-byte-ms"
+                                                type="number"
+                                                min="0"
+                                                placeholder="First byte"
+                                                title="Timeout waiting for response headers (ms)"
+                                                prop:value=move || first_byte_ms.get()
+                                                on:input=move |ev| first_byte_ms.set(event_target_value(&ev))
+                                            />
+                                        </div>
+                                        <div class="settings-row">
+                                            <input
+                                                name="retry-idle-ms"
+                                                type="number"
+                                                min="0"
+                                                placeholder="Idle stream"
+                                                title="Timeout waiting for stream data (ms)"
+                                                prop:value=move || idle_ms.get()
+                                                on:input=move |ev| idle_ms.set(event_target_value(&ev))
                                             />
                                             <button class="btn primary" on:click=move |_| save_session_retry()>
                                                 "Save"
@@ -2622,17 +2697,35 @@ mod tests {
     fn apply_stream_event_parses_structured_retry_status() {
         let st = chat_signals();
         // The driver's retry status is a JSON object literal inside the string
-        // payload; it must become EventOutcome::Retry.
+        // payload; it must become EventOutcome::Retry, carrying the reason.
         let out = apply_stream_event(
             &st,
             0,
-            &ev("status", r#""{\"retry_in_ms\":2000,\"attempt\":3}""#),
+            &ev(
+                "status",
+                r#""{\"retry_in_ms\":2000,\"attempt\":3,\"reason\":\"upstream status 503\"}""#,
+            ),
         );
         assert!(matches!(
             out,
             EventOutcome::Retry {
                 ms: 2000,
-                attempt: 3
+                attempt: 3,
+                ref reason,
+            } if reason == "upstream status 503"
+        ));
+        // A status without a reason still parses, falling back to a label.
+        let out = apply_stream_event(
+            &st,
+            0,
+            &ev("status", r#""{\"retry_in_ms\":500,\"attempt\":2}""#),
+        );
+        assert!(matches!(
+            out,
+            EventOutcome::Retry {
+                ms: 500,
+                attempt: 2,
+                ..
             }
         ));
         // Plain statuses (e.g. compaction messages) stay string statuses.

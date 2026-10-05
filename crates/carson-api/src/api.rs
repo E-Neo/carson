@@ -55,6 +55,9 @@ pub struct RetryUpdateReq {
     base_backoff_ms: Option<u64>,
     max_backoff_ms: Option<u64>,
     max_ms: Option<u64>,
+    connect_ms: Option<u64>,
+    first_byte_ms: Option<u64>,
+    idle_ms: Option<u64>,
 }
 
 /// Create or rename a sandbox by its display alias.
@@ -1742,13 +1745,25 @@ pub(crate) async fn update_session(
         let base = retry.base_backoff_ms.unwrap_or(entry.retry.base_backoff_ms);
         let max_backoff = retry.max_backoff_ms.unwrap_or(entry.retry.max_backoff_ms);
         let max_inner = retry.max_ms.unwrap_or(entry.retry.max_ms);
-        if base > 3_600_000 || max_backoff > 3_600_000 || max_inner > 86_400_000 {
+        let connect = retry.connect_ms.unwrap_or(entry.retry.connect_ms);
+        let first_byte = retry.first_byte_ms.unwrap_or(entry.retry.first_byte_ms);
+        let idle = retry.idle_ms.unwrap_or(entry.retry.idle_ms);
+        if base > 3_600_000
+            || max_backoff > 3_600_000
+            || max_inner > 86_400_000
+            || connect > 3_600_000
+            || first_byte > 3_600_000
+            || idle > 3_600_000
+        {
             return json_err(StatusCode::BAD_REQUEST, "retry values out of range");
         }
         let new = RetryConfig {
             base_backoff_ms: base,
             max_backoff_ms: max_backoff,
             max_ms: max_inner,
+            connect_ms: connect,
+            first_byte_ms: first_byte,
+            idle_ms: idle,
         };
         if st.db.set_session_retry(&id, &new).is_err() {
             return json_err(

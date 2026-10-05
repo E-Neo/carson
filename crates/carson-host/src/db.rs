@@ -52,6 +52,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     retry_base_ms INTEGER NOT NULL DEFAULT 1000,
     retry_max_backoff_ms INTEGER NOT NULL DEFAULT 60000,
     retry_max_ms INTEGER NOT NULL DEFAULT 1800000,
+    retry_connect_ms INTEGER NOT NULL DEFAULT 10000,
+    retry_first_byte_ms INTEGER NOT NULL DEFAULT 60000,
+    retry_idle_ms INTEGER NOT NULL DEFAULT 120000,
     summary TEXT,
     input_tokens INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
@@ -157,6 +160,24 @@ fn migrate(conn: &Connection) -> Result<()> {
         "sessions",
         "retry_max_ms",
         "ALTER TABLE sessions ADD COLUMN retry_max_ms INTEGER NOT NULL DEFAULT 1800000",
+    )?;
+    add_column_if_missing(
+        conn,
+        "sessions",
+        "retry_connect_ms",
+        "ALTER TABLE sessions ADD COLUMN retry_connect_ms INTEGER NOT NULL DEFAULT 10000",
+    )?;
+    add_column_if_missing(
+        conn,
+        "sessions",
+        "retry_first_byte_ms",
+        "ALTER TABLE sessions ADD COLUMN retry_first_byte_ms INTEGER NOT NULL DEFAULT 60000",
+    )?;
+    add_column_if_missing(
+        conn,
+        "sessions",
+        "retry_idle_ms",
+        "ALTER TABLE sessions ADD COLUMN retry_idle_ms INTEGER NOT NULL DEFAULT 120000",
     )?;
     add_column_if_missing(
         conn,
@@ -568,12 +589,13 @@ impl Db {
             "INSERT INTO sessions (id, agent_name, agent_version_id, name, sandbox_id, model, \
              retry_base_ms, retry_max_backoff_ms, retry_max_ms, summary, \
              input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, created_at, \
-             updated_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) \
+             updated_at, retry_connect_ms, retry_first_byte_ms, retry_idle_ms) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19) \
              ON CONFLICT(id) DO UPDATE SET agent_name=?2, agent_version_id=?3, name=?4, \
              sandbox_id=?5, model=?6, \
              summary=?10, input_tokens=?11, cache_read_tokens=?12, cache_creation_tokens=?13, \
-             output_tokens=?14, updated_at=?16",
+             output_tokens=?14, updated_at=?16, retry_connect_ms=?17, retry_first_byte_ms=?18, \
+             retry_idle_ms=?19",
             params![
                 session.id,
                 session.agent_name,
@@ -590,7 +612,10 @@ impl Db {
                 session.usage.cache_creation_tokens,
                 session.usage.output_tokens,
                 now,
-                session.updated_at
+                session.updated_at,
+                session.retry.connect_ms as i64,
+                session.retry.first_byte_ms as i64,
+                session.retry.idle_ms as i64
             ],
         )?;
         tx.execute(
@@ -634,7 +659,8 @@ impl Db {
              s.updated_at, \
              m.seq, m.agent_version_id, m.model, m.attachments_json, m.kind, m.content, m.input_tokens, \
              m.cache_read_tokens, m.cache_creation_tokens, \
-             m.output_tokens, m.created_at, m.finished_at \
+             m.output_tokens, m.created_at, m.finished_at, \
+             s.retry_connect_ms, s.retry_first_byte_ms, s.retry_idle_ms \
              FROM sessions s LEFT JOIN messages m ON m.session_id = s.id \
              ORDER BY s.rowid, m.seq",
         )?;
@@ -674,6 +700,9 @@ impl Db {
                 row.get::<_, i64>(13)? as u32,
                 row.get::<_, i64>(14)?,
                 block,
+                row.get::<_, i64>(27)?,
+                row.get::<_, i64>(28)?,
+                row.get::<_, i64>(29)?,
             ))
         })?;
 
@@ -698,6 +727,9 @@ impl Db {
                 output,
                 updated_at,
                 block,
+                retry_connect_ms,
+                retry_first_byte_ms,
+                retry_idle_ms,
             ) = row?;
             let idx = match index_of.get(&id) {
                 Some(idx) => *idx,
@@ -713,6 +745,9 @@ impl Db {
                             base_backoff_ms: retry_base_ms.max(0) as u64,
                             max_backoff_ms: retry_max_backoff_ms.max(0) as u64,
                             max_ms: retry_max_ms.max(0) as u64,
+                            connect_ms: retry_connect_ms.max(0) as u64,
+                            first_byte_ms: retry_first_byte_ms.max(0) as u64,
+                            idle_ms: retry_idle_ms.max(0) as u64,
                         },
                         updated_at,
                         summary,
@@ -853,17 +888,21 @@ impl Db {
         Ok(())
     }
 
-    /// Set the session's LLM retry budget.
+    /// Set the session's LLM tuning (retry budget and timeouts).
     pub fn set_session_retry(&self, id: &str, retry: &RetryConfig) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE sessions SET retry_base_ms = ?2, retry_max_backoff_ms = ?3, \
-             retry_max_ms = ?4, updated_at = ?5 WHERE id = ?1",
+             retry_max_ms = ?4, retry_connect_ms = ?5, retry_first_byte_ms = ?6, \
+             retry_idle_ms = ?7, updated_at = ?8 WHERE id = ?1",
             params![
                 id,
                 retry.base_backoff_ms as i64,
                 retry.max_backoff_ms as i64,
                 retry.max_ms as i64,
+                retry.connect_ms as i64,
+                retry.first_byte_ms as i64,
+                retry.idle_ms as i64,
                 now_ms()
             ],
         )?;
