@@ -2,6 +2,7 @@ use crate::api;
 use crate::shell::{DragRail, DrawerBackdrop, MenuButton, sidebar_width};
 use crate::sse;
 use crate::types::{SandboxSummary, SessionSummary};
+use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::hooks::{use_navigate, use_params};
@@ -280,9 +281,14 @@ fn stream_text(
 struct ChatSignals {
     messages: RwSignal<Vec<MsgEntry>>,
     running: RwSignal<bool>,
+    /// Whether the last turn completed (for the "Done" status).
+    done: RwSignal<bool>,
     usage: RwSignal<Option<String>>,
     error: RwSignal<Option<String>>,
     status_line: RwSignal<Option<String>>,
+    /// An in-flight retry backoff: `(deadline_ms, attempt)`. Cleared the
+    /// moment the provider sends content (or the backoff expires).
+    retry: RwSignal<Option<(f64, u32)>>,
     scroll_tick: RwSignal<u64>,
     follow: RwSignal<bool>,
     at_latest: RwSignal<bool>,
@@ -301,6 +307,12 @@ enum EventOutcome {
     /// chunk / thinking / tool events mutated blocks in place.
     Silent,
     Status(String),
+    /// The driver backed off after a failed LLM request; `ms` is the backoff
+    /// duration and `attempt` the retry count (for a countdown).
+    Retry {
+        ms: u64,
+        attempt: u32,
+    },
     Error(String),
     /// `finished_ms` stamps any still-open blocks; `usage_text` is the
     /// formatted usage summary when the payload carried one.
@@ -335,6 +347,8 @@ fn apply_stream_event(st: &ChatSignals, now: u64, ev: &sse::SseEvent) -> EventOu
                 },
                 &text,
             );
+            st.retry.set(None);
+            st.status_line.set(None);
             st.scroll_tick.update(|t| *t += 1);
             EventOutcome::Silent
         }
@@ -356,6 +370,8 @@ fn apply_stream_event(st: &ChatSignals, now: u64, ev: &sse::SseEvent) -> EventOu
                 },
                 &text,
             );
+            st.retry.set(None);
+            st.status_line.set(None);
             st.scroll_tick.update(|t| *t += 1);
             EventOutcome::Silent
         }
@@ -366,6 +382,8 @@ fn apply_stream_event(st: &ChatSignals, now: u64, ev: &sse::SseEvent) -> EventOu
                 let model = st.session_model.get_untracked();
                 push_tool(&messages, &next_id, now, &model, name.to_string());
             }
+            st.retry.set(None);
+            st.status_line.set(None);
             st.scroll_tick.update(|t| *t += 1);
             EventOutcome::Silent
         }
@@ -380,6 +398,8 @@ fn apply_stream_event(st: &ChatSignals, now: u64, ev: &sse::SseEvent) -> EventOu
             // The tool call is fully yielded here: its duration is the time to
             // produce the call (streaming the arguments).
             close_open_assistant(&messages, now);
+            st.retry.set(None);
+            st.status_line.set(None);
             EventOutcome::Silent
         }
         "tool_result" => {
@@ -412,10 +432,26 @@ fn apply_stream_event(st: &ChatSignals, now: u64, ev: &sse::SseEvent) -> EventOu
                 finished,
                 format!("{marker}{preview}"),
             );
+            st.retry.set(None);
+            st.status_line.set(None);
             EventOutcome::Silent
         }
         "status" => {
             let text = serde_json::from_str::<String>(&ev.data).unwrap_or_else(|_| ev.data.clone());
+            // Any status means the driver is still working, so keep the view
+            // pinned to the latest while the user waits (e.g. through retries).
+            st.scroll_tick.update(|t| *t += 1);
+            if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<Value>(&text) {
+                if let (Some(ms), Some(attempt)) = (
+                    map.get("retry_in_ms").and_then(|x| x.as_u64()),
+                    map.get("attempt").and_then(|x| x.as_u64()),
+                ) {
+                    return EventOutcome::Retry {
+                        ms,
+                        attempt: attempt as u32,
+                    };
+                }
+            }
             EventOutcome::Status(text)
         }
         "error" => {
@@ -464,9 +500,11 @@ fn send(session_id: String, input: RwSignal<String>, st: ChatSignals) {
     input.set(String::new());
     st.attachments.set(Vec::new());
     st.running.set(true);
+    st.done.set(false);
     st.usage.set(None);
     st.error.set(None);
     st.status_line.set(None);
+    st.retry.set(None);
     // The user asked for this reply; follow it regardless of prior scroll.
     st.follow.set(true);
     st.at_latest.set(true);
@@ -478,6 +516,10 @@ fn send(session_id: String, input: RwSignal<String>, st: ChatSignals) {
         let result = sse::stream_post(&path, &body, move |ev| {
             match apply_stream_event(&st, now_ms(), &ev) {
                 EventOutcome::Status(text) => st.status_line.set(Some(text)),
+                EventOutcome::Retry { ms, attempt } => {
+                    st.retry
+                        .set(Some((js_sys::Date::now() + ms as f64, attempt)));
+                }
                 EventOutcome::Error(msg) => st.error.set(Some(msg)),
                 EventOutcome::Done {
                     finished_ms,
@@ -491,13 +533,18 @@ fn send(session_id: String, input: RwSignal<String>, st: ChatSignals) {
                     close_open_assistant(&st.messages, finished_ms);
                     finish_user(&st.messages, finished_ms);
                     st.scroll_tick.update(|t| *t += 1);
+                    st.retry.set(None);
+                    st.status_line.set(None);
                     st.running.set(false);
+                    st.done.set(true);
                 }
                 EventOutcome::Silent => {}
             }
         })
         .await;
         st.running.set(false);
+        st.retry.set(None);
+        st.status_line.set(None);
         if let Err(e) = result {
             st.error.set(Some(e));
         }
@@ -956,6 +1003,7 @@ pub fn ChatPage() -> impl IntoView {
     let messages = RwSignal::new(Vec::<MsgEntry>::new());
     let input = RwSignal::new(String::new());
     let running = RwSignal::new(false);
+    let done = RwSignal::new(false);
     let usage = RwSignal::new(None::<String>);
     let error = RwSignal::new(None::<String>);
     let status_line = RwSignal::new(None::<String>);
@@ -973,9 +1021,12 @@ pub fn ChatPage() -> impl IntoView {
     let sandboxes = RwSignal::new(Vec::<SandboxSummary>::new());
     let name_edit = RwSignal::new(String::new());
     let model_edit = RwSignal::new(String::new());
-    let retry_base = RwSignal::new(String::new());
-    let retry_max_backoff = RwSignal::new(String::new());
-    let retry_max_ms = RwSignal::new(String::new());
+    // Retry budget inputs default to the driver's defaults so they are never
+    // blank; the session's real values overwrite them once the drawer fetch
+    // resolves.
+    let retry_base = RwSignal::new("1000".to_string());
+    let retry_max_backoff = RwSignal::new("60000".to_string());
+    let retry_max_ms = RwSignal::new("1800000".to_string());
     let rename_alias = RwSignal::new(String::new());
     let new_sandbox_name = RwSignal::new(String::new());
     let selected_sandbox = RwSignal::new(None::<String>);
@@ -1004,13 +1055,18 @@ pub fn ChatPage() -> impl IntoView {
     // mislabel visibility.
     let pinned_until = RwSignal::new(0f64);
     let scroll_tick = RwSignal::new(0u64);
+    // An in-flight retry backoff `(deadline_ms, attempt)`; the statusbar shows
+    // a live countdown until the deadline passes or the provider responds.
+    let retry = RwSignal::new(None::<(f64, u32)>);
 
     let stream_signals = ChatSignals {
         messages,
         running,
+        done,
         usage,
         error,
         status_line,
+        retry,
         scroll_tick,
         follow,
         at_latest,
@@ -1037,6 +1093,34 @@ pub fn ChatPage() -> impl IntoView {
         }
     });
 
+    // Retry countdown: while a backoff is pending, tick the status line with
+    // the time remaining. Stops when the deadline passes (the statusbar drops
+    // back to "Working…") or the retry is reset by a response.
+    Effect::new(move |_| {
+        if let Some((deadline, attempt)) = retry.get() {
+            spawn_local(async move {
+                loop {
+                    if retry.get_untracked().map(|(d, _)| d) != Some(deadline) {
+                        break;
+                    }
+                    let remaining = deadline - js_sys::Date::now();
+                    if remaining <= 0.0 {
+                        if retry.get_untracked().map(|(d, _)| d) == Some(deadline) {
+                            retry.set(None);
+                            status_line.set(None);
+                        }
+                        break;
+                    }
+                    status_line.set(Some(format!(
+                        "Retrying in {:.1}s (attempt {attempt})",
+                        remaining / 1000.0
+                    )));
+                    TimeoutFuture::new(100).await;
+                }
+            });
+        }
+    });
+
     let pin_to_latest = move || {
         follow.set(true);
         at_latest.set(true);
@@ -1057,6 +1141,7 @@ pub fn ChatPage() -> impl IntoView {
         if let Some(id) = session_id.get() {
             active.set(Some(id.clone()));
             running.set(false);
+            done.set(false);
             usage.set(None);
             error.set(None);
             status_line.set(None);
@@ -1758,14 +1843,27 @@ pub fn ChatPage() -> impl IntoView {
                                     </div>
                                 </div>
                                 <div class="statusbar">
-                                    {move || running.get().then(|| view! {
-                                        <span class="status-line working">
-                                            <span class="spinner"></span>
-                                            "Working…"
-                                        </span>
-                                    })}
-                                    {move || status_line.get().map(|s| view! { <span class="status-line">{s}</span> })}
-                                    {move || error.get().map(|e| view! { <span class="error-line">{e}</span> })}
+                                    {move || {
+                                        let error = error.get();
+                                        let running = running.get();
+                                        let status = status_line.get();
+                                        let done = done.get();
+                                        if let Some(e) = error {
+                                            view! { <span class="error-line">{e}</span> }.into_any()
+                                        } else if running {
+                                            view! {
+                                                <span class="status-line working">
+                                                    <span class="spinner"></span>
+                                                    {status.unwrap_or_else(|| "Working…".to_string())}
+                                                </span>
+                                            }
+                                                .into_any()
+                                        } else if done {
+                                            view! { <span class="status-line">Done</span> }.into_any()
+                                        } else {
+                                            view! { <span class="status-line">Idle</span> }.into_any()
+                                        }
+                                    }}
                                     {move || usage.get().map(|u| view! { <span class="usage-line">{u}</span> })}
                                 </div>
                             }
@@ -1891,6 +1989,20 @@ pub fn ChatPage() -> impl IntoView {
                                             <button class="btn primary" on:click=move |_| save_session_retry()>
                                                 "Save"
                                             </button>
+                                        </div>
+                                        <div class="settings-hint">
+                                            "State: "
+                                            {move || {
+                                                if retry.get().is_some() {
+                                                    status_line
+                                                        .get()
+                                                        .unwrap_or_else(|| "Working…".to_string())
+                                                } else if running.get() {
+                                                    "Working…".to_string()
+                                                } else {
+                                                    "Idle".to_string()
+                                                }
+                                            }}
                                         </div>
                                         <label>"Sandbox"</label>
                                         <div class="settings-hint">
@@ -2242,7 +2354,7 @@ mod tests {
                 .all(|(a, b)| a.id < b.id)
         );
 
-        assert!(matches!(entries[0].block, UiBlock::User { ref content } if content == "hi"));
+        assert!(matches!(entries[0].block, UiBlock::User { ref content, .. } if content == "hi"));
         assert_eq!(entries[0].times.get_untracked(), (1000, 1000));
         assert_eq!(
             entries[0].model, "mock/mock",
@@ -2348,9 +2460,11 @@ mod tests {
         ChatSignals {
             messages: RwSignal::new(Vec::<MsgEntry>::new()),
             running: RwSignal::new(false),
+            done: RwSignal::new(false),
             usage: RwSignal::new(None),
             error: RwSignal::new(None),
             status_line: RwSignal::new(None),
+            retry: RwSignal::new(None),
             scroll_tick: RwSignal::new(0),
             follow: RwSignal::new(true),
             at_latest: RwSignal::new(true),
@@ -2502,6 +2616,30 @@ mod tests {
             entries[0].times.get_untracked().1 > 0,
             "open block stamped finished"
         );
+    }
+
+    #[test]
+    fn apply_stream_event_parses_structured_retry_status() {
+        let st = chat_signals();
+        // The driver's retry status is a JSON object literal inside the string
+        // payload; it must become EventOutcome::Retry.
+        let out = apply_stream_event(
+            &st,
+            0,
+            &ev("status", r#""{\"retry_in_ms\":2000,\"attempt\":3}""#),
+        );
+        assert!(matches!(
+            out,
+            EventOutcome::Retry {
+                ms: 2000,
+                attempt: 3
+            }
+        ));
+        // Plain statuses (e.g. compaction messages) stay string statuses.
+        assert!(matches!(
+            apply_stream_event(&st, 0, &ev("status", "\"compacting…\"")),
+            EventOutcome::Status(text) if text == "compacting…"
+        ));
     }
 
     #[test]

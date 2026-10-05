@@ -92,7 +92,16 @@ pub fn builtin_tools() -> Vec<ToolDef> {
                 "/tmp and /home/carson (the home, also the default cwd). ",
                 "Builtins: cd, pwd, echo, printf, export, unset, set, env, test, true, false, exit. ",
                 "Commands: most GNU coreutils (ls, cat, cp, mv, rm, mkdir, touch, date, ",
-                "head, tail, sort, wc, ...). Arguments: {command, cwd?, env?}."
+                "head, tail, sort, wc, ...). ",
+                "SUPPORTED syntax: variables, \"if/then/elif/else/fi\", \"while [ ] / do / done\", ",
+                "\"for x in ... / do / done\", case is NOT supported, pipelines, ",
+                "$(...) and ${...} expansion, heredocs, redirection (>, >>, <, <<EOF). ",
+                "NOT supported (do NOT use): functions \"f() { }\", arrays \"a=( )\", ",
+                "arithmetic \"$(( ))\", substring expansion \"${v:0:1}\", \"bash\", \"sh\", ",
+                "sed, awk, grep, perl, python. ",
+                "Work around them with loops, cut/tr/sort/uniq/comm pipelines, and ",
+                "printf into files. ",
+                "Arguments: {command, cwd?, env?}."
             )
             .into(),
             parameters: serde_json::json!({

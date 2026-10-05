@@ -200,30 +200,43 @@ impl SseDecoder {
                         name: call["function"]["name"].as_str().unwrap_or("").to_string(),
                         arguments: String::new(),
                     });
-                if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
+                if let Some(id) = call
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    // Some providers repeat `id`/`name` as empty strings on
+                    // later argument deltas; never let empty clobber a known.
+                    .filter(|s| !s.is_empty())
+                {
                     entry.id = id.to_string();
                 }
                 if let Some(name) = call
                     .get("function")
                     .and_then(|f| f.get("name"))
                     .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
                 {
                     entry.name = name.to_string();
                 }
-                if !self.announced.contains(&index)
-                    && !entry.id.is_empty()
-                    && !entry.name.is_empty()
-                {
+                // Announce once the name is known. If the provider never sends
+                // an id, mint one — it only correlates this turn's call+result.
+                if !self.announced.contains(&index) && !entry.name.is_empty() {
+                    if entry.id.is_empty() {
+                        entry.id = format!("call_{}", self.announced.len());
+                    }
                     self.announced.insert(index);
                     events.push(DriverEvent::ToolCallStart(entry.clone()));
                 }
-                if let Some(arg) = call
-                    .get("function")
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(|v| v.as_str())
-                    && !arg.is_empty()
-                {
-                    entry.arguments.push_str(arg);
+                if let Some(arg) = call.get("function").and_then(|f| f.get("arguments")) {
+                    // Arguments are usually a streamed string; some providers
+                    // send the JSON object/number directly — accept either.
+                    let arg = match arg {
+                        Value::String(s) => s.clone(),
+                        Value::Null => String::new(),
+                        other => other.to_string(),
+                    };
+                    if !arg.is_empty() {
+                        entry.arguments.push_str(&arg);
+                    }
                 }
             }
         }
@@ -328,6 +341,10 @@ impl LlmDriver for EchoDriver {
         })
     }
 }
+
+/// How long the provider may stream nothing before the request is aborted as
+/// a timeout (so a stalled SSE stream can't hang the turn forever).
+const LLM_READ_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Classify a failed request phase into a [`DriverError`] and whether it is
 /// worth a backoff retry. `send_err` is non-None when the request never
@@ -565,10 +582,9 @@ impl LlmDriver for OpenAiCompatDriver {
                 return Err(err);
             }
             tracing::warn!(url = %url, sleep_ms = sleep, attempt, "llm request retry");
-            let _ = tx.send(DriverEvent::Status(format!(
-                "retrying in {}ms (attempt {})",
-                sleep, attempt
-            )));
+            let _ = tx.send(DriverEvent::Status(
+                json!({"retry_in_ms": sleep, "attempt": attempt}).to_string(),
+            ));
             tokio::time::sleep(std::time::Duration::from_millis(sleep)).await;
         };
 
@@ -576,9 +592,26 @@ impl LlmDriver for OpenAiCompatDriver {
         let mut decoder = SseDecoder::new();
         let mut buffer: Vec<u8> = Vec::new();
 
-        while let Some(chunk) = chunks.next().await {
-            let chunk =
-                chunk.map_err(|err| DriverError::Internal(format!("stream read failed: {err}")))?;
+        loop {
+            // A stalled provider stream (no [DONE], no EOF) must not hang the
+            // turn forever: treat an idle read timeout as a retryable Timeout.
+            let chunk = match tokio::time::timeout(LLM_READ_IDLE_TIMEOUT, chunks.next()).await {
+                Err(_) => return Err(DriverError::Timeout),
+                Ok(None) => break,
+                Ok(Some(chunk)) => match chunk {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        // Close out any announced-but-unfinished tool call so
+                        // the agent can act on it instead of a dangling block.
+                        for event in decoder.finish() {
+                            if tx.send(translate(event)).is_err() {
+                                return Err(DriverError::Cancelled);
+                            }
+                        }
+                        return Err(DriverError::Internal(format!("stream read failed: {err}")));
+                    }
+                },
+            };
             buffer.extend_from_slice(&chunk);
 
             while let Some(line) = pop_line(&mut buffer) {
@@ -587,6 +620,7 @@ impl LlmDriver for OpenAiCompatDriver {
                 let Some(data) = line.strip_prefix("data:") else {
                     continue;
                 };
+                tracing::debug!(url = %url, line = %excerpt(data, 256), "llm sse data");
                 let events = match decoder.decode(data) {
                     Some(SseEventBatch::Done) => decoder.finish(),
                     Some(SseEventBatch::Events(events)) => events,
@@ -1245,11 +1279,14 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         assert!(driver.stream(req, tx).await.is_ok());
         assert_eq!(hits.load(Ordering::SeqCst), 2, "503 retried once");
-        // The client is told about the retry before any content streams.
-        assert!(matches!(
-            rx.recv().unwrap(),
-            DriverEvent::Status(s) if s.contains("retrying")
-        ));
+        // The client is told about the retry before any content streams; the
+        // payload carries the backoff duration and attempt for a countdown.
+        let status = match rx.recv().unwrap() {
+            DriverEvent::Status(s) => serde_json::from_str::<serde_json::Value>(&s).unwrap(),
+            other => panic!("expected a status event, got {other:?}"),
+        };
+        assert!(status["retry_in_ms"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(status["attempt"], serde_json::json!(1));
         assert_eq!(rx.recv().unwrap(), DriverEvent::Text("hi".into()));
     }
 
@@ -1322,5 +1359,95 @@ mod tests {
             decoder.finish().is_empty(),
             "an unannounced partial call is dropped, not replayed"
         );
+    }
+
+    /// Some providers send `function.arguments` as a JSON object rather than a
+    /// streamed string; the decoder must accept both.
+    #[test]
+    fn decoder_accepts_non_string_arguments() {
+        let mut decoder = SseDecoder::new();
+        let batch = decoder
+            .decode(
+                r#"{"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"c1","function":{"name":"bash","arguments":{"command":"ls"}}}
+                ]}}]}"#,
+            )
+            .unwrap();
+        let SseEventBatch::Events(events) = batch else {
+            panic!("expected an events batch, got a done marker");
+        };
+        let DriverEvent::ToolCallStart(tc) = &events[0] else {
+            panic!("expected a tool-call start");
+        };
+        assert_eq!(tc.name, "bash");
+        assert!(tc.arguments.is_empty(), "start carries no args yet");
+        let DriverEvent::ToolCallEnd(tc) = &decoder.finish()[0] else {
+            panic!("expected a tool-call end");
+        };
+        assert_eq!(tc.arguments, r#"{"command":"ls"}"#);
+    }
+
+    /// Some gateways repeat `id`/`name` as empty strings on later argument
+    /// deltas; those must not clobber the real values from the first delta.
+    #[test]
+    fn decoder_ignores_empty_id_name_on_later_deltas() {
+        let mut decoder = SseDecoder::new();
+        let batch = decoder
+            .decode(
+                r#"{"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"call_x","type":"function","function":{"name":"bash","arguments":""}}
+                ]}}]}"#,
+            )
+            .unwrap();
+        let SseEventBatch::Events(events) = batch else {
+            panic!("expected an events batch, got a done marker");
+        };
+        assert!(matches!(
+            &events[0],
+            DriverEvent::ToolCallStart(tc) if tc.name == "bash" && tc.id == "call_x"
+        ));
+        // Argument deltas repeat the id/name as empty strings.
+        decoder
+            .decode(
+                r#"{"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"","type":"","function":{"name":"","arguments":"{\"command\":\"l"}}
+                ]}}]}"#,
+            )
+            .unwrap();
+        decoder
+            .decode(
+                r#"{"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"","type":"","function":{"name":"","arguments":"s\"}"}}
+                ]}}]}"#,
+            )
+            .unwrap();
+        let DriverEvent::ToolCallEnd(tc) = &decoder.finish()[0] else {
+            panic!("expected a tool-call end");
+        };
+        assert_eq!(tc.name, "bash", "empty deltas must not clobber the name");
+        assert_eq!(tc.id, "call_x", "empty deltas must not clobber the id");
+        assert_eq!(tc.arguments, r#"{"command":"ls"}"#);
+    }
+
+    /// A provider that never sends an id: the call is still announced with a
+    /// synthesized id.
+    #[test]
+    fn decoder_synthesizes_id_when_provider_omits_it() {
+        let mut decoder = SseDecoder::new();
+        let batch = decoder
+            .decode(
+                r#"{"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}
+                ]}}]}"#,
+            )
+            .unwrap();
+        let SseEventBatch::Events(events) = batch else {
+            panic!("expected an events batch, got a done marker");
+        };
+        let DriverEvent::ToolCallStart(tc) = &events[0] else {
+            panic!("expected a tool-call start");
+        };
+        assert_eq!(tc.name, "bash");
+        assert!(!tc.id.is_empty(), "a synthetic id is assigned");
     }
 }
